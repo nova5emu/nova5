@@ -180,23 +180,21 @@ uint64_t KYTY_SYSV_ABI ReadCleanWord(uint64_t address) {
 }
 
 // Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, Xbyak::Label* clean_load) {
+void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, Xbyak::Label& clean_load) {
 	code.lea(code.r10, code.ptr[address]);
 	Xbyak::Label direct, done;
-	if (clean_load != nullptr) {
-		code.mov(code.r11, code.r10);
-		code.shr(code.r11, 12);
-		code.inc(code.r11); // Empty hint (zero) cannot match the null page.
-		code.mov(code.rcx, code.r11);
-		code.and_(code.ecx, CleanPageSlots - 1);
-		code.cmp(code.qword[code.r12 + code.rcx * 8], code.r11);
-		code.jne(direct);
-		code.call(*clean_load);
-		code.bt(code.rax, 32);
-		code.jnc(direct);
-		code.mov(code.eax, code.eax);
-		code.jmp(done);
-	}
+	code.mov(code.r11, code.r10);
+	code.shr(code.r11, 12);
+	code.inc(code.r11); // Empty hint (zero) cannot match the null page.
+	code.mov(code.rcx, code.r11);
+	code.and_(code.ecx, CleanPageSlots - 1);
+	code.cmp(code.qword[code.r12 + code.rcx * 8], code.r11);
+	code.jne(direct);
+	code.call(clean_load);
+	code.bt(code.rax, 32);
+	code.jnc(direct);
+	code.mov(code.eax, code.eax);
+	code.jmp(done);
 	code.L(direct);
 	code.mov(code.eax, code.dword[code.r10]);
 	code.L(done);
@@ -400,8 +398,8 @@ private:
 // rdx scratch, r8 capture cursor.
 class WalkerCompiler {
 public:
-	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code, bool clean = false):
-	    m_plan(plan), m_code(code), m_clean(clean) {}
+	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code):
+	    m_plan(plan), m_code(code) {}
 
 	void Compile(std::span<const Value> values);
 
@@ -472,7 +470,6 @@ private:
 	std::vector<std::vector<uint32_t>>                m_output_gates;
 	Xbyak::Label                                      m_ret;
 	Xbyak::Label                                      m_clean_load;
-	bool                                             m_clean = false;
 	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
 };
@@ -964,7 +961,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.mov(c.rcx, c.rax);
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
-			LoadGuest(c, c.rax, m_clean ? &m_clean_load : nullptr);
+			LoadGuest(c, c.rax, m_clean_load);
 		} else {
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
@@ -994,7 +991,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.lea(c.r11, c.ptr[c.r9 + static_cast<size_t>(immediate) + 4u]);
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
-			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_clean ? &m_clean_load : nullptr);
+			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_clean_load);
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
@@ -1364,23 +1361,21 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (Thunk(index)) EmitNode(index);
 	}
-	if (m_clean) {
-		c.L(m_clean_load);
-		// Thunks have variable nesting depth. Preserve walker registers, then
-		// align explicitly before calling C++; a miss resumes the original JIT
-		// mov, preserving its fault/zero-read contract and captured address.
-		for (const auto reg: {c.rcx, c.rdx, c.rsi, c.rdi, c.r8, c.r9, c.r10, c.r11}) c.push(reg);
-		c.mov(c.r11, c.rsp);
-		c.and_(c.rsp, -16);
-		c.sub(c.rsp, 16);
-		c.mov(c.qword[c.rsp], c.r11);
-		c.mov(c.rdi, c.r10);
-		c.mov(c.rax, reinterpret_cast<uint64_t>(&ReadCleanWord));
-		c.call(c.rax);
-		c.mov(c.rsp, c.qword[c.rsp]);
-		for (const auto reg: {c.r11, c.r10, c.r9, c.r8, c.rdi, c.rsi, c.rdx, c.rcx}) c.pop(reg);
-		c.ret();
-	}
+	c.L(m_clean_load);
+	// Thunks have variable nesting depth. Preserve walker registers, then
+	// align explicitly before calling C++; a miss resumes the original JIT
+	// mov, preserving its fault/zero-read contract and captured address.
+	for (const auto reg: {c.rcx, c.rdx, c.rsi, c.rdi, c.r8, c.r9, c.r10, c.r11}) c.push(reg);
+	c.mov(c.r11, c.rsp);
+	c.and_(c.rsp, -16);
+	c.sub(c.rsp, 16);
+	c.mov(c.qword[c.rsp], c.r11);
+	c.mov(c.rdi, c.r10);
+	c.mov(c.rax, reinterpret_cast<uint64_t>(&ReadCleanWord));
+	c.call(c.rax);
+	c.mov(c.rsp, c.qword[c.rsp]);
+	for (const auto reg: {c.r11, c.r10, c.r9, c.r8, c.rdi, c.rsi, c.rdx, c.rcx}) c.pop(reg);
+	c.ret();
 	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures, 0u);
 	m_plan.srt_user_data = m_user_data;
 }
@@ -1390,28 +1385,16 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 	auto& c = *plan.srt_code;
-	if (Common::SubmitProfile::SelectedExperiment() == Common::SubmitProfile::Experiment::SrtCleanRead) {
-		// Two bodies only in this opt-in experiment: A has its original loads,
-		// with no per-load checks. The gate selects a body once per plan, so a
-		// warm cached plan can switch A/B/A without recompiling or patching code.
-		Xbyak::Label normal, guarded;
-		c.test(c.r8, c.r8);
-		c.jz(normal);
-		c.push(c.r12);
-		c.mov(c.r12, c.r8);
-		c.call(guarded);
-		c.pop(c.r12);
-		c.ret();
-		c.L(normal);
-		WalkerCompiler(plan, c).Compile(values);
-		const auto captures = plan.srt_captures, user_data = plan.srt_user_data;
-		const auto scratch_size = plan.srt_scratch.size();
-		c.L(guarded);
-		WalkerCompiler(plan, c, true).Compile(values);
-		EXIT_IF(plan.srt_captures != captures || plan.srt_user_data != user_data || plan.srt_scratch.size() != scratch_size);
-	} else {
-		WalkerCompiler(plan, c).Compile(values);
-	}
+	// One body. r12 holds page hints across thunks and the C++ clean-read
+	// helper; preserve the caller's callee-saved register around the walk.
+	Xbyak::Label body;
+	c.push(c.r12);
+	c.mov(c.r12, c.r8);
+	c.call(body);
+	c.pop(c.r12);
+	c.ret();
+	c.L(body);
+	WalkerCompiler(plan, c).Compile(values);
 	c.readyRE();
 	EXIT_IF(Xbyak::GetError() != 0);
 }
@@ -1422,12 +1405,10 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t, const uint64_t*);
-	const bool clean = Common::SubmitProfile::ExperimentActive(Common::SubmitProfile::Experiment::SrtCleanRead) &&
-	                   runtime.read_clean_memory != nullptr;
 	const auto* previous_walker = std::exchange(t_running_walker, plan.srt_code.get());
-	const auto previous_reader = std::exchange(t_clean_reader, clean ? runtime.read_clean_memory : nullptr);
+	const auto previous_reader = std::exchange(t_clean_reader, runtime.read_clean_memory);
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
-	    plan.srt_scratch.data(), runtime.shader_base, clean ? t_clean_pages.data() : nullptr);
+	    plan.srt_scratch.data(), runtime.shader_base, t_clean_pages.data());
 	t_clean_reader = previous_reader;
 	t_running_walker = previous_walker;
 	if (end == nullptr) return false;

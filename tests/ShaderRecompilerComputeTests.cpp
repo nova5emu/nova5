@@ -5946,8 +5946,73 @@ public:
   }
 
 #if defined(_WIN32)
-  void CheckAttribCleanRead(bool srt_clean = false) {
-    const char* name = srt_clean ? "SrtCleanRead" : "AttribCleanRead";
+  // Original protected loads, retained only as a differential test reference.
+  static void ApplyAttribSemanticsReference(ShaderVertexInputInfo& info,
+                                 std::span<const ShaderSemantic> input_semantics,
+                                 const uint32_t* attrib, const uint32_t* buffer) {
+
+    EXIT_IF(attrib == nullptr || buffer == nullptr);
+
+    const bool debug_dump = Config::GraphicsDebugDumpEnabled();
+    for (uint32_t i = 0; i < input_semantics.size(); i++) {
+      const auto& in = input_semantics[i];
+
+      EXIT_NOT_IMPLEMENTED(in.static_vb_index == 1 || in.static_attribute == 1);
+
+      uint32_t reg  = in.hardware_mapping;
+      uint32_t size = in.size_in_elements;
+      const auto* attribute = &attrib[in.semantic];
+
+      if (debug_dump) {
+        LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
+             *attribute);
+      }
+
+      size_t index = *attribute & 0x1fu;
+      auto   format =
+          static_cast<Prospero::VertexAttribFormat>((*attribute >> 5u) & 0x1ffu);
+      uint32_t offset      = (*attribute >> 14u) & 0xfffu;
+      uint32_t fetch_index = (*attribute >> 26u) & 0x1u;
+
+      EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
+
+      const auto* sharp = &buffer[index * 4];
+
+      EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
+
+      auto& r           = info.resources[info.resources_num];
+      auto& rd          = info.resources_dst[info.resources_num];
+      rd.register_start = static_cast<int>(reg);
+      rd.registers_num  = static_cast<int>(size);
+      rd.attr_id        = static_cast<int>(in.semantic);
+      rd.fetch_index    = fetch_index;
+      r.fields[0]       = sharp[0];
+      r.fields[1]       = sharp[1];
+      r.fields[2]       = sharp[2];
+      r.fields[3]       = sharp[3];
+      EXIT_NOT_IMPLEMENTED(r.AddTid());
+      EXIT_NOT_IMPLEMENTED(r.SwizzleEnabled());
+      if (format != Prospero::VertexAttribFormat::kInvalid) {
+        const auto                   format_raw    = static_cast<uint32_t>(format);
+        const auto                   buffer_format = format_raw >> 2u;
+        const auto                   channels      = (format_raw & 3u) + 1u;
+        // AGC vertex formats encode the buffer format above the two channel-count bits.
+        // The fetch prolog selects X001, XY01, XYZ1, or XYZW from that count.
+        r.fields[3] = (r.fields[3] & ~((0x7fu << 12u) | 0xfffu)) |
+                      (buffer_format << 12u) |
+                      DstSel(4, channels > 1u ? 5u : 0u, channels > 2u ? 6u : 0u,
+                             channels > 3u ? 7u : 1u);
+      }
+      if (offset != 0) {
+        r.UpdateAddress48(r.Base48() + offset);
+      }
+
+      info.resources_num++;
+    }
+  }
+
+  void CheckCleanReads() {
+    constexpr const char* name = "CleanReads";
     constexpr uint64_t base = 0x0000000205700000ull, size = 0x10000;
     constexpr uint64_t attrib = base + 0x40, descriptor = base + 0x80, neighbor = base + 0xc0;
     // Use a nonzero semantic and descriptor index, offset and fetch index.
@@ -5979,8 +6044,7 @@ public:
       auto& cache = context.GetBufferCache();
       auto& scheduler = context.GetCommandScheduler();
       Profile::Reset(); Profile::SetRecording(true);
-      Require(name, "selector", Profile::SelectedExperiment() == (srt_clean ? Profile::Experiment::SrtCleanRead :
-              Profile::Experiment::AttribCleanRead), "test must select its experiment before starting GPU");
+      Require(name, "no experiment", Profile::SelectedExperiment() == Profile::Experiment::None, "clean reads must work by default");
       auto write_gpu = [&](uint64_t address, uint32_t value) {
         auto [buffer, offset] = cache.ObtainBuffer(address, 4, true);
         buffer->Fill(offset, 4, value);
@@ -5993,13 +6057,14 @@ public:
         return VirtualQuery(reinterpret_cast<void*>(attrib), &memory, sizeof(memory)) != 0 &&
                (memory.Protect & 0xff) == PAGE_NOACCESS;
       };
-      auto read = [&](uint64_t table = descriptor) {
+      auto read = [&](uint64_t table = descriptor, bool reference = false) {
         ShaderVertexInputInfo info {};
-        ShaderApplyAttribSemantics(info, semantics, reinterpret_cast<const uint32_t*>(attrib),
+        (reference ? ApplyAttribSemanticsReference : ShaderApplyAttribSemantics)(info, semantics, reinterpret_cast<const uint32_t*>(attrib),
                                    reinterpret_cast<const uint32_t*>(table));
         return info;
       };
-      // Compare all populated resource and destination fields against A.
+      // Compare all populated resource and destination fields against the
+      // original protected-load implementation, which exists only in this test.
       auto equivalent = [&](const ShaderVertexInputInfo& a, const ShaderVertexInputInfo& b) {
         if (a.resources_num != b.resources_num) return false;
         for (int i = 0; i < a.resources_num; ++i) {
@@ -6012,15 +6077,25 @@ public:
       };
       Profile::SetExperiment(false);
       write_gpu(neighbor, 1);
-      const auto reference = read();
-      Require(name, "A readback", !cache.HasGpuDirtyBytes(neighbor, 4) && reference.resources_num == 1 &&
+      const auto reference = read(descriptor, true);
+      Require(name, "reference readback", !cache.HasGpuDirtyBytes(neighbor, 4) && reference.resources_num == 1 &&
               reference.resources[0].Base48() == 0x12340004 && reference.resources_dst[0].fetch_index == 1 &&
               extra(Profile::Extra::AttribCleanReads) == 0, "baseline attribute translation failed");
-      Profile::SetExperiment(true);
       write_gpu(neighbor, 2);
+      bool foreign_read = true;
+      std::thread foreign([&] {
+        uint32_t value = 0;
+        foreign_read = LibKernel::Memory::TryReadCleanBufferBacking(attrib + 12, &value, 4);
+      });
+      foreign.join();
+      Require(name, "host thread excluded", !foreign_read, "host thread inspected GPU dirty ownership");
       const auto tick = scheduler.CurrentTick();
       const auto faults = extra(Profile::Extra::TrackedReadFaults);
-      Require(name, "B repeated clean reads", equivalent(reference, read()) && equivalent(reference, read()) &&
+      const auto first_clean = read();
+      Profile::SetExperiment(true); // An old helper's trigger must not change this path.
+      const auto second_clean = read();
+      Profile::SetExperiment(false);
+      Require(name, "default repeated clean reads", equivalent(reference, first_clean) && equivalent(reference, second_clean) &&
               extra(Profile::Extra::AttribCleanReads) == 4 && extra(Profile::Extra::TrackedReadFaults) == faults &&
               scheduler.CurrentTick() == tick && cache.HasGpuDirtyBytes(neighbor, 4) && protected_page(),
               "clean tables faulted, submitted, changed protection or changed the translated resource");
@@ -6031,7 +6106,7 @@ public:
       write_gpu(attrib + 12, attribute + (4u << 14u));
       Require(name, "dirty attribute", read().resources[0].Base48() == 0x12340008 &&
               !cache.HasGpuDirtyBytes(attrib + 12, 4), "attribute read missed fresh GPU data");
-      // Fresh CPU writes are also visible: the candidate never caches values.
+      // Fresh CPU writes are also visible: the clean reader never caches values.
       std::memcpy(reinterpret_cast<void*>(attrib + 12), &attribute, 4);
       write_gpu(neighbor, 3);
       Require(name, "fresh backing", read().resources[0].Base48() == 0x12340004,
@@ -6072,10 +6147,10 @@ public:
       Profile::SetExperiment(false);
       write_gpu(neighbor, 6);
       const auto before_a = extra(Profile::Extra::AttribCleanReads);
-      Require(name, "A restored", read().resources[0].NumRecords() == 64 &&
+      Require(name, "reference rechecked", read(descriptor, true).resources[0].NumRecords() == 64 &&
               !cache.HasGpuDirtyBytes(neighbor, 4) && extra(Profile::Extra::AttribCleanReads) == before_a &&
-              extra(Profile::Extra::FalseSharedServed) == 0, "gate did not restore A or enabled handler emulation");
-      if (srt_clean) {
+              extra(Profile::Extra::FalseSharedServed) == 0, "protected reference skipped readback or non-walker load was emulated");
+      {
         namespace IR = ShaderRecompiler::IR;
         constexpr uint64_t table = base + 0x200, leaf = base + 0x240;
         const std::array<uint32_t, 2> pointer {static_cast<uint32_t>(leaf), static_cast<uint32_t>(leaf >> 32)};
@@ -6113,9 +6188,24 @@ public:
                                .read_clean_memory = LibKernel::Memory::TryReadCleanBufferBacking};
         std::vector<uint32_t> flat;
         std::vector<std::pair<uint64_t, uint64_t>> captures;
-        auto walk = [&] {
+        auto walk = [&](bool reference = false) {
           captures.clear();
-          if (!IR::WalkSrt(plan, runtime, flat, &captures) || flat.size() != 10 || captures.size() != 10 ||
+          bool known = true;
+          if (reference) {
+            // Original direct DWORD loads. This reference deliberately faults
+            // on a protected page and consumes the real GPU readback.
+            auto load = [&](uint64_t address) {
+              captures.emplace_back(address, 4);
+              return *reinterpret_cast<const volatile uint32_t*>(address);
+            };
+            const auto address = (uint64_t{user_data[1] & 0xffffu} << 32) | (user_data[0] & ~3u);
+            flat = {load(address), load(address + 4)};
+            const auto nested_address = (uint64_t{flat[1] & 0xffffu} << 32) | (flat[0] & ~3u);
+            for (uint32_t i = 0; i < 8; ++i) flat.push_back(load(nested_address + i * 4));
+          } else {
+            known = IR::WalkSrt(plan, runtime, flat, &captures);
+          }
+          if (!known || flat.size() != 10 || captures.size() != 10 ||
               flat[0] != pointer[0] || flat[1] != pointer[1]) return false;
           for (uint32_t i = 0; i < flat.size(); ++i) {
             if (captures[i] != std::pair<uint64_t, uint64_t>{i < 2 ? table + i * 4 : leaf + (i - 2) * 4, 4})
@@ -6125,9 +6215,8 @@ public:
           return true;
         };
         write_gpu(neighbor, 7);
-        Require(name, "walker A", walk() && !cache.HasGpuDirtyBytes(neighbor, 4) &&
+        Require(name, "walker reference", walk(true) && !cache.HasGpuDirtyBytes(neighbor, 4) &&
                 extra(Profile::Extra::WalkerCleanReads) == 0, "baseline walker changed values or skipped readback");
-        Profile::SetExperiment(true);
         write_gpu(neighbor, 8);
         const auto first_faults = extra(Profile::Extra::TrackedReadFaults);
         const auto first_tick = scheduler.CurrentTick();
@@ -6135,7 +6224,11 @@ public:
                 extra(Profile::Extra::TrackedReadFaults) == first_faults + 1 &&
                 extra(Profile::Extra::WalkerCleanReads) == 10 && scheduler.CurrentTick() == first_tick &&
                 protected_page(), "first clean walker fault failed to establish a safe hint");
-        for (int i = 0; i < 20; ++i) Require(name, "walker repeat", walk(), "helper corrupted nested values/captures");
+        for (int i = 0; i < 20; ++i) {
+          Profile::SetExperiment((i & 1) != 0);
+          Require(name, "walker repeat", walk(), "helper corrupted nested values/captures");
+        }
+        Profile::SetExperiment(false);
         Require(name, "walker avoids repeated exceptions", extra(Profile::Extra::TrackedReadFaults) == first_faults + 1 &&
                 extra(Profile::Extra::WalkerCleanReads) == 210 && cache.HasGpuDirtyBytes(neighbor, 4) &&
                 scheduler.CurrentTick() == first_tick && protected_page(), "page hint repeated exceptions or downloaded");
@@ -6177,9 +6270,8 @@ public:
                 "published value or newer GPU ownership was lost");
         Profile::SetExperiment(false);
         const auto before_restore = extra(Profile::Extra::WalkerCleanReads);
-        Require(name, "walker A restored", walk() && !cache.HasGpuDirtyBytes(neighbor, 4) &&
-                extra(Profile::Extra::WalkerCleanReads) == before_restore, "cached walker did not return to A");
-        Profile::SetExperiment(true);
+        Require(name, "walker reference rechecked", walk(true) && !cache.HasGpuDirtyBytes(neighbor, 4) &&
+                extra(Profile::Extra::WalkerCleanReads) == before_restore, "protected reference skipped readback");
         Require(name, "walker stale hint", walk(), "stale hint changed ordinary data");
         const auto ordinary_reads = extra(Profile::Extra::WalkerCleanReads);
         const auto ordinary_fallbacks = extra(Profile::Extra::WalkerCleanFallbacks);
@@ -6187,6 +6279,16 @@ public:
         Require(name, "walker ordinary fast path", extra(Profile::Extra::WalkerCleanReads) == ordinary_reads &&
                 extra(Profile::Extra::WalkerCleanFallbacks) == ordinary_fallbacks,
                 "ordinary pages continued calling the helper after their stale hint was removed");
+        Profile::SetRecording(false);
+        write_gpu(neighbor, 12);
+        Require(name, "attributes profiling disabled", read().resources[0].NumRecords() == 64 &&
+                cache.HasGpuDirtyBytes(neighbor, 4) && protected_page(),
+                "clean attributes required profiling to preserve the protected page");
+        Require(name, "profiling disabled", walk() && cache.HasGpuDirtyBytes(neighbor, 4) && protected_page(),
+                "clean walker required profiling to preserve the protected page");
+        Require(name, "reference profiling disabled", walk(true) && !cache.HasGpuDirtyBytes(neighbor, 4),
+                "reference did not preserve the dirty-read fallback with profiling off");
+        Profile::SetRecording(true);
         // An unmapped pointer must retain the original zero-read contract.
         // This handler is limited to this subcase; all GPU cases above used
         // the real emulator's fault handler.
@@ -6208,116 +6310,6 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  void CheckCleanReadFault() {
-    constexpr const char* name = "CleanReadFault";
-    constexpr uint64_t base = 0x0000000205700000ull, size = 0x10000;
-    constexpr uint64_t clean = base + 0x40, dirty = base + 0x80, other_dirty = base + 0xc0;
-    constexpr uint32_t initial = 0x89abcdef;
-    namespace Profile = Common::SubmitProfile;
-    EnsureRuntimeContext();
-    int64_t physical = -1;
-    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
-        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0, "allocation failed");
-    void* mapped = reinterpret_cast<void*>(base);
-    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 3, 0x10, physical, size) == 0 &&
-        mapped == reinterpret_cast<void*>(base), "mapping failed");
-    std::memset(mapped, 0, size);
-    std::memcpy(reinterpret_cast<void*>(clean), &initial, 4);
-    // Real native faults from tiny, precisely known loads. No synthetic handler
-    // substitute: EnsureRuntimeContext installs HandleGpuAccessFault below.
-    Xbyak::CodeGenerator mov, add, crossing;
-    mov.mov(mov.eax, mov.dword[mov.rcx]); mov.ret(); mov.ready();
-    add.xor_(add.eax, add.eax); add.add(add.eax, add.dword[add.rcx]); add.ret(); add.ready();
-    crossing.movups(crossing.xmm0, crossing.ptr[crossing.rcx]);
-    crossing.movd(crossing.eax, crossing.xmm0); crossing.ret(); crossing.ready();
-    using Load = uint32_t (*)(uint64_t);
-    const auto load = mov.getCode<Load>(), unknown = add.getCode<Load>(), cross = crossing.getCode<Load>();
-    RenderContext context(m_runtime_context);
-    context.InitializeGpu(nullptr);
-    LibKernel::Memory::InstallGpuResources(&context);
-    context.GetGpu().SendCommandSync([&] {
-      CommandProcessor processor(context, 0);
-      processor.BufferInit();
-      context.MapMemory(base, size);
-      auto& cache = context.GetBufferCache();
-      auto& scheduler = context.GetCommandScheduler();
-      Profile::Reset(); Profile::SetRecording(true);
-      Require(name, "selector", Profile::SelectedExperiment() == Profile::Experiment::ReadFaultClean,
-              "test must select read-fault-clean before starting GPU");
-      auto write_gpu = [&](uint64_t address, uint32_t value) {
-        auto [buffer, offset] = cache.ObtainBuffer(address, 4, true);
-        buffer->Fill(offset, 4, value);
-      };
-      auto protected_page = [&] {
-        MEMORY_BASIC_INFORMATION memory {};
-        return VirtualQuery(reinterpret_cast<void*>(clean), &memory, sizeof(memory)) != 0 &&
-               (memory.Protect & 0xff) == PAGE_NOACCESS;
-      };
-      auto served = [&] {
-        return Profile::Detail::window.extra[static_cast<size_t>(Profile::Extra::FalseSharedServed)].load();
-      };
-      // A: even a clean load downloads its dirty page with the gate closed.
-      Profile::SetExperiment(false);
-      write_gpu(dirty, 0x11112222);
-      Require(name, "A readback", load(clean) == initial && !cache.HasGpuDirtyBytes(dirty, 4) && served() == 0,
-              "closed gate did not use normal readback");
-      // B: clean bytes are served, with neither submission nor unprotection.
-      Profile::SetExperiment(true);
-      write_gpu(dirty, 0x33334444);
-      bool foreign_read = true;
-      std::thread foreign([&] {
-        uint32_t value = 0;
-        foreign_read = LibKernel::Memory::TryReadCleanBufferBacking(clean, &value, 4);
-      });
-      foreign.join();
-      Require(name, "host thread excluded", !foreign_read, "host thread inspected GPU dirty ownership");
-      const auto tick = scheduler.CurrentTick();
-      Require(name, "protected before", protected_page(), "fixture page was not GPU-protected");
-      Require(name, "B clean load", load(clean) == initial && load(clean) == initial && served() == 2 &&
-              scheduler.CurrentTick() == tick && cache.HasGpuDirtyBytes(dirty, 4) && protected_page(),
-              "clean load submitted, downloaded, changed protection or lost dirty ownership");
-      Require(name, "B dirty load", load(dirty) == 0x33334444 && !cache.HasGpuDirtyBytes(dirty, 4) && served() == 2,
-              "dirty load did not perform normal readback");
-      // A partly dirty operand must fall back even when its first byte is clean.
-      write_gpu(dirty, 0x778899aa);
-      Require(name, "partial overlap", load(dirty - 2) == 0x99aa0000 && !cache.HasGpuDirtyBytes(dirty, 4) && served() == 2,
-              "whole-load overlap check missed dirty bytes after the fault address");
-      write_gpu(dirty, 0x55556666);
-      Require(name, "unknown instruction", unknown(clean) == initial && !cache.HasGpuDirtyBytes(dirty, 4) && served() == 2,
-              "unsupported arithmetic load bypassed readback");
-      write_gpu(dirty, 0x77778888);
-      Require(name, "cross-page instruction", cross(base + 4096 - 8) == 0 &&
-              !cache.HasGpuDirtyBytes(dirty, 4) && served() == 2, "cross-page load bypassed readback");
-      // A scheduled asynchronous download has removed its dirty interval but
-      // has not published it yet. Another write still protects that same page.
-      write_gpu(dirty, 0x9999aaaa);
-      Require(name, "async download", BufferCacheTestAccess::DownloadAsync(cache, dirty, 4), "no async copy");
-      write_gpu(other_dirty, 0xbbbbcccc);
-      uint32_t value = 0;
-      Require(name, "unpublished backing excluded", cache.HasUnpublishedDownloads() &&
-              !cache.HasGpuDirtyBytes(dirty, 4) && cache.HasGpuDirtyBytes(other_dirty, 4) &&
-              !LibKernel::Memory::TryReadCleanBufferBacking(dirty, &value, 4),
-              "pending publication exposed stale backing as clean");
-      const auto publish_tick = scheduler.CurrentTick();
-      scheduler.Finish();
-      scheduler.WaitPriorityOperations(publish_tick);
-      Require(name, "published backing", !cache.HasUnpublishedDownloads() &&
-              LibKernel::Memory::TryReadCleanBufferBacking(dirty, &value, 4) && value == 0x9999aaaa && protected_page(),
-              "completed publication was not visible through the protected alias");
-      Require(name, "remaining dirty bytes", load(other_dirty) == 0xbbbbcccc, "neighbor GPU write was lost");
-      Profile::SetExperiment(false);
-      write_gpu(dirty, 0xddddeeee);
-      Require(name, "A restored", load(clean) == initial && !cache.HasGpuDirtyBytes(dirty, 4) && served() == 2,
-              "reverting the gate did not restore the old path");
-      Profile::SetRecording(false);
-      context.UnmapMemory(base, size);
-      scheduler.Finish();
-    });
-    LibKernel::Memory::InstallGpuResources(nullptr);
-    context.ShutdownGpu();
-    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0, "release failed");
-    std::printf("[gpu]     %-32s ok\n", name);
-  }
 #endif
 
   void CheckUnifiedTextureCacheFlow() {
@@ -51187,28 +51179,12 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
 #if defined(_WIN32)
-  if (argc == 2 && std::strcmp(argv[1], "--srt-clean-read-only") == 0) {
-    _putenv_s("KYTY_EXPERIMENT", "srt-clean-read");
+  if (argc == 2 && std::strcmp(argv[1], "--clean-reads-only") == 0) {
+    _putenv_s("KYTY_EXPERIMENT", "");
     _putenv_s("KYTY_SUBMIT_PROFILE", "1");
     EnsureConfigInitialized();
     VulkanHarness vulkan;
-    vulkan.CheckAttribCleanRead(true);
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--attrib-clean-read-only") == 0) {
-    _putenv_s("KYTY_EXPERIMENT", "attrib-clean-read");
-    _putenv_s("KYTY_SUBMIT_PROFILE", "1");
-    EnsureConfigInitialized();
-    VulkanHarness vulkan;
-    vulkan.CheckAttribCleanRead();
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--read-fault-clean-only") == 0) {
-    _putenv_s("KYTY_EXPERIMENT", "read-fault-clean");
-    _putenv_s("KYTY_SUBMIT_PROFILE", "1");
-    EnsureConfigInitialized();
-    VulkanHarness vulkan;
-    vulkan.CheckCleanReadFault();
+    vulkan.CheckCleanReads();
     return 0;
   }
 #endif

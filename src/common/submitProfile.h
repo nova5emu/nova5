@@ -232,12 +232,9 @@ inline void TakeTag(ThreadTag& tag, uint32_t& tid, bool& multi) {
 	return Detail::Armed() && Detail::recording.load(std::memory_order_relaxed);
 }
 // Candidate under A/B (see SubmitProfileRuntime); off unless the experiment gate is open.
-enum class Experiment { None, ReleaseMem, ReadFaultClean, AttribCleanRead, SrtCleanRead };
+enum class Experiment { None, ReleaseMem };
 inline Experiment ParseExperiment(std::string_view name) {
 	if (name == "release-mem") return Experiment::ReleaseMem;
-	if (name == "read-fault-clean") return Experiment::ReadFaultClean;
-	if (name == "attrib-clean-read") return Experiment::AttribCleanRead;
-	if (name == "srt-clean-read") return Experiment::SrtCleanRead;
 	return Experiment::None;
 }
 inline Experiment SelectedExperiment() {
@@ -250,9 +247,6 @@ inline Experiment SelectedExperiment() {
 inline const char* ExperimentName() {
 	switch (SelectedExperiment()) {
 		case Experiment::ReleaseMem: return "release-mem";
-		case Experiment::ReadFaultClean: return "read-fault-clean";
-		case Experiment::AttribCleanRead: return "attrib-clean-read";
-		case Experiment::SrtCleanRead: return "srt-clean-read";
 		default: return "none";
 	}
 }

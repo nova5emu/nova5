@@ -30,6 +30,9 @@ LicenseFile={#Stage}\LICENSE.txt
 InfoBeforeFile={#Stage}\LEEME.txt
 Compression=lzma2/ultra64
 SolidCompression=yes
+; Updates started from the launcher run while Nova5 is closing; close whatever is still open.
+CloseApplications=force
+RestartApplications=no
 
 [Languages]
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
@@ -47,3 +50,5 @@ Name: "{autodesktop}\Nova5"; Filename: "{app}\Nova5.exe"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\Nova5.exe"; Description: "{cm:LaunchProgram,Nova5}"; Flags: nowait postinstall skipifsilent
+; Silent installs come from the launcher's updater: open Nova5 again when they finish.
+Filename: "{app}\Nova5.exe"; Flags: nowait; Check: WizardSilent

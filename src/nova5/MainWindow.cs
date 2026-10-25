@@ -58,6 +58,13 @@ public sealed class MainWindow : Window
 	private readonly Border     _toastBox;
 	private readonly Border     _prompt;
 	private Border?             _statsBox;
+	private Border              _chrome = new();
+	private bool                _chromePinned;
+	private readonly TextBlock  _fullscreenLabel = Text("", 20, FontWeight.Normal);
+	private readonly TextBlock  _updateText = Text("", 20, FontWeight.SemiBold, Palette.AuroraA);
+	private Border              _updatePill = new();
+	private UpdateInfo?         _update;
+	private bool                _updating;
 
 	public MainWindow()
 	{
@@ -92,10 +99,27 @@ public sealed class MainWindow : Window
 		_clock.Text = DateTime.Now.ToString("HH:mm");
 
 		KeyDown += OnKey;
+		PointerMoved += (_, e) =>
+		{
+			var y = e.GetPosition(this).Y;
+			if (y <= 6) ShowChrome(true);
+			else if (!_chromePinned && y > 72) ShowChrome(false);
+		};
+		PointerWheelChanged += (_, e) =>
+		{
+			if (_running is not null || _zone == Zone.Prompt) return;
+			OnInput(e.Delta.Y < 0 ? (_tab == 0 ? PadInput.Right : PadInput.Down) : (_tab == 0 ? PadInput.Left : PadInput.Up));
+		};
+		PropertyChanged += (_, e) =>
+		{
+			if (e.Property == WindowStateProperty) _fullscreenLabel.Text = WindowState == WindowState.FullScreen ? "Ventana" : "Pantalla completa";
+		};
 		Opened  += (_, _) =>
 		{
 			Reload();
+			_fullscreenLabel.Text = WindowState == WindowState.FullScreen ? "Ventana" : "Pantalla completa";
 			if (SnapshotPath is { } snapshot) DispatcherTimer.RunOnce(() => SaveSnapshot(snapshot), TimeSpan.FromSeconds(4));
+			else if (_store.UpdateMode != "no") DispatcherTimer.RunOnce(() => CheckUpdates(false), TimeSpan.FromSeconds(3));
 		};
 		Closed  += (_, _) =>
 		{
@@ -117,6 +141,12 @@ public sealed class MainWindow : Window
 		Place(stage, brand, 72, 34);
 
 		var status = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 28, VerticalAlignment = VerticalAlignment.Center };
+		_updatePill = Pill(_updateText);
+		_updatePill.IsVisible   = false;
+		_updatePill.BorderBrush = Palette.Aurora();
+		_updatePill.Cursor      = new Cursor(StandardCursorType.Hand);
+		_updatePill.PointerPressed += (_, _) => StartUpdate();
+		status.Children.Add(_updatePill);
 		status.Children.Add(Pill(_padStatus));
 		status.Children.Add(_clock);
 		var statusDock = new DockPanel { Width = 1920 - 144, LastChildFill = false };
@@ -125,7 +155,14 @@ public sealed class MainWindow : Window
 		Place(stage, statusDock, 72, 40);
 
 		var tabs = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 40 };
-		foreach (var tab in _tabs) tabs.Children.Add(tab);
+		for (var i = 0; i < _tabs.Length; i++)
+		{
+			var tab = i;
+			_tabs[i].Background = Brushes.Transparent;
+			_tabs[i].Cursor     = new Cursor(StandardCursorType.Hand);
+			_tabs[i].PointerPressed += (_, _) => { if (_zone != Zone.Prompt) ShowTab(tab); };
+			tabs.Children.Add(_tabs[i]);
+		}
 		Place(stage, tabs, 72, 120);
 
 		// Games page.
@@ -142,7 +179,14 @@ public sealed class MainWindow : Window
 		_meta.Margin = new Thickness(0, 0, 0, 34);
 		info.Children.Add(_meta);
 		var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 18 };
-		foreach (var button in _buttons) actions.Children.Add(button);
+		for (var i = 0; i < _buttons.Length; i++)
+		{
+			var action = i;
+			_buttons[i].Cursor = new Cursor(StandardCursorType.Hand);
+			_buttons[i].PointerEntered += (_, _) => { if (_zone is Zone.Tiles or Zone.Buttons) { _zone = Zone.Buttons; FocusButton(action); SetZoneVisuals(); } };
+			_buttons[i].PointerPressed += (_, _) => { if (_zone != Zone.Prompt) Activate(action); };
+			actions.Children.Add(_buttons[i]);
+		}
 		info.Children.Add(actions);
 		Place(_gamesPage, info, 72, 640);
 
@@ -163,10 +207,10 @@ public sealed class MainWindow : Window
 
 		var hints = new DockPanel { Width = 1920 - 144, LastChildFill = false };
 		var left = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 34 };
-		left.Children.Add(Hint("A", "Aceptar"));
-		left.Children.Add(Hint("Y", "Ajustes"));
-		left.Children.Add(Hint("LB RB", "Pestañas"));
-		var right = Hint("B", "Atrás");
+		left.Children.Add(Clickable(Hint("A", "Aceptar"), () => OnInput(PadInput.Accept)));
+		left.Children.Add(Clickable(Hint("Y", "Ajustes"), () => OnInput(PadInput.Options)));
+		left.Children.Add(Clickable(Hint("LB RB", "Pestañas"), () => OnInput(PadInput.NextTab)));
+		var right = Clickable(Hint("B", "Atrás"), () => OnInput(PadInput.Back));
 		DockPanel.SetDock(left, Dock.Left);
 		DockPanel.SetDock(right, Dock.Right);
 		hints.Children.Add(left);
@@ -187,7 +231,60 @@ public sealed class MainWindow : Window
 		root.Children.Add(new Rectangle { Fill = Palette.Fade(Palette.P(0, 1), Palette.P(0, 0), (0, 0.95), (0.45, 0)) });
 		root.Children.Add(new Rectangle { Fill = Palette.Fade(Palette.P(0, 0), Palette.P(0, 1), (0, 0.7), (0.18, 0)) });
 		root.Children.Add(new Viewbox { Stretch = Stretch.Uniform, Child = stage });
+		root.Children.Add(_chrome = BuildChrome());
 		return root;
+	}
+
+	// Window bar that slides in when the pointer reaches the top edge or Escape is pressed.
+	private Border BuildChrome()
+	{
+		var bar = new DockPanel { LastChildFill = false, Margin = new Thickness(20, 0) };
+		var brand = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };
+		brand.Children.Add(Logo(26));
+		brand.Children.Add(Text("Nova5", 18, FontWeight.SemiBold));
+		DockPanel.SetDock(brand, Dock.Left);
+		bar.Children.Add(brand);
+		var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
+		buttons.Children.Add(ChromeButton(Text("Minimizar", 20, FontWeight.Normal), Palette.Brush(Colors.White, 0.12), () => WindowState = WindowState.Minimized));
+		buttons.Children.Add(ChromeButton(_fullscreenLabel, Palette.Brush(Colors.White, 0.12),
+		    () => WindowState = WindowState == WindowState.FullScreen ? WindowState.Maximized : WindowState.FullScreen));
+		buttons.Children.Add(ChromeButton(Text("Cerrar Nova5", 20, FontWeight.SemiBold), Palette.Brush(Color.Parse("#E5484D"), 0.9), Close));
+		DockPanel.SetDock(buttons, Dock.Right);
+		bar.Children.Add(buttons);
+		return new Border
+		{
+			Height = 60, VerticalAlignment = VerticalAlignment.Top, Opacity = 0, IsHitTestVisible = false, Child = bar,
+			Background = Palette.Brush(Palette.Ink, 0.96), BorderBrush = Palette.Brush(Colors.White, 0.1), BorderThickness = new Thickness(0, 0, 0, 1),
+			Transitions = new Transitions { new DoubleTransition { Property = OpacityProperty, Duration = TimeSpan.FromMilliseconds(160) } },
+		};
+	}
+
+	private static Border ChromeButton(TextBlock label, IBrush hover, Action click)
+	{
+		var button = new Border
+		{
+			Child = label, Padding = new Thickness(18, 8), CornerRadius = new CornerRadius(10),
+			Background = Brushes.Transparent, Cursor = new Cursor(StandardCursorType.Hand),
+		};
+		button.PointerEntered += (_, _) => button.Background = hover;
+		button.PointerExited  += (_, _) => button.Background = Brushes.Transparent;
+		button.PointerPressed += (_, _) => click();
+		return button;
+	}
+
+	private void ShowChrome(bool show, bool pin = false)
+	{
+		_chromePinned = show && pin;
+		if ((_chrome.Opacity > 0) == show) return;
+		_chrome.Opacity          = show ? 1 : 0;
+		_chrome.IsHitTestVisible = show;
+	}
+
+	private static Control Clickable(Control control, Action click)
+	{
+		var host = new Border { Child = control, Background = Brushes.Transparent, Cursor = new Cursor(StandardCursorType.Hand) };
+		host.PointerPressed += (_, _) => click();
+		return host;
 	}
 
 	private Border BuildPrompt()
@@ -195,8 +292,8 @@ public sealed class MainWindow : Window
 		var text = new StackPanel { Spacing = 26, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
 		text.Children.Add(Text("¿Salir de Nova5?", 44, FontWeight.Bold));
 		var keys = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 34, HorizontalAlignment = HorizontalAlignment.Center };
-		keys.Children.Add(Hint("A", "Salir"));
-		keys.Children.Add(Hint("B", "Volver"));
+		keys.Children.Add(Clickable(Hint("A", "Salir"), Close));
+		keys.Children.Add(Clickable(Hint("B", "Volver"), () => ShowPrompt(false)));
 		text.Children.Add(keys);
 		return new Border
 		{
@@ -215,6 +312,12 @@ public sealed class MainWindow : Window
 		_row.Children.Clear();
 		foreach (var game in _games) _row.Children.Add(Tile(game));
 		_row.Children.Add(AddTile());
+		for (var i = 0; i < _row.Children.Count; i++)
+		{
+			var index = i;
+			_row.Children[i].Cursor = new Cursor(StandardCursorType.Hand);
+			_row.Children[i].PointerPressed += (_, _) => TileClicked(index);
+		}
 		if (!_emulator.Exists) ShowToast("No se encontró Nova5Emulator junto al lanzador");
 		Select(_index, force: true);
 	}
@@ -324,7 +427,7 @@ public sealed class MainWindow : Window
 		PadInput? input = e.Key switch
 		{
 			Key.Left => PadInput.Left, Key.Right => PadInput.Right, Key.Up => PadInput.Up, Key.Down => PadInput.Down,
-			Key.Enter or Key.Space => PadInput.Accept, Key.Escape or Key.Back => PadInput.Back,
+			Key.Enter or Key.Space => PadInput.Accept, Key.Back => PadInput.Back,
 			Key.Q => PadInput.PrevTab, Key.E or Key.Tab => PadInput.NextTab, Key.Y => PadInput.Options,
 			_ => null,
 		};
@@ -332,6 +435,12 @@ public sealed class MainWindow : Window
 		{
 			WindowState = WindowState == WindowState.FullScreen ? WindowState.Maximized : WindowState.FullScreen;
 			e.Handled   = true;
+			return;
+		}
+		if (e.Key == Key.Escape)
+		{
+			ShowChrome(_chrome.Opacity == 0, pin: true);
+			e.Handled = true;
 			return;
 		}
 		if (input is null || _running is not null) return;
@@ -392,8 +501,26 @@ public sealed class MainWindow : Window
 	{
 		_zone = zone;
 		if (zone == Zone.Buttons) _button = 0;
-		for (var i = 0; i < _row.Children.Count; i++) Focus((Border)_row.Children[i], i == _index && zone == Zone.Tiles);
-		for (var i = 0; i < _buttons.Length; i++) FocusButtonVisual(_buttons[i], zone == Zone.Buttons && i == _button);
+		SetZoneVisuals();
+	}
+
+	private void SetZoneVisuals()
+	{
+		for (var i = 0; i < _row.Children.Count; i++) Focus((Border)_row.Children[i], i == _index && _zone == Zone.Tiles);
+		for (var i = 0; i < _buttons.Length; i++) FocusButtonVisual(_buttons[i], _zone == Zone.Buttons && i == _button);
+	}
+
+	// A click selects a game; a click on the selected game plays it, like pressing A.
+	private void TileClicked(int index)
+	{
+		if (_zone is Zone.Prompt or Zone.Settings || _running is not null) return;
+		if (index == _index && _zone == Zone.Tiles)
+		{
+			Activate(0);
+			return;
+		}
+		SetZone(Zone.Tiles);
+		Select(index, force: true);
 	}
 
 	private void FocusButton(int index)
@@ -460,6 +587,14 @@ public sealed class MainWindow : Window
 			_music.Volume      = _store.MusicVolume;
 			_store.Save();
 		}),
+		new("Actualizaciones", () => _store.UpdateMode switch { "auto" => "Automáticas", "no" => "Desactivadas", _ => "Avisar" }, step =>
+		{
+			string[] modes = { "avisar", "auto", "no" };
+			_store.UpdateMode = modes[(Math.Max(Array.IndexOf(modes, _store.UpdateMode), 0) + step + modes.Length) % modes.Length];
+			_store.Save();
+		}),
+		new(_update is null ? $"Buscar actualizaciones (tienes la {Updates.Current})" : $"Actualizar a Nova5 {_update.Version}",
+		    () => _updating ? "Actualizando…" : "", _ => { if (_update is null) CheckUpdates(true); else StartUpdate(); }),
 		new("Añadir carpeta de juegos", () => "", _ => AddFolder()),
 		new("Salir de Nova5", () => "", _ => ShowPrompt(true)),
 	};
@@ -487,12 +622,23 @@ public sealed class MainWindow : Window
 			row.Children.Add(value);
 			row.Children.Add(Text(settings[i].Label, 26, FontWeight.Normal));
 			var focused = i == _setting;
-			_settingsList.Children.Add(new Border
+			var index   = i;
+			var item = new Border
 			{
 				Child = row, Padding = new Thickness(28, 18), CornerRadius = new CornerRadius(16),
 				Background = Palette.Brush(focused ? Colors.White : Palette.Ink, focused ? 0.14 : 0.55),
 				BorderBrush = focused ? Palette.Aurora() : Palette.Brush(Colors.White, 0.08), BorderThickness = new Thickness(focused ? 2 : 1),
-			});
+				Cursor = new Cursor(StandardCursorType.Hand),
+			};
+			// Left click goes to the next value, right click to the previous one.
+			item.PointerPressed += (_, e) =>
+			{
+				if (_zone != Zone.Settings) return;
+				_setting = index;
+				Settings()[index].Change(e.GetCurrentPoint(item).Properties.IsRightButtonPressed ? -1 : 1);
+				if (_zone == Zone.Settings && _tab == 1) BuildSettings();
+			};
+			_settingsList.Children.Add(item);
 		}
 	}
 
@@ -521,6 +667,50 @@ public sealed class MainWindow : Window
 		Reload();
 		ShowToast(_games.Count > before ? $"{_games.Count - before} juego(s) añadido(s)" : "No se encontraron juegos en esa carpeta");
 		if (_tab == 1) ShowTab(0);
+	}
+
+	// ---- Updates ------------------------------------------------------------------------------
+
+	private async void CheckUpdates(bool manual)
+	{
+		if (manual) ShowToast("Buscando actualizaciones…");
+		_update = await Updates.CheckAsync();
+		if (_tab == 1) BuildSettings();
+		if (_update is null)
+		{
+			if (manual) ShowToast($"Tienes la última versión ({Updates.Current})");
+			return;
+		}
+		_updateText.Text      = $"Actualizar a {_update.Version}";
+		_updatePill.IsVisible = true;
+		if (_store.UpdateMode == "auto" && !manual) StartUpdate();
+		else ShowToast($"Nova5 {_update.Version} está disponible: pulsa «Actualizar» arriba o en Ajustes");
+	}
+
+	private async void StartUpdate()
+	{
+		if (_update is not { } update || _updating) return;
+		if (_running is not null)
+		{
+			ShowToast("Cierra el juego para actualizar Nova5");
+			return;
+		}
+		_updating = true;
+		_music.Stop();
+		try
+		{
+			var progress = new Progress<double>(p => _updateText.Text = $"Descargando {p * 100:0} %");
+			var setup    = await Updates.DownloadAsync(update, progress);
+			_updateText.Text = "Instalando…";
+			Updates.Install(setup, _emulator.BaseDir);
+			Close(); // The setup replaces the files and opens Nova5 again.
+		}
+		catch (Exception e) when (e is HttpRequestException or IOException or InvalidDataException or TaskCanceledException or System.ComponentModel.Win32Exception)
+		{
+			_updating        = false;
+			_updateText.Text = $"Actualizar a {update.Version}";
+			ShowToast("No se pudo actualizar: " + e.Message);
+		}
 	}
 
 	// ---- Launch -------------------------------------------------------------------------------

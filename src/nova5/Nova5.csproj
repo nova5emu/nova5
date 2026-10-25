@@ -9,7 +9,7 @@
     <AssemblyName>Nova5</AssemblyName>
     <RootNamespace>Nova5</RootNamespace>
     <ApplicationIcon>Assets\nova5.ico</ApplicationIcon>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Product>Nova5</Product>
     <Copyright>GPL-2.0-or-later. Based on KytyPS5.</Copyright>
     <!-- One executable next to Nova5Emulator.exe that carries its own .NET runtime, so any PC can run it. -->

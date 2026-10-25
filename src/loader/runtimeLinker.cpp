@@ -672,11 +672,7 @@ bool HandleGpuAccessFault(const Common::HostException::ExceptionInfo& exception_
 			namespace IR = Libs::Graphics::ShaderRecompiler::IR;
 			const bool walker_load = access == GpuAccess::Read && IR::SrtWalkerLoadLength(info->exception_address) != 0;
 			read_profile.SrtWalker(walker_load);
-			const bool walker_clean = walker_load &&
-			    Common::SubmitProfile::ExperimentActive(Common::SubmitProfile::Experiment::SrtCleanRead);
-			const bool clean_experiment = access == GpuAccess::Read && (walker_clean ||
-			    Common::SubmitProfile::ExperimentActive(Common::SubmitProfile::Experiment::ReadFaultClean));
-			if (read_profile.Enabled() || clean_experiment) {
+			if (read_profile.Enabled() || walker_load) {
 				// Do not probe across an instruction-page boundary. Incomplete or
 				// unsupported instructions remain unknown, without affecting recovery.
 				const auto bytes = std::min<uint64_t>(15, 4096 - (info->exception_address & 4095));
@@ -684,13 +680,13 @@ bool HandleGpuAccessFault(const Common::HostException::ExceptionInfo& exception_
 					const auto read = Loader::X64InstructionEmulator::DescribeReadAccess(
 					    {reinterpret_cast<const uint8_t*>(info->exception_address), static_cast<size_t>(bytes)}, *info);
 					read_profile.ReadAccess(read.address, read.size);
-					if (clean_experiment && Loader::X64InstructionEmulator::TryEmulateRead(
+					if (walker_load && Loader::X64InstructionEmulator::TryEmulateRead(
 					        {reinterpret_cast<const uint8_t*>(info->exception_address), static_cast<size_t>(bytes)},
-					        *info, walker_clean ? IR::SrtWalkerTryReadClean : Libs::LibKernel::Memory::TryReadCleanBufferBacking)) {
+					        *info, IR::SrtWalkerTryReadClean)) {
 						handled = true;
 						read_profile.ServedClean();
 						Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::FalseSharedServed);
-						if (walker_clean) Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::WalkerCleanFaults);
+						Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::WalkerCleanFaults);
 					}
 				}
 			}

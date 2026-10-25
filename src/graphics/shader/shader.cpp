@@ -155,10 +155,7 @@ void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 
 	const bool debug_dump = Config::GraphicsDebugDumpEnabled();
 	namespace Profile = Common::SubmitProfile;
-	const bool clean_read = Profile::ExperimentActive(Profile::Experiment::AttribCleanRead) ||
-	                        Profile::ExperimentActive(Profile::Experiment::SrtCleanRead);
 	auto try_clean = [&](const uint32_t* source, void* destination, uint64_t bytes) {
-		if (!clean_read) return false;
 		// No cached guest values: copy only a currently clean range from the
 		// unprotected alias. Pending publications, dirty bytes and cross-page
 		// operands keep the normal protected load/readback path.

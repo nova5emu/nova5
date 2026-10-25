@@ -10,6 +10,8 @@ public sealed class Store
 	public List<string>                 ExtraDirs   { get; set; } = new();
 	public bool                         Music       { get; set; } = true;
 	public double                       MusicVolume { get; set; } = 0.6;
+	// "avisar" shows an update and waits for the player, "auto" installs it at startup, "no" never checks.
+	public string                       UpdateMode  { get; set; } = "avisar";
 
 	private static string FilePath => Path.Combine(AppContext.BaseDirectory, "nova5.json");
 

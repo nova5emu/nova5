@@ -141,11 +141,7 @@ void TestReadFaultAttribution() {
 int main(int argc, char** argv) {
 	const bool release_mem = argc > 1 && std::string_view(argv[1]) == "--experiment-release";
 	const bool retired = argc > 1 && std::string_view(argv[1]) == "--experiment-retired";
-	const bool read_clean = argc > 1 && std::string_view(argv[1]) == "--experiment-read-fault-clean";
-	const bool attrib_clean = argc > 1 && std::string_view(argv[1]) == "--experiment-attrib-clean-read";
-	const bool srt_clean = argc > 1 && std::string_view(argv[1]) == "--experiment-srt-clean-read";
-	const auto* experiment = release_mem ? "release-mem" : retired ? "overlap-fast" : read_clean ? "read-fault-clean" :
-	                         attrib_clean ? "attrib-clean-read" : srt_clean ? "srt-clean-read" : "";
+	const auto* experiment = release_mem ? "release-mem" : retired ? (argc > 2 ? argv[2] : "overlap-fast") : "";
 #if defined(_WIN32)
 	_putenv_s("KYTY_EXPERIMENT", experiment);
 #else
@@ -153,24 +149,16 @@ int main(int argc, char** argv) {
 #endif
 	Check(ParseExperiment("") == Experiment::None && ParseExperiment("typo") == Experiment::None);
 	Check(ParseExperiment("release-mem") == Experiment::ReleaseMem);
-	Check(ParseExperiment("read-fault-clean") == Experiment::ReadFaultClean);
-	Check(ParseExperiment("attrib-clean-read") == Experiment::AttribCleanRead);
-	Check(ParseExperiment("srt-clean-read") == Experiment::SrtCleanRead);
-	// Old helpers may still pass the retired name. It must not select RELEASE_MEM.
-	Check(ParseExperiment("overlap-fast") == Experiment::None);
-	Check(std::string_view(ExperimentName()) == (release_mem ? "release-mem" : read_clean ? "read-fault-clean" :
-	                                           attrib_clean ? "attrib-clean-read" : srt_clean ? "srt-clean-read" : "none"));
+	// Old helpers may keep these names. None may activate RELEASE_MEM or
+	// disable the promoted clean reads when experiment.trigger is toggled.
+	for (const auto name: {"overlap-fast", "read-fault-clean", "attrib-clean-read", "srt-clean-read"})
+		Check(ParseExperiment(name) == Experiment::None);
+	Check(std::string_view(ExperimentName()) == (release_mem ? "release-mem" : "none"));
 	SetExperiment(true);
 	Check(ExperimentActive(Experiment::ReleaseMem) == release_mem);
-	Check(ExperimentActive(Experiment::ReadFaultClean) == read_clean);
-	Check(ExperimentActive(Experiment::AttribCleanRead) == attrib_clean);
-	Check(ExperimentActive(Experiment::SrtCleanRead) == srt_clean);
 	Check(!ExperimentActive(Experiment::None));
 	SetExperiment(false);
 	Check(!ExperimentActive(Experiment::ReleaseMem));
-	Check(!ExperimentActive(Experiment::ReadFaultClean));
-	Check(!ExperimentActive(Experiment::AttribCleanRead));
-	Check(!ExperimentActive(Experiment::SrtCleanRead));
 	const bool armed = Armed();
 	// Disarmed builds never record and scopes leave thread-local state untouched.
 	SetRecording(true);

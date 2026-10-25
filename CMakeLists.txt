@@ -688,13 +688,13 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-release)
 	add_test(NAME submit_profile_experiment_retired
 	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired)
-	add_test(NAME submit_profile_experiment_read_fault_clean
-	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-read-fault-clean)
-	add_test(NAME submit_profile_experiment_attrib_clean_read
-	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-attrib-clean-read)
-	add_test(NAME submit_profile_experiment_srt_clean_read
-	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-srt-clean-read)
-	set_tests_properties(submit_profile_experiment_release submit_profile_experiment_retired submit_profile_experiment_read_fault_clean submit_profile_experiment_attrib_clean_read submit_profile_experiment_srt_clean_read
+	add_test(NAME submit_profile_retired_read_fault_clean
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired read-fault-clean)
+	add_test(NAME submit_profile_retired_attrib_clean_read
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired attrib-clean-read)
+	add_test(NAME submit_profile_retired_srt_clean_read
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired srt-clean-read)
+	set_tests_properties(submit_profile_experiment_release submit_profile_experiment_retired submit_profile_retired_read_fault_clean submit_profile_retired_attrib_clean_read submit_profile_retired_srt_clean_read
 	                     PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
 	add_test(NAME submit_profile_runtime COMMAND $<TARGET_FILE:submit_profile_runtime_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
@@ -788,12 +788,8 @@ if(BUILD_TESTING)
 	add_test(NAME buffer_cache_ranges
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 	if(WIN32)
-		add_test(NAME gpu_read_fault_clean
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --read-fault-clean-only)
-		add_test(NAME gpu_attrib_clean_read
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --attrib-clean-read-only)
-		add_test(NAME gpu_srt_clean_read
-			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srt-clean-read-only)
+		add_test(NAME gpu_clean_reads
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --clean-reads-only)
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS
