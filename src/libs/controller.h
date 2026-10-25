@@ -1,0 +1,141 @@
+#ifndef EMULATOR_INCLUDE_EMULATOR_CONTROLLER_H_
+#define EMULATOR_INCLUDE_EMULATOR_CONTROLLER_H_
+
+#include "common/abi.h"
+#include "common/common.h"
+namespace Libs::Controller {
+
+void Initialize();
+void Shutdown();
+void EmergencyShutdown();
+
+struct Lifecycle {
+	static constexpr const char* name               = "Controller";
+	static constexpr auto        initialize         = Libs::Controller::Initialize;
+	static constexpr auto        shutdown           = Libs::Controller::Shutdown;
+	static constexpr auto        emergency_shutdown = Libs::Controller::EmergencyShutdown;
+};
+
+constexpr int HOST_INPUT_CONTROLLER_ID = -1000;
+
+constexpr int PAD_ERROR_INVALID_ARG     = -2137915391; /* 0x80920001 */
+constexpr int PAD_ERROR_INVALID_HANDLE  = -2137915389; /* 0x80920003 */
+constexpr int PAD_ERROR_ALREADY_OPENED  = -2137915388; /* 0x80920004 */
+constexpr int PAD_ERROR_NOT_INITIALIZED = -2137915387; /* 0x80920005 */
+constexpr int PAD_ERROR_NO_HANDLE       = -2137915384; /* 0x80920008 */
+
+constexpr uint32_t PAD_BUTTON_L3        = 0x00000002;
+constexpr uint32_t PAD_BUTTON_R3        = 0x00000004;
+constexpr uint32_t PAD_BUTTON_OPTIONS   = 0x00000008;
+constexpr uint32_t PAD_BUTTON_UP        = 0x00000010;
+constexpr uint32_t PAD_BUTTON_RIGHT     = 0x00000020;
+constexpr uint32_t PAD_BUTTON_DOWN      = 0x00000040;
+constexpr uint32_t PAD_BUTTON_LEFT      = 0x00000080;
+constexpr uint32_t PAD_BUTTON_L2        = 0x00000100;
+constexpr uint32_t PAD_BUTTON_R2        = 0x00000200;
+constexpr uint32_t PAD_BUTTON_L1        = 0x00000400;
+constexpr uint32_t PAD_BUTTON_R1        = 0x00000800;
+constexpr uint32_t PAD_BUTTON_TRIANGLE  = 0x00001000;
+constexpr uint32_t PAD_BUTTON_CIRCLE    = 0x00002000;
+constexpr uint32_t PAD_BUTTON_CROSS     = 0x00004000;
+constexpr uint32_t PAD_BUTTON_SQUARE    = 0x00008000;
+constexpr uint32_t PAD_BUTTON_TOUCH_PAD = 0x00100000;
+
+enum class Axis {
+	LeftX        = 0,
+	LeftY        = 1,
+	RightX       = 2,
+	RightY       = 3,
+	TriggerLeft  = 4,
+	TriggerRight = 5,
+
+	AxisMax
+};
+
+enum class Sensor { Accel, Gyro };
+
+struct PadControllerInformation;
+struct PadData;
+struct PadVibrationParam;
+struct PadLightBarParam;
+struct PadTriggerEffectParam;
+struct PadTriggerEffectStateInformation;
+
+inline int controller_get_axis(int min, int max, int value) {
+	int v = (255 * (value - min)) / (max - min);
+	if (v < 0) {
+		return 0;
+	}
+	if (v > 255) {
+		return 255;
+	}
+	return v;
+}
+
+void Connect(int id);
+void Disconnect(int id);
+// Moves the keyboard to the next player (shared with player 1, then 1-4) while the game runs.
+void CycleKeyboardPlayer();
+void SetButton(int id, uint32_t button, bool down);
+void SetAxis(int id, Axis axis, int value);
+void SetRightStick(int id, int x, int y);
+void SetTouchPad(int id, int finger, bool down, float x, float y);
+void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
+void ToggleGyroEmulation(int id);
+void ResetInputState();
+int  GetActiveControllerId();
+// True when the player has a keyboard or gamepad assigned.
+bool IsPlayerConnected(int player);
+
+enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };
+
+void  CycleSetting(Setting setting);
+float GetSettingScale(Setting setting);
+
+int  PadCheckHandle(int handle);
+bool PadInitialized();
+
+// Virtual headset only (padVr.cpp): the Sense controller ports of the initial user. Their handles
+// stay outside the per-player range and otherwise act on the first player.
+constexpr int PAD_HANDLE_VR_LEFT = 0x10; // The right controller follows it.
+
+// 0 for the left and 1 for the right Sense controller handle, -1 for any other handle.
+constexpr int PadVrHand(int handle) {
+	return handle == PAD_HANDLE_VR_LEFT || handle == PAD_HANDLE_VR_LEFT + 1
+	           ? handle - PAD_HANDLE_VR_LEFT
+			   : -1;
+}
+
+// Hand of a Sense controller port type, -1 for other types or without the virtual headset.
+int PadVrPortHand(int type);
+// scePadOpen (open) or scePadGetHandle for a Sense controller port.
+int PadVrPort(int user_id, int hand, int index, bool open);
+int PadVrCheckHandle(int handle);
+int PadVrClose(int handle);
+
+struct PadVrControllerData;
+
+int KYTY_SYSV_ABI PadVrControllerReadState(int handle, PadVrControllerData* data);
+int KYTY_SYSV_ABI PadVrControllerSetTriggerEffects(int left_handle, int right_handle,
+                                                   const PadTriggerEffectParam* param);
+
+int KYTY_SYSV_ABI PadInit();
+int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param);
+int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index);
+int KYTY_SYSV_ABI PadClose(int handle);
+int KYTY_SYSV_ABI PadSetMotionSensorState(int handle, bool enable);
+int KYTY_SYSV_ABI PadSetAngularVelocityDeadbandState(int handle, bool enable);
+int KYTY_SYSV_ABI PadResetOrientation(int handle);
+int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformation* info);
+int KYTY_SYSV_ABI PadIsRemoteController(int handle, bool* is_remote);
+int KYTY_SYSV_ABI PadReadState(int handle, PadData* data);
+int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num);
+int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param);
+int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* param);
+int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info);
+int KYTY_SYSV_ABI PadResetLightBar(int handle);
+int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param);
+
+} // namespace Libs::Controller
+
+#endif /* EMULATOR_INCLUDE_EMULATOR_CONTROLLER_H_ */

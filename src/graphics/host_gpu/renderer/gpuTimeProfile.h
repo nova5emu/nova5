@@ -1,0 +1,82 @@
+#pragma once
+
+#include "graphics/host_gpu/vulkanCommon.h"
+#include <array>
+#include <cstdint>
+
+namespace Libs::Graphics {
+class CommandScheduler;
+struct GraphicContext;
+
+// Opt-in GPU elapsed-time sampling with Vulkan timestamps, active only while SubmitProfile records.
+// One block of queries per command buffer of the owning scheduler: reset when the command buffer
+// begins (outside rendering), a TOP->BOTTOM pair spanning the whole command buffer, and pairs around
+// chosen operations. Results are read only after the block's tick completed, without WAIT_BIT,
+// flushes or waits; a block that is not ready yet is simply read later. Intervals are GPU elapsed
+// times between pipeline points: they may overlap and include dependencies, so they are neither
+// exclusive costs nor a serial "work per frame".
+class GpuTimeProfile {
+public:
+	enum class Category : uint8_t { Detile, TextureUpload, DepthDetile, DepthConvert, DepthUpload, Count };
+
+	explicit GpuTimeProfile(GraphicContext& graphics);
+	~GpuTimeProfile();
+	GpuTimeProfile(const GpuTimeProfile&)            = delete;
+	GpuTimeProfile& operator=(const GpuTimeProfile&) = delete;
+
+	void SetOwner(CommandScheduler* owner) { m_owner = owner; }
+	// Right after the scheduler began a new command buffer.
+	void OnBegin(CommandScheduler& scheduler, vk::CommandBuffer command);
+	// Right before the scheduler ends the command buffer that will signal `tick`.
+	void OnSubmit(CommandScheduler& scheduler, vk::CommandBuffer command, uint64_t tick);
+
+	struct Token {
+		uint32_t query      = UINT32_MAX;
+		uint64_t generation = 0; // Command buffer recording that wrote the begin timestamp.
+	};
+	Token Begin(CommandScheduler& scheduler, vk::CommandBuffer command);
+	void  End(CommandScheduler& scheduler, vk::CommandBuffer command, Token token, Category category);
+
+private:
+	static constexpr uint32_t Blocks        = 512;
+	static constexpr uint32_t SlotsPerBlock = 32;
+	struct Block {
+		uint64_t tick       = 0; // Nonzero while results are pending.
+		uint64_t generation = 0; // Recording that owns the block.
+		uint64_t session    = 0; // Profile session (recording period) the block belongs to.
+		uint32_t used       = 0;
+		uint32_t ended      = 0; // Bit per pair after the first: closed in the same recording.
+		std::array<uint8_t, SlotsPerBlock / 2> categories {};
+	};
+	void Poll(CommandScheduler& scheduler);
+
+	GraphicContext&           m_graphics;
+	CommandScheduler*         m_owner = nullptr;
+	vk::QueryPool             m_pool;
+	std::array<Block, Blocks> m_blocks {};
+	int32_t                   m_active     = -1;
+	uint32_t                  m_next       = 0;
+	uint32_t                  m_begins     = 0;
+	uint64_t                  m_generation = 0;
+	uint64_t                  m_session    = 0;
+	bool                      m_recording  = false;
+	uint64_t                  m_valid_mask = 0; // 0 when the queue has no timestamp support.
+	double                    m_period_ns  = 1.0;
+};
+
+// Times one operation recorded into the scheduler's current command buffer. If the command buffer
+// changes before the scope ends (an intermediate flush), the pair is dropped and counted, never
+// misattributed.
+class GpuTimeScope {
+public:
+	GpuTimeScope(CommandScheduler& scheduler, GpuTimeProfile::Category category);
+	~GpuTimeScope();
+	GpuTimeScope(const GpuTimeScope&)            = delete;
+	GpuTimeScope& operator=(const GpuTimeScope&) = delete;
+
+private:
+	CommandScheduler&        m_scheduler;
+	GpuTimeProfile::Category m_category;
+	GpuTimeProfile::Token    m_token;
+};
+} // namespace Libs::Graphics

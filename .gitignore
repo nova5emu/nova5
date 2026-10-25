@@ -1,0 +1,12 @@
+# Visual Studio 2015 cache/options directory
+.vs/
+.idea/
+build/
+_Build/vscode-clang/
+_Build/
+cmake-build-debug/
+_PipelineCache/
+CMakeUserPresets.json
+# Nova5 launcher build output
+src/nova5/bin/
+src/nova5/obj/

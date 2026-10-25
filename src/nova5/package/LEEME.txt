@@ -1,0 +1,46 @@
+﻿Nova5 - emulador de PS5 para PC
+================================
+
+Nova5 es un emulador de PlayStation 5 de código abierto basado en KytyPS5,
+con un lanzador propio de estilo consola: carátulas, fondos y música de menú
+de cada juego, y uso completo con mando.
+
+Requisitos
+----------
+- Windows 10 u 11 de 64 bits.
+- Tarjeta gráfica con Vulkan 1.3 y controladores actualizados
+  (NVIDIA RTX, AMD RX 6000 o superior recomendadas).
+- 16 GB de RAM o más.
+- Tus propios juegos de PS5, extraídos de una copia que poseas legalmente.
+  Nova5 no incluye juegos, firmware ni claves de ninguna consola.
+
+Primeros pasos
+--------------
+1. Abre Nova5 desde el menú Inicio o el acceso directo del escritorio.
+2. Pulsa el botón + y elige la carpeta donde tienes tus juegos extraídos
+   (cada juego es una carpeta con eboot.bin y sce_sys).
+3. Elige un juego y pulsa Jugar (botón A del mando o Enter).
+
+Controles del lanzador
+----------------------
+Mando: cruceta o stick para moverte, A aceptar, B atrás, Y ajustes,
+LB/RB cambiar de pestaña.
+Teclado: flechas, Enter, Esc, Q/E para pestañas y F11 para pantalla completa.
+
+Estado del proyecto
+-------------------
+La emulación de PS5 es experimental. Muchos juegos todavía no arrancan o van
+lentos. La compatibilidad mejora con cada versión.
+
+Licencia y código fuente
+------------------------
+Nova5 se distribuye bajo la Licencia Pública General de GNU, versión 2
+(GPL-2.0), la misma que KytyPS5; ver LICENSE.txt. El Kyty original está bajo
+licencia MIT y los componentes de terceros conservan sus propias licencias
+(carpeta licenses).
+
+Código fuente completo: https://github.com/nova5emu/nova5
+Web oficial: https://nova5emu.github.io/nova5/
+
+Nova5 no está afiliado, respaldado ni patrocinado por Sony Interactive
+Entertainment. "PlayStation" y "PS5" son marcas de sus respectivos dueños.
