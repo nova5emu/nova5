@@ -48,11 +48,13 @@ foreach ($dir in Get-ChildItem (Join-Path $repo '3rdparty') -Directory) {
 Copy-Item (Join-Path $PSScriptRoot 'LEEME.txt') $stage
 
 # PKG installer: pkg-to-anyps5 (GPL-3.0, https://github.com/awake-devel/pkg-to-anyps5), run by the launcher.
-$extractor = Join-Path $repo '..\herramientas\pkg-extractor\pkg-to-anyps5-v0.2.5-windows-x86_64'
+# v0.2.5 source with pkg-to-anyps5.patch applied, built with cargo build --release.
+$extractor = Join-Path $repo '..\herramientas\pkg-extractor\pkg-to-anyps5-src'
 New-Item -ItemType Directory -Force (Join-Path $stage 'tools') | Out-Null
-Copy-Item (Join-Path $extractor 'pkg-to-anyps5.exe') (Join-Path $stage 'tools')
+Copy-Item (Join-Path $extractor 'target\release\pkg-to-anyps5.exe') (Join-Path $stage 'tools')
 Copy-Item (Join-Path $extractor 'LICENSE') (Join-Path $licenses 'pkg-to-anyps5-LICENSE.txt')
 Copy-Item (Join-Path $extractor 'README.md') (Join-Path $licenses 'pkg-to-anyps5-README.md')
+Copy-Item (Join-Path $PSScriptRoot 'pkg-to-anyps5.patch') (Join-Path $licenses 'pkg-to-anyps5-changes.patch')
 
 $iscc = @("$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe", 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe') |
     Where-Object { Test-Path $_ } | Select-Object -First 1

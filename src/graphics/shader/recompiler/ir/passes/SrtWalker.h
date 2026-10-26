@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <span>
 
+namespace Common::ReadbackProfile { struct Origin; }
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
@@ -63,7 +65,11 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
 };
 
-enum class RuntimeValueType { Any, Integer, ImmutableInteger };
+// ReadOnlyControlInteger excludes native reads that may overlap writes to their
+// buffer when projecting optional host control, retaining proven disjoint fixed
+// ranges. It is not a proof about aliases through other resources:
+// mandatory descriptor/SRT dependencies still require CommitBindings' checks.
+enum class RuntimeValueType { Any, Integer, ImmutableInteger, ReadOnlyControlInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
@@ -84,6 +90,9 @@ bool WalkedActive(const ResourcePlan& plan, uint32_t source);
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
+bool DescribeSrtWalkerRead(uint64_t rip, Common::ReadbackProfile::Origin& origin);
+// Called only after a real tracked read fault was handled, never for a clean-read bypass.
+bool NoteSrtControlReadback(uint64_t rip);
 // Called only for a recognized walker load (by its generated slow path or the
 // exception handler). Remembers a page hint, never values or alias pointers.
 bool SrtWalkerTryReadClean(uint64_t address, void* data, uint64_t bytes);

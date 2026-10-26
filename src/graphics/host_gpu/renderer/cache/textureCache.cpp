@@ -293,6 +293,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	m_image_candidate_hints.Invalidate();
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
@@ -315,6 +316,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	m_image_candidate_hints.Invalidate();
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -521,6 +523,23 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 	for (const auto id: result) {
 		m_slot_images[id].picked = false;
 	}
+	return result;
+}
+
+TextureCache::ImageIds TextureCache::FindImageCandidates(uint64_t address, uint64_t size) {
+	// Copy the list before resolving overlaps: resolution may change the index and
+	// invalidate hints. No cached image pointers, descriptions or dirty state escape.
+	using namespace Common::SubmitProfile;
+	if (const auto* cached = m_image_candidate_hints.Find(address, size)) {
+		AddExtra(Extra::ImageFindHintHits);
+		ImageIds result;
+		for (const auto id: *cached) result.push_back(id);
+		return result;
+	}
+	AddExtra(Extra::ImageFindHintMisses);
+	auto result = FindImagesInRegion(address, size, false);
+	if (!m_image_candidate_hints.Store(address, size, result))
+		AddExtra(Extra::ImageFindHintTooLarge);
 	return result;
 }
 
@@ -1336,6 +1355,9 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 			}
 			depth.stencil_ids.push_back(association);
 		}
+		// This is the only in-place replacement of a registered ImageInfo. Keep
+		// range-query hints invalid even if the association's size changes.
+		m_image_candidate_hints.Invalidate();
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
@@ -1345,106 +1367,145 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
-	auto& command = m_scheduler.Current();
-	if (command.IsInvalid()) {
-		EXIT("TextureCache: image lookup requires a valid command buffer\n");
+	using namespace Common::RenderStageProfile;
+	if (Detail::DetailedEnabled() && Detail::IsImageBindingLookup(Detail::state.active))
+		return FindImageImpl<true>(desc, exact_format);
+	return FindImageImpl<false>(desc, exact_format);
+}
+
+template <bool Profile>
+ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format) {
+	using namespace Common::RenderStageProfile;
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::ImageLookupValidate};
+		auto& command = m_scheduler.Current();
+		if (command.IsInvalid()) {
+			EXIT("TextureCache: image lookup requires a valid command buffer\n");
+		}
+		ValidateImageDesc(desc);
+		EXIT_IF(desc.info.data.Empty());
 	}
-	ValidateImageDesc(desc);
-	EXIT_IF(desc.info.data.Empty());
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
 	{
-		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		std::unique_lock lock {m_lock, std::defer_lock};
+		{
+			[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::ImageLookupLock};
+			lock.lock();
+		}
+		const auto candidates = [&] {
+			[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::ImageLookupCandidates};
+			return FindImageCandidates(desc.info.data.address, desc.info.data.size);
+		}();
+		if constexpr (Profile) Detail::state.image_lookups.Observe(candidates.size());
 		bool block_alias = false;
 
-		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
-			// Stencil descriptors name the associated plane; its depth owner supplies
-			// the native image and the canonical guest tiling.
-			if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
-			    image.depth_id && image.info.data == desc.info.data &&
-			    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
-			    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
-			    image.info.resources.levels >= desc.info.resources.levels &&
-			    image.info.resources.layers >= desc.info.resources.layers &&
-			    desc.info.bytes_per_block == 1 &&
-			    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
-				result = id;
-				break;
-			}
-			if (SameBacking(image.info, desc.info, exact_format)) {
-				result = id;
-			} else if (image.SafeToDownload() &&
-			           BcAlias::Matches(desc.info, image.info)) {
-				block_alias = true;
+		{
+			[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::ImageLookupMatch};
+			for (const auto id: candidates) {
+				const auto& image = m_slot_images[id];
+				// Stencil descriptors name the associated plane; its depth owner supplies
+				// the native image and the canonical guest tiling.
+				if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+				    image.depth_id && image.info.data == desc.info.data &&
+				    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
+				    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
+				    image.info.resources.levels >= desc.info.resources.levels &&
+				    image.info.resources.layers >= desc.info.resources.layers &&
+				    desc.info.bytes_per_block == 1 &&
+				    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
+					if constexpr (Profile) ++Detail::state.image_lookups.stencil_matches;
+					result = id;
+					break;
+				}
+				if constexpr (Profile) ++Detail::state.image_lookups.backing_checks;
+				if (SameBacking(image.info, desc.info, exact_format)) {
+					result = id;
+				} else if (image.SafeToDownload() &&
+				           BcAlias::Matches(desc.info, image.info)) {
+					block_alias = true;
+				}
 			}
 		}
+		if constexpr (Profile) Detail::state.image_lookups.direct_matches += static_cast<bool>(result);
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
-		if (!result) {
-			for (const auto candidate: candidates) {
-				view_mip                = -1;
-				view_layer              = -1;
-				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
-				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
-				if (overlap.image) {
-					result     = overlap.image;
-					view_mip   = overlap.mip;
-					view_layer = overlap.layer;
+		{
+			[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::ImageLookupOverlap};
+			if (!result) {
+				for (const auto candidate: candidates) {
+					view_mip                = -1;
+					view_layer              = -1;
+					const auto& merged_info = result ? m_slot_images[result].info : desc.info;
+					if constexpr (Profile) ++Detail::state.image_lookups.overlap_checks;
+					const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
+					if (overlap.image) {
+						result     = overlap.image;
+						view_mip   = overlap.mip;
+						view_layer = overlap.layer;
+					}
+				}
+			} else if (block_alias) {
+				for (const auto candidate: candidates) {
+					if constexpr (Profile) ++Detail::state.image_lookups.alias_checks;
+					const auto& owner = m_slot_images[candidate];
+					if (candidate != result && owner.registered && !owner.IsCpuDirty() &&
+					    BcAlias::Matches(m_slot_images[result].info, owner.info)) {
+						if constexpr (Profile) ++Detail::state.image_lookups.alias_resolves;
+						BcAlias::Resolve(*this, candidate, result);
+					}
 				}
 			}
-		} else if (block_alias) {
-			for (const auto candidate: candidates) {
-				const auto& owner = m_slot_images[candidate];
-				if (candidate != result && owner.registered && !owner.IsCpuDirty() &&
-				    BcAlias::Matches(m_slot_images[result].info, owner.info)) {
-					BcAlias::Resolve(*this, candidate, result);
+		}
+		{
+			[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::ImageLookupFinalize};
+			if (result && !m_slot_images[result].depth_id) {
+				auto& resolved = m_slot_images[result];
+				if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
+					if constexpr (Profile) ++Detail::state.image_lookups.format_rejects;
+					result = {};
+				} else if (resolved.info.resources < desc.info.resources) {
+					if constexpr (Profile) ++Detail::state.image_lookups.recreates;
+					FreeImage(result);
+					result = {};
 				}
 			}
-		}
-
-		if (result && !m_slot_images[result].depth_id) {
-			auto& resolved = m_slot_images[result];
-			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
-				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
-				FreeImage(result);
-				result = {};
+			if (!result) {
+				if constexpr (Profile) ++Detail::state.image_lookups.inserts;
+				result         = InsertImage(desc.info);
+				auto& inserted = m_slot_images[result];
+				if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
+				                                    inserted.info.data.size)) {
+					inserted.MarkBufferModified();
+				}
 			}
-		}
-		if (!result) {
-			result         = InsertImage(desc.info);
-			auto& inserted = m_slot_images[result];
-			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
-			                                    inserted.info.data.size)) {
-				inserted.MarkBufferModified();
+			auto& image = m_slot_images[result];
+			if (view_mip >= 0) {
+				desc.view_info.base_level = static_cast<uint32_t>(view_mip);
 			}
+			if (view_layer >= 0) {
+				desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
+			}
+			image.tick_accessed_last = m_scheduler.CurrentTick();
+			TouchImage(image);
 		}
-		auto& image = m_slot_images[result];
-		if (view_mip >= 0) {
-			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
-		}
-		if (view_layer >= 0) {
-			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
-		}
-		image.tick_accessed_last = m_scheduler.CurrentTick();
-		TouchImage(image);
 	}
-	MaterializeColorClear(result, desc, metadata_base_layer);
-	if (desc.type == BindingType::VideoOut &&
-	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
-		std::scoped_lock lock {m_lock};
-		const auto& image = m_slot_images[result];
-		const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
-		const bool native_current =
-		    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
-		if (!native_current) {
-			EXIT("TextureCache: compressed video-out read requires clean native GPU "
-			     "contents\n");
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::ImageLookupClear};
+		MaterializeColorClear(result, desc, metadata_base_layer);
+		if (desc.type == BindingType::VideoOut &&
+		    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
+			std::scoped_lock lock {m_lock};
+			const auto& image = m_slot_images[result];
+			const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
+			const bool native_current =
+			    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
+			if (!native_current) {
+				EXIT("TextureCache: compressed video-out read requires clean native GPU "
+				     "contents\n");
+			}
 		}
 	}
 	return result;
@@ -1959,22 +2020,41 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	return true;
 }
 
+template <bool ProfileRebind>
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
+	if constexpr (ProfileRebind) ++Common::RenderStageProfile::Detail::state.buffer_rebinds.invalidation_calls;
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
+	uint64_t matched = 0, changed = 0;
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
 		if (image.info.data.address != address) {
 			continue;
+		}
+		if constexpr (ProfileRebind) {
+			++matched;
+			changed += image.IsGpuModified() || !image.IsBufferModified();
+			Common::RenderStageProfile::Detail::state.buffer_rebinds.heap_notifications +=
+			    image.heap_refs.load(std::memory_order_relaxed) != 0;
 		}
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();
 		}
 		image.MarkBufferModified();
 	}
+	if constexpr (ProfileRebind) {
+		auto& counters = Common::RenderStageProfile::Detail::state.buffer_rebinds;
+		counters.invalidation_matches += matched != 0;
+		counters.invalidation_changes += changed != 0;
+		counters.matched_images += matched;
+		counters.changed_images += changed;
+	}
 }
+
+template void TextureCache::InvalidateMemoryFromGPU<false>(uint64_t, uint64_t);
+template void TextureCache::InvalidateMemoryFromGPU<true>(uint64_t, uint64_t);
 
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);

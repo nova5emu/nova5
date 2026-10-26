@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "SrtWalkerTestMemory.h"
+#include "common/readbackProfile.h"
 
 #include <bit>
 #include <cstdio>
@@ -280,6 +281,15 @@ void TestNativeNestedSrtRefresh() {
                   std::vector<uint32_t>{(*data)[1], table[0], table[1], (*data)[2]},
           "native SRT refresh lost pointer masking, alignment, or current values");
   }
+  // Identical SGPRs, root/leaf pointers and specialization do not imply identical
+  // materialized data. A CPU store can change a table without moving it.
+  const auto previous_specialization = specialization;
+  second[1] ^= 1u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.flattened_srt ==
+                std::vector<uint32_t>{second[1], table[0], table[1], second[2]} &&
+            specialization == previous_specialization,
+        "same-pointer table DWORD update must refresh data even with unchanged specialization");
   {
     // Unmapped tables and the null pointer they yield read as zero.
     FakeGuestMemory unmapped;
@@ -635,6 +645,165 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
                   ? std::vector<std::pair<uint64_t, uint64_t>>{{0x1004u, 4u}}
                   : std::vector<std::pair<uint64_t, uint64_t>>{}),
           "writable descriptor lost its address or captured an immutable predicate");
+  }
+}
+
+void TestWritableBufferControlProjection(bool adaptive = true) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  for (bool scalar : {false, true}) for (bool written : {false, true}) for (bool descriptor_dependency : {false, true}) {
+    Program program;
+    program.shader_hash = 0x12345678;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    auto &entry = AddValueBlock(program);
+    auto &yes = AddValueBlock(program);
+    auto &no = AddValueBlock(program);
+    program.memory_info.push_back({.kind = scalar ? ResourceKind::ScalarBuffer : ResourceKind::Buffer, .resource = 0});
+    auto &handle = entry.AppendNewInst(ValueOpcode::GetBufferResource,
+        {Value(0x1000u), Value(4u << 16u), Value(4u), Value(0x16204u)});
+    auto &read = scalar
+        ? entry.AppendNewInst(ValueOpcode::ReadConstBuffer, {Value(&handle), Value(0u)})
+        : entry.AppendNewInst(ValueOpcode::LoadBufferU32,
+            {Value(&handle), Value(0u), Value(0u), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 0, .pc = 0x24});
+    auto &varying = entry.AppendNewInst(ValueOpcode::UndefU32);
+    auto &condition = entry.AppendNewInst(ValueOpcode::ULessThan32,
+        {Value(&varying), Value(&read)});
+    entry.condition = Value(&condition);
+    entry.terminator.kind = TerminatorKind::ConditionalBranch;
+    entry.terminator.true_block = &yes;
+    entry.terminator.false_block = &no;
+    yes.terminator.kind = no.terminator.kind = TerminatorKind::Return;
+    for (uint32_t i = 0; i < 3; ++i) {
+      DescriptorSource source;
+      source.dwords = {Value(0x1000u + i * 0x1000u), Value(4u << 16u), Value(4u), Value(0x16204u)};
+      source.dword_count = 4;
+      program.descriptor_sources.push_back(source);
+      program.info.buffers.push_back({.source = i, .read = true, .written = i != 0 || written});
+      if (i == 0) continue;
+      auto &block = i == 1 ? yes : no;
+      auto &out = block.AppendNewInst(ValueOpcode::GetBufferResource,
+          {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
+      program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = i});
+      block.AppendNewInst(ValueOpcode::StoreBufferU32,
+          {Value(&out), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)})
+          .SetFlags(MemoryFlags{.index = i});
+    }
+    if (descriptor_dependency) {
+      // The same read also selects an actual descriptor: suppressing control
+      // projection must NOT suppress this mandatory descriptor dependency.
+      program.descriptor_sources[2].dwords[0] = Value(&read);
+    }
+    Check(ValidateRuntimeValue(program, Value(&read), RuntimeValueType::Integer) &&
+              ValidateRuntimeValue(program, Value(&read), RuntimeValueType::ReadOnlyControlInteger) == !written,
+          "writable buffer control classification changed descriptor evaluation");
+    auto plan = Extract(program); // Includes save/load round trip.
+    struct ReadState {
+      uint32_t calls = 0, attributed = 0;
+      bool written, descriptor;
+      uint32_t word = 0;
+      bool train = false;
+    };
+    ReadState read_state{0, 0, written, descriptor_dependency};
+    FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
+      ++static_cast<ReadState *>(data)->calls;
+      Check(address == 0x1000u && words.size() == 1, "unexpected control read");
+      words[0] = static_cast<ReadState *>(data)->word;
+      return true;
+    }, &read_state, +[](void* data, uint64_t rip, uint64_t address) {
+      auto& state = *static_cast<ReadState*>(data);
+      if (state.train) {
+        Check(NoteSrtControlReadback(rip) == (!state.written && !state.descriptor),
+              "adaptive control suppressed a mandatory descriptor dependency");
+      }
+      if (!Common::ReadbackProfile::Armed()) return;
+      Common::ReadbackProfile::Origin reader;
+      Check(DescribeSrtWalkerRead(rip, reader) && reader.hash == 0x12345678 &&
+                reader.memory == 0 && reader.resource == 0 && address == 0x1000 &&
+                (std::string_view(reader.opcode) == "LoadBufferU32" || std::string_view(reader.opcode) == "ReadConstBuffer"),
+            "JIT fault attribution lost its reader or memory instruction");
+      Check((reader.uses & 1u) == (state.written ? 0u : 1u) &&
+                (reader.uses & 4u) == (state.descriptor ? 4u : 0u),
+            "JIT attribution confused optional control and descriptor dependency");
+      Check(!DescribeSrtWalkerRead(rip + 1, reader), "non-load RIP accepted by attribution");
+      ++state.attributed;
+    });
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {}, snapshot, specialization), "RW control plan failed");
+    Check(WalkedActive(plan, 1) == written && WalkedActive(plan, 2),
+          "RW predicate pruned a GPU branch or read-only pruning was lost");
+    Check(read_state.calls == ((!written || descriptor_dependency) ? 1u : 0u),
+          "optional RW control read survived or mandatory descriptor read was hidden");
+    // Scalar descriptor reads alone do not enable specialization capture (see
+    // TestWrittenDescriptorPredicateReads). A surviving memory-derived control
+    // predicate does; LoadBufferU32 also enables capture when cloned as a descriptor.
+    const bool captured = !written || (!scalar && descriptor_dependency);
+    Check(snapshot.specialization_reads == (captured
+              ? std::vector<std::pair<uint64_t, uint64_t>>{{0x1000u, 4u}}
+              : std::vector<std::pair<uint64_t, uint64_t>>{}),
+          "RW control projection changed the specialization capture policy");
+    Check(!descriptor_dependency || snapshot.buffers[2].dwords[0] == read_state.word,
+          "mandatory descriptor did not consume the actual scalar/vector read");
+    Check(!Common::ReadbackProfile::Armed() || read_state.attributed == read_state.calls,
+          "JIT fault was not attributed after shader plan serialization");
+    Check(read.GetOpcode() == (scalar ? ValueOpcode::ReadConstBuffer : ValueOpcode::LoadBufferU32) && read.Parent() == &entry &&
+              condition.Arg(1) == Value(&read), "extraction modified the dynamic GPU load");
+    if (adaptive) {
+      using namespace Common::SubmitProfile;
+      auto reference = Extract(program); // Fresh, untrained CPU pruning reference.
+      SetExperiment(false);
+      read_state.train = true; // Simulated tracked readback; first walk still reads normally.
+      Check(MaterializeResources(plan, {}, snapshot, specialization), "adaptive training failed");
+      read_state.train = false;
+      for (const bool gate : {false, true, false}) {
+        SetExperiment(gate); // Promotion is independent of experiment.trigger.
+        for (const uint32_t word : {0u, 1u, 0u}) {
+          read_state.word = word;
+          read_state.calls = 0;
+          Check(MaterializeResources(plan, {}, snapshot, specialization), "adaptive refresh failed");
+          const bool suppressed = !written && !descriptor_dependency;
+          Check(WalkedActive(plan, 1) == (written || suppressed || word != 0) && WalkedActive(plan, 2),
+                "adaptive control pruned a dynamic GPU branch or depended on the experiment gate");
+          const bool required_read = !suppressed && (!written || descriptor_dependency);
+          Check(read_state.calls == uint32_t{required_read}, "adaptive read count differs from dependency contract");
+          Check(!descriptor_dependency || snapshot.buffers[2].dwords[0] == word,
+                "adaptive control suppressed a changing mandatory descriptor");
+          // For either value, every resource used by the original GPU condition is
+          // still available. The unchanged GPU instruction decides the branch.
+          const auto gpu_branch = word != 0 ? 1u : 2u;
+          Check(WalkedActive(plan, gpu_branch), "changed GPU condition selected a pruned resource");
+          ResourceSnapshot cpu_snapshot;
+          ResourceSpecialization cpu_specialization;
+          Check(MaterializeResources(reference, {}, cpu_snapshot, cpu_specialization) &&
+                    WalkedActive(reference, gpu_branch) &&
+                    cpu_snapshot.buffers[gpu_branch] == snapshot.buffers[gpu_branch],
+                "promoted control changed the resource used by the CPU reference branch");
+        }
+      }
+      SetExperiment(false);
+      const auto saved = SaveResourcePlan(plan);
+      ResourcePlan reloaded;
+      Check(LoadResourcePlan(saved, reloaded) &&
+                std::ranges::all_of(reloaded.walker_control_disabled, [](uint8_t v) { return v == 0; }),
+            "adaptive history persisted in the shader cache");
+      if (!written && !descriptor_dependency) {
+        // The pruned arm contains an unsupported descriptor. Expanding control
+        // must fall back to the old materialization, not turn success into EXIT.
+        plan.descriptor_sources[1].dwords[0] = Value(&plan.value_storage.emplace_back(ValueOpcode::UndefU32));
+        CompileSrtWalker(plan);
+        read_state.word = 0;
+        SetExperiment(false);
+        read_state.train = true;
+        Check(MaterializeResources(plan, {}, snapshot, specialization), "fallback training failed");
+        read_state.train = false;
+        Check(MaterializeResources(plan, {}, snapshot, specialization) && plan.walker_control_rejected &&
+                  !WalkedActive(plan, 1) && !snapshot.specialization_reads.empty(),
+              "unsupported newly active descriptor did not fall back to original pruning");
+        SetExperiment(false);
+      }
+    }
   }
 }
 
@@ -1457,7 +1626,143 @@ void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc == 2 && (std::string_view(argv[1]) == "--walker-control-only" ||
+                    std::string_view(argv[1]) == "--walker-control-combined-only")) {
+    const auto* experiment = std::string_view(argv[1]) == "--walker-control-combined-only"
+        ? "indirect-count-gpu" : "";
+#if defined(_WIN32)
+    _putenv_s("KYTY_EXPERIMENT", experiment);
+#else
+    setenv("KYTY_EXPERIMENT", experiment, 1);
+#endif
+    TestWritableBufferControlProjection(true);
+    std::puts("WalkerControlGpu: all cases passed");
+    return 0;
+  }
+  if (argc == 2 && std::string_view(argv[1]) == "--readback-origins-only") {
+#if defined(_WIN32)
+    _putenv_s("KYTY_READBACK_DETAIL", "1");
+    _putenv_s("KYTY_SUBMIT_PROFILE", "1");
+#else
+    setenv("KYTY_READBACK_DETAIL", "1", 1);
+    setenv("KYTY_SUBMIT_PROFILE", "1", 1);
+#endif
+    TestWritableBufferControlProjection();
+    {
+      using namespace Libs::Graphics::ShaderRecompiler::IR;
+      auto plan = Extract(SrtProgram(0x1000));
+      uint32_t observed = 0;
+      FakeGuestMemory fake(+[](void*, uint64_t, std::span<uint32_t> words) {
+        words[0] = 17; return true;
+      }, &observed, +[](void* data, uint64_t rip, uint64_t) {
+        Common::ReadbackProfile::Origin reader;
+        Check(DescribeSrtWalkerRead(rip, reader) && (reader.uses & 2u) &&
+                  !(reader.uses & 1u) && reader.flat_slot == 0 && reader.planning_only,
+              "mandatory flattened SRT load was classified as optional control");
+        ++*static_cast<uint32_t*>(data);
+      });
+      std::vector<uint32_t> flat;
+      Check(WalkSrt(plan, {}, flat, nullptr) && flat == std::vector<uint32_t>{17} && observed == 1,
+            "flat-read diagnostic changed the walker result");
+    }
+    using namespace Common::ReadbackProfile;
+    auto state = std::make_unique<State>(); // Large bounded history stays off the test stack.
+    state->writers.Add({.address = 0x1000, .bytes = 4, .hash = 11, .tick = 3});
+    state->writers.Add({.address = 0x1004, .bytes = 4, .hash = 22, .tick = 4});
+    Check(state->writers.Find(0x1000, 4).hash == 11 &&
+              state->writers.Find(0x1003, 2).hash == 22 &&
+              state->writers.Find(0x1008, 4).sequence == 0,
+          "writer history broke exact overlap or newest-first ordering");
+    Origin reader;
+    reader.kind = Kind::Walker; reader.tid = 7; reader.hash = 33;
+    reader.address = 0x1000; reader.bytes = 4;
+    Add(*state, reader, 50, 6, true);
+    reader.tid = 8;
+    Add(*state, reader, 75, 7, false);
+    Check(state->calls == 2 && state->ns == 125 && state->entries[0].ns == 50 &&
+              state->entries[1].ns == 75 && state->entries[0].writer.hash == 11,
+          "requester identity or local/delegated wait attribution was merged");
+    { OriginScope scope(reader); Check(origin.tid == 8, "request scope did not publish"); }
+    Check(origin.kind == Kind::Unknown, "request scope leaked to next operation");
+    // A delegated guest fault with unknown width can prove that its fault byte
+    // is dirty. A clean fault byte alone cannot prove the whole read is clean.
+    reader = {.kind = Kind::Fault, .tid = 9, .role = 1, .rip = 0x9073a9fce,
+              .address = 0x1080, .fault_address = 0x1080};
+    Common::SubmitProfile::SetRecording(true);
+    {
+      OriginScope scope(reader);
+      Common::SubmitProfile::WaitSiteScope site(Common::SubmitProfile::WaitSite::ReadbackCpuReadFault);
+      RecordDownload(0x1000, 0x1040);
+      Check(origin.downloads.page_dirty && !origin.downloads.fault_dirty &&
+                !origin.downloads.FalseShared(reader.address, 0, 0x1000),
+            "unknown-width clean byte was mistaken for a wholly clean read");
+      Add(*state, origin, 25, 8, false);
+      // Even intervals beyond the bounded sample must affect classification.
+      for (unsigned i = 0; i < 4; ++i) RecordDownload(0x1070 + 4 * i, 0x1074 + 4 * i);
+      RecordDownload(0x1080, 0x1084);
+      Check(origin.downloads.count == 6 && origin.downloads.fault_dirty && !origin.downloads.read_dirty,
+            "unknown-width dirty byte or truncated range evidence was lost");
+      Add(*state, origin, 30, 9, false);
+    }
+    Check(state->entries[2].unknown_width == 2 && state->entries[2].dirty_fault_byte == 1 &&
+              state->entries[2].false_shared == 0 && state->entries[2].last.role == 1,
+          "delegated fault evidence was misclassified or lost its requester");
+    // An indirect record's exact fault byte survives exception attribution,
+    // while nested/unrelated loads must not inherit the packet annotation.
+    Origin record;
+    record.kind = Kind::IndirectRecords;
+    record.address = record.record_address = 0x3000;
+    record.count_address = 0x5000;
+    record.bytes = 20;
+    record.record_index = 2; record.record_stride = 32; record.record_count = 5;
+    record.vertex_register = 0x94; record.instance_register = 0x95;
+    record.index_register = 0x280; record.indexed = true;
+    for (uint64_t offset = 0; offset < record.bytes; ++offset) {
+      const auto fault = FaultOrigin(record, 0xabcdef, record.address + offset);
+      Check(fault.kind == Kind::IndirectRecords && fault.address == record.address + offset &&
+                fault.bytes == 0 && fault.rip == 0xabcdef && fault.record_address == record.address &&
+                fault.record_index == 2 && fault.record_stride == 32 && fault.record_count == 5 &&
+                fault.vertex_register == 0x94 && fault.instance_register == 0x95 && fault.indexed &&
+                fault.count_address == 0x5000,
+            "indirect record fault lost packet context or invented a read width");
+    }
+    for (const uint64_t address : {uint64_t{0x2fff}, uint64_t{0x3014}, uint64_t{0x9000}}) {
+      const auto fault = FaultOrigin(record, 0xabcdef, address);
+      Check(fault.kind == Kind::Fault && fault.record_address == 0 && fault.bytes == 0,
+            "unrelated fault inherited indirect record attribution");
+    }
+    for (const auto kind : {Kind::IndirectCount, Kind::IndirectInstances}) {
+      Origin scalar; scalar.kind = kind; scalar.address = 0x4000; scalar.bytes = 4;
+      Check(FaultOrigin(scalar, 0xabcdef, 0x4003).kind == kind &&
+                FaultOrigin(scalar, 0xabcdef, 0x4004).kind == Kind::Fault,
+            "counter/instance fault lost its four-byte boundary");
+    }
+    auto record_fault = FaultOrigin(record, 0xabcdef, 0x3010);
+    record_fault.bytes = 4; // Width supplied by the instruction decoder.
+    Add(*state, record_fault, 10, 9, false);
+    Downloads clean;
+    clean.Observe(0x1080, 4, 0x1080, true, 0x1000, 0x1040);
+    Check(clean.FalseShared(0x1080, 4, 0x1000) && !clean.FalseShared(0x1fff, 4, 0x1000),
+          "whole-read evidence accepted a cross-page or overlapping read");
+    clean.Observe(0x1080, 4, 0x1080, true, 0x1083, 0x1084);
+    Check(clean.read_dirty && !clean.fault_dirty && !clean.FalseShared(0x1080, 4, 0x1000),
+          "clean first byte hid an overlapping tail of a decoded read");
+    {
+      OriginScope scope(reader);
+      Common::SubmitProfile::SetRecording(false);
+      RecordDownload(0x1080, 0x1084);
+      Check(origin.downloads.count == 0, "closed profile gate recorded a download");
+    }
+    Report(*state, 5'000'000'001ull); // Also exercise the bounded JSON evidence report.
+    for (unsigned i = 0; i < 2048; ++i) state->writers.Add({.address = 0x2000, .bytes = 4});
+    Check(!state->writers.Find(0x1000, 4).sequence, "expired writer history survived wrap");
+    ResetWindow(*state, 123, 4);
+    Check(state->calls == 0 && state->ns == 0 && state->start == 123 && state->generation == 4,
+          "readback attribution window did not reset");
+    std::puts("ReadbackOrigins: all cases passed");
+    return 0;
+  }
   TestWalkerLoadsBypassSpecializationReader();
   TestIdentityResolutionPreservesTerminalValue();
   TestNativeNestedSrtRefresh();
@@ -1469,6 +1774,7 @@ int main() {
   for (const bool memory_condition : {false, true})
     TestWrittenDescriptorPredicateReads(memory_condition);
   TestFailedMaterializationRejectsStage();
+  TestWritableBufferControlProjection();
   TestSharedControlPredicates();
   TestNestedExecPredicatesReuseReads();
   TestFiniteImageRefreshReusesScalarReads();

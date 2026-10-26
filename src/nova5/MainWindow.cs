@@ -327,6 +327,7 @@ public sealed class MainWindow : Window
 	// ---- Packages -----------------------------------------------------------------------------
 
 	private readonly Dictionary<string, string> _packageStatus = new(StringComparer.OrdinalIgnoreCase);
+	private readonly Dictionary<string, Packages.InstallProgress> _packageProgress = new(StringComparer.OrdinalIgnoreCase);
 	private readonly HashSet<string>            _packageFailed = new(StringComparer.OrdinalIgnoreCase);
 	private readonly List<FileSystemWatcher>    _watchers = new();
 	private bool                                _installingPackages;
@@ -340,18 +341,20 @@ public sealed class MainWindow : Window
 		{
 			while (_games.FirstOrDefault(g => g.Package is { } p && !_packageFailed.Contains(p)) is { Package: { } package } game)
 			{
-				SetPackageStatus(package, "Esperando a que termine de copiarse…");
+				SetPackageProgress(package, new Packages.InstallProgress("Esperando a que termine de copiarse…", null));
 				if (!await Packages.WaitUntilStableAsync(package, CancellationToken.None))
 				{
+					_packageProgress.Remove(package);
 					_packageFailed.Add(package);
 					continue;
 				}
 				ShowToast($"Instalando {game.Name}…");
 				try
 				{
-					var progress = new Progress<double>(p => SetPackageStatus(package, $"Instalando {p * 100:0} %"));
+					var progress = new Progress<Packages.InstallProgress>(p => SetPackageProgress(package, p));
 					await Task.Run(() => Packages.InstallAsync(package, progress, CancellationToken.None));
 					_packageStatus.Remove(package);
+					_packageProgress.Remove(package);
 					Reload();
 					ShowToast($"{game.Name} está listo para jugar");
 				}
@@ -359,6 +362,7 @@ public sealed class MainWindow : Window
 				{
 					try { Packages.CleanUp(package); } catch (IOException) { }
 					_packageFailed.Add(package);
+					_packageProgress.Remove(package);
 					SetPackageStatus(package, "No se pudo instalar: " + e.Message);
 					ShowToast($"No se pudo instalar {game.Name}");
 				}
@@ -370,13 +374,59 @@ public sealed class MainWindow : Window
 		}
 	}
 
+	private void SetPackageProgress(string package, Packages.InstallProgress progress)
+	{
+		_packageProgress[package] = progress;
+		SetPackageStatus(package, ShortProgress(progress));
+	}
+
 	private void SetPackageStatus(string package, string status)
 	{
 		_packageStatus[package] = status;
 		var index = _games.FindIndex(g => g.Package == package);
 		if (index < 0) return;
-		if (_row.Children[index] is Border { Child: StackPanel panel } && panel.Children.LastOrDefault() is TextBlock label) label.Text = status;
+		if (_row.Children[index] is Border { Child: StackPanel panel })
+		{
+			if (panel.Children.OfType<TextBlock>().LastOrDefault() is { } label) label.Text = status;
+			if (panel.Children.OfType<ProgressBar>().FirstOrDefault() is { } bar) ShowProgress(bar, _packageProgress.GetValueOrDefault(package));
+		}
 		if (index == _index) Select(_index, force: true);
+	}
+
+	// The tile shows the percentage and the time left; the details line under the title shows everything.
+	private static readonly System.Globalization.CultureInfo Es = System.Globalization.CultureInfo.GetCultureInfo("es-ES");
+
+	private static string ShortProgress(Packages.InstallProgress p) =>
+	    p.Fraction is { } f && p.Total > 0 ? $"Instalando {f * 100:0} %" + (p.Remaining is { } r ? " · " + TimeLeft(r) : "") : p.Step;
+
+	private static string LongProgress(Packages.InstallProgress p)
+	{
+		if (p.Total == 0) return p.Step;
+		var parts = new List<string> { $"{p.Step}: {Gb(p.Done)} de {Gb(p.Total)} GB ({(p.Fraction ?? 0) * 100:0} %)" };
+		if (p.Speed > 0) parts.Add((p.Speed / (1 << 20)).ToString("0", Es) + " MB/s");
+		if (p.Remaining is { } r) parts.Add(TimeLeft(r));
+		if (p.FilesTotal > 0) parts.Add($"{p.FilesDone.ToString("N0", Es)} de {p.FilesTotal.ToString("N0", Es)} archivos");
+		return string.Join(" · ", parts);
+	}
+
+	// Sizes in GB as Windows shows them (1024³ bytes), so they match the folder in the Explorer.
+	private static string Gb(long bytes) => (bytes / (double)(1L << 30)).ToString("0.0", Es);
+
+	private static string TimeLeft(TimeSpan left) =>
+	    left.TotalMinutes < 1 ? "menos de 1 min" : left.TotalHours < 1 ? $"quedan {Math.Ceiling(left.TotalMinutes):0} min" : $"quedan {(int)left.TotalHours} h {left.Minutes} min";
+
+	private static ProgressBar ProgressLine(double width) => new()
+	{
+		Minimum = 0, Maximum = 1, Height = 6, MinHeight = 6, MinWidth = 0, Width = width, CornerRadius = new CornerRadius(3),
+		Foreground = Palette.Aurora(), Background = Palette.Brush(Palette.Text, 0.15), IsVisible = false,
+	};
+
+	private static void ShowProgress(ProgressBar bar, Packages.InstallProgress? progress)
+	{
+		bar.IsVisible = progress is not null;
+		if (progress is null) return;
+		bar.IsIndeterminate = progress.Fraction is null;
+		if (progress.Fraction is { } fraction) bar.Value = fraction;
 	}
 
 	private void WatchFolders(IEnumerable<string> roots)
@@ -421,7 +471,17 @@ public sealed class MainWindow : Window
 			if (_statsBox is not null) _statsBox.IsVisible = false;
 			_meta.Children.Add(Badge("Paquete PKG"));
 			_meta.Children.Add(Text($"{new FileInfo(package).Length / 1e9:0.0} GB", 22, FontWeight.Normal, Palette.Muted));
-			_meta.Children.Add(Text(_packageStatus.GetValueOrDefault(package, "Pendiente de instalar"), 22, FontWeight.Normal, Palette.Muted));
+			if (_packageProgress.GetValueOrDefault(package) is { } progress)
+			{
+				var bar = ProgressLine(640);
+				ShowProgress(bar, progress);
+				_meta.Children.Add(new StackPanel
+				{
+					Spacing = 10, VerticalAlignment = VerticalAlignment.Center,
+					Children = { Text(LongProgress(progress), 22, FontWeight.Normal, Palette.Muted), bar },
+				});
+			}
+			else _meta.Children.Add(Text(_packageStatus.GetValueOrDefault(package, "Pendiente de instalar"), 22, FontWeight.Normal, Palette.Muted));
 			if (_packageFailed.Contains(package)) _meta.Children.Add(Text("· pulsa A para reintentar", 22, FontWeight.Normal, Palette.AuroraA));
 			SetBackground(null);
 			_music.Stop();
@@ -854,6 +914,9 @@ public sealed class MainWindow : Window
 			panel.Children.Add(Text("PKG", 16, FontWeight.Bold, Palette.AuroraA));
 			panel.Children.Add(new TextBlock { Text = game.Name, FontSize = 17, FontWeight = FontWeight.SemiBold, TextWrapping = TextWrapping.Wrap, MaxLines = 3, Foreground = Palette.Brush(Palette.Text) });
 			panel.Children.Add(new TextBlock { Text = _packageStatus.GetValueOrDefault(package, "Pendiente"), FontSize = 14, TextWrapping = TextWrapping.Wrap, MaxLines = 2, Foreground = Palette.Brush(Palette.Muted) });
+			var bar = ProgressLine(double.NaN);
+			ShowProgress(bar, _packageProgress.GetValueOrDefault(package));
+			panel.Children.Add(bar);
 			tile.Child = panel;
 			return tile;
 		}

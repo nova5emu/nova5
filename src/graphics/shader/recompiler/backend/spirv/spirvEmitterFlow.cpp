@@ -732,6 +732,21 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
+	if (state.input_info.vertex->mesh.indirect_draw) {
+		// The first two push dwords carry a native BDA, not a guest address.
+		// All seven parameters come from the same immutable conversion snapshot.
+		const auto low = EmitPushDataLoad(state, ConstantU32(state, 0));
+		const auto high = EmitPushDataLoad(state, ConstantU32(state, 1));
+		const auto pair = state.builder.AllocateId(), address = state.builder.AllocateId();
+		const auto offset = state.builder.AllocateId(), pointer = state.builder.AllocateId();
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2), pair, low, high);
+		state.builder.AddFunction(spv::OpBitcast, TypeU64(state), address, pair);
+		state.builder.AddFunction(spv::OpIAdd, TypeU64(state), offset, address, ConstantU64(state, index * 4u));
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, offset);
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer, spv::MemoryAccessAlignedMask, 4u);
+		return value;
+	}
 	return EmitPushDataLoad(state, ConstantU32(state, index));
 }
 

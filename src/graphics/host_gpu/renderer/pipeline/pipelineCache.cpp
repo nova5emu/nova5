@@ -308,22 +308,53 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
                                                  uint32_t push_data_cursor) {
-	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-	                                                    specialization));
-	ProfileMaterialization(this, resources);
-	for (auto& candidate: modules) {
-		const auto& layout = candidate.info.bindings;
-		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
-		        push_data_cursor, layout.ShaderDataDwords()) ||
-		    candidate.specialization != specialization) {
-			continue;
+	if (Common::RenderStageProfile::Detail::DetailedEnabled())
+		return FindModuleImpl<HasCalls, true>(runtime, push_data_cursor);
+	return FindModuleImpl<HasCalls, false>(runtime, push_data_cursor);
+}
+
+template <bool HasCalls, bool Profile>
+ShaderModule* PipelineCache::Program::FindModuleImpl(const ShaderRecompiler::IR::SrtRuntime& runtime,
+                                                     uint32_t push_data_cursor) {
+	using namespace Common::RenderStageProfile;
+	{
+		[[maybe_unused]] ProgramScope<Profile> materialize {ProgramStage::ModuleMaterialize};
+		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+		                                                    specialization));
+		// Includes the existing optional materialization-hash diagnostic, before selection.
+		{
+			// Hashing and repeat detection are diagnostic work, not resource materialization.
+			[[maybe_unused]] ProgramScope<Profile> diagnostic {ProgramStage::MaterializeDiagnostic};
+			ProfileMaterialization(this, resources);
 		}
-		if constexpr (HasCalls) {
-			if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
-		}
-		return &candidate;
 	}
-	return nullptr;
+	[[maybe_unused]] uint64_t examined = 0;
+	const auto select = [&]() -> ShaderModule* {
+		[[maybe_unused]] ProgramScope<Profile> selection {ProgramStage::ModuleSelect};
+		for (auto& candidate: modules) {
+			if constexpr (Profile) ++examined;
+			const auto& layout = candidate.info.bindings;
+			if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
+			        push_data_cursor, layout.ShaderDataDwords()) ||
+			    candidate.specialization != specialization) {
+				continue;
+			}
+			if constexpr (HasCalls) {
+				if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
+			}
+			return &candidate;
+		}
+		return nullptr;
+	};
+	auto* result = select();
+	if constexpr (Profile) {
+		// Aggregate outside the sampled selection interval.
+		const auto index = result != nullptr ? static_cast<uint64_t>(result - modules.data()) : UINT64_MAX;
+		const auto identity = result != nullptr
+		    ? std::bit_cast<uint64_t>(static_cast<VkShaderModule>(result->module)) : 0;
+		profile_selection.Observe(Detail::state.module_selections, modules.size(), examined, index, identity);
+	}
+	return result;
 }
 
 ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& key,
@@ -674,6 +705,17 @@ void PipelineCache::Save() {
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
+	if (Common::RenderStageProfile::Detail::DetailedEnabled()) {
+		GetGraphicsProgramsImpl<true>(command, state);
+	} else {
+		GetGraphicsProgramsImpl<false>(command, state);
+	}
+}
+
+template <bool Profile>
+void PipelineCache::GetGraphicsProgramsImpl(const CommandBuffer& command, DrawRenderState& state) {
+	using Common::RenderStageProfile::ProgramScope;
+	using Common::RenderStageProfile::ProgramStage;
 	const auto& context           = command.GetRegisters();
 	const auto& user_config       = command.GetUserConfig();
 	const auto& sh                = context.GetShaderRegisters();
@@ -703,24 +745,27 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	state.ps_active = pixel_active;
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
-	if (tess_active) {
-		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
-		// Reflection decodes both programs; the key also covers the VGT fields in tess.
-		const uint64_t layout_key[] = {vertex_params[0].hash, vertex_params[1].hash,
-		                               uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u |
-		                                   sh.m_vgtTfParam};
-		const auto [layout, inserted] = m_tess_layouts.try_emplace(
-		    XXH3_64bits(layout_key, sizeof(layout_key)), vertex_info[0].tess);
-		if (inserted) {
-			ShaderRecompiler::AnalyzeTessellationPrograms(vertex_params[0].code,
-			                                              vertex_params[1].code, layout->second);
-			StoreLayout(layout->first, layout->second);
+	{
+		[[maybe_unused]] ProgramScope<Profile> vertex_profile {ProgramStage::VertexPrepare};
+		if (tess_active) {
+			vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
+			// Reflection decodes both programs; the key also covers the VGT fields in tess.
+			const uint64_t layout_key[] = {vertex_params[0].hash, vertex_params[1].hash,
+			                               uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u |
+			                                   sh.m_vgtTfParam};
+			const auto [layout, inserted] = m_tess_layouts.try_emplace(
+			    XXH3_64bits(layout_key, sizeof(layout_key)), vertex_info[0].tess);
+			if (inserted) {
+				ShaderRecompiler::AnalyzeTessellationPrograms(vertex_params[0].code,
+				                                              vertex_params[1].code, layout->second);
+				StoreLayout(layout->first, layout->second);
+			}
+			for (auto& stage: vertex_info) {
+				stage.tess = layout->second;
+			}
+		} else {
+			vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 		}
-		for (auto& stage: vertex_info) {
-			stage.tess = layout->second;
-		}
-	} else {
-		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (object_primitive_id) {
@@ -737,6 +782,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
+		mesh.indirect_draw = state.indirect_mesh && !mesh.fast_launch && !state.primitive_restart_enable;
 		const auto& limits      = m_graphics.mesh_shader_properties;
 		const auto  logical_threads =
 		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
@@ -753,6 +799,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
+		[[maybe_unused]] ProgramScope<Profile> pixel_profile {ProgramStage::PixelPrepare};
 		std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
 		    target_export_mapping {};
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
@@ -856,6 +903,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	if (pixel_active) {
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::GraphicsPixelModule};
 		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
 		for (const auto& output: pixel_module.info.info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
@@ -865,8 +913,11 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		}
 		state.mrt_mask &= color_output_mask;
 	}
-	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::GraphicsVertexModules};
+		for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
+			GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+		}
 	}
 }
 

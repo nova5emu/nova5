@@ -67,6 +67,7 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
+	template <bool ProfileRebind = false>
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
@@ -80,6 +81,9 @@ public:
 	void RunGarbageCollector();
 
 private:
+	template <bool Profile>
+	[[nodiscard]] ImageId FindImageImpl(ImageDesc& desc, bool exact_format);
+
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
@@ -132,6 +136,7 @@ private:
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
+	[[nodiscard]] ImageIds      FindImageCandidates(uint64_t address, uint64_t size);
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
@@ -176,6 +181,7 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	ImageCandidateHints<ImageId>                      m_image_candidate_hints;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;

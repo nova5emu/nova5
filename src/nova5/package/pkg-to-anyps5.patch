@@ -1,0 +1,20 @@
+Nova5 change to pkg-to-anyps5 v0.2.5 (https://github.com/awake-devel/pkg-to-anyps5, GPL-3.0-or-later), 2026-10-25.
+Demon's Souls (PPSA01341) keeps about 1.25 GiB after the last listed file boundary, which the 1 GiB limit rejected as corrupt.
+The shipped tools\pkg-to-anyps5.exe is v0.2.5 built with this change: cargo build --release
+
+diff --git a/src/inner.rs b/src/inner.rs
+index 9961c97..11920e0 100644
+--- a/src/inner.rs
++++ b/src/inner.rs
+@@ -28,8 +28,9 @@ const DIRENT_FILE: u32 = 2;
+ const DIRENT_DIR: u32 = 3;
+ const MAX_DIR_SIZE: u64 = 8 << 20;
+ /// The superblock, inodes and directories after the last file. Real images
+-/// keep a few MiB there; a larger tail means a corrupt layout.
+-const MAX_META_TAIL: u64 = 1 << 30;
++/// keep a few MiB there, but some (Demon's Souls, PPSA01341) keep over 1 GiB
++/// after the last listed file boundary; a larger tail means a corrupt layout.
++const MAX_META_TAIL: u64 = 4 << 30;
+ 
+ #[derive(Debug, Clone, Copy)]
+ struct UBlock {

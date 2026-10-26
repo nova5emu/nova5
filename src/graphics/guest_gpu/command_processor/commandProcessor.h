@@ -116,6 +116,7 @@ public:
 
 private:
 	void ProcessPm4(Pm4Execution& execution);
+	friend struct CommandProcessorTestAccess;
 	void SuspendPm4();
 	uint32_t            NumInstances();
 	const void*         IndexAddress(uint32_t first_index) const;
@@ -137,6 +138,12 @@ private:
 	// read only when a later draw inherits it.
 	uint32_t m_num_instances      = 1;
 	uint64_t m_num_instances_addr = 0;
+	struct PendingIndirectCount {
+		IndirectCountSnapshot snapshot;
+		uint64_t args;
+		uint32_t maximum, stride;
+	};
+	std::vector<PendingIndirectCount> m_pending_indirect_counts;
 
 	const int m_interrupt_event_id;
 	uint64_t  m_submit_id                   = 0;

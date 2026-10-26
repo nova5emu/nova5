@@ -256,6 +256,53 @@ private:
 	size_type                              m_inline_size = 0;
 };
 
+// Bounded hints for an ordered range query, never for the selected image or its
+// live state. The owner serializes lookup/store/invalidation with its index lock.
+template <typename Owner, size_t Slots = 1024, size_t MaxOwners = 256>
+class ImageCandidateHints {
+public:
+	static_assert(Slots > 0 && MaxOwners > 0);
+	const std::vector<Owner>* Find(uint64_t address, uint64_t size) const {
+		const auto& entry = m_entries[Slot(address, size)];
+		return entry.generation == m_generation && entry.address == address && entry.size == size
+		           ? &entry.owners : nullptr;
+	}
+	template <typename Range>
+	bool Store(uint64_t address, uint64_t size, const Range& owners) {
+		auto& entry = m_entries[Slot(address, size)];
+		entry.generation = 0;
+		if (owners.size() > MaxOwners) return false;
+		entry.owners.clear();
+		entry.owners.reserve(owners.size());
+		for (const auto owner: owners) entry.owners.push_back(owner);
+		entry.address = address;
+		entry.size = size;
+		entry.generation = m_generation;
+		return true;
+	}
+	void Invalidate() {
+		if (++m_generation == 0) {
+			for (auto& entry: m_entries) entry.generation = 0;
+			m_generation = 1;
+		}
+	}
+
+private:
+	static size_t Slot(uint64_t address, uint64_t size) {
+		uint64_t hash = address ^ (size + 0x9e3779b97f4a7c15ull + (address << 6) + (address >> 2));
+		hash ^= hash >> 30;
+		hash *= 0xbf58476d1ce4e5b9ull;
+		hash ^= hash >> 27;
+		return hash % Slots;
+	}
+	struct Entry {
+		uint64_t address = 0, size = 0, generation = 0;
+		std::vector<Owner> owners;
+	};
+	std::array<Entry, Slots> m_entries {};
+	uint64_t m_generation = 1;
+};
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MULTILEVELPAGETABLE_H_

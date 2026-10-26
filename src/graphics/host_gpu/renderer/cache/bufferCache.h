@@ -60,6 +60,11 @@ public:
 	                                  Common::SubmitProfile::WaitSite site = Common::SubmitProfile::WaitSite::BufferReadback);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// GPU-thread only. Full contiguous coverage, not IsRegionRegistered's intersection.
+	[[nodiscard]] uint64_t ContiguousRegisteredSize(uint64_t vaddr, uint64_t limit) const;
+	// Keep existing BDA owners alive; PrepareBda still drains CPU dirty ranges.
+	[[nodiscard]] bool TouchRegisteredRange(uint64_t vaddr, uint64_t size);
+	template <bool ProfileRebind = false>
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,

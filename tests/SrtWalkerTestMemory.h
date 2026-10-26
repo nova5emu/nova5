@@ -21,8 +21,9 @@
 class FakeGuestMemory {
 public:
   explicit FakeGuestMemory(Libs::Graphics::ShaderRecompiler::IR::SrtMemoryReader reader = nullptr,
-                           void *userdata = nullptr) {
-    Current() = {reader, userdata};
+                           void *userdata = nullptr,
+                           void (*observer)(void*, uint64_t, uint64_t) = nullptr) {
+    Current() = {reader, userdata, observer};
 #if defined(__linux__)
     struct sigaction action {};
     action.sa_sigaction = Handle;
@@ -44,14 +45,18 @@ public:
   FakeGuestMemory &operator=(const FakeGuestMemory &) = delete;
 
 private:
-  using Reader = std::pair<Libs::Graphics::ShaderRecompiler::IR::SrtMemoryReader, void *>;
+  struct Reader {
+    Libs::Graphics::ShaderRecompiler::IR::SrtMemoryReader reader = nullptr;
+    void* userdata = nullptr;
+    void (*observer)(void*, uint64_t, uint64_t) = nullptr;
+  };
   static Reader &Current() {
     static thread_local Reader reader;
     return reader;
   }
   static uint32_t Read(uint64_t address) {
     uint32_t word = 0;
-    const auto [reader, userdata] = Current();
+    const auto [reader, userdata, observer] = Current();
     return reader != nullptr && reader(userdata, address, {&word, 1}) ? word : 0u;
   }
 #if defined(__linux__)
@@ -60,6 +65,7 @@ private:
     const auto length =
         Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(registers[REG_RIP]);
     if (length == 0) std::abort();
+    if (Current().observer) Current().observer(Current().userdata, registers[REG_RIP], registers[REG_R10]);
     registers[REG_RAX] = Read(registers[REG_R10]);
     registers[REG_RIP] += length;
   }
@@ -70,6 +76,7 @@ private:
     const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(context.Rip);
     if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || length == 0)
       return EXCEPTION_CONTINUE_SEARCH;
+    if (Current().observer) Current().observer(Current().userdata, context.Rip, context.R10);
     context.Rax = Read(context.R10);
     context.Rip += length;
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -86,6 +93,9 @@ inline bool EvaluateSrtValue(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan 
   const auto *inst = value.Resolve().TryInstruction();
   const auto output = inst != nullptr ? inst->WalkOutput() : UINT32_MAX;
   auto code = std::move(plan.srt_code);
+  auto read_sites = std::move(plan.walker_read_sites);
+  auto controls = std::move(plan.walker_control_disabled);
+  const auto rejected = plan.walker_control_rejected;
   auto scratch = std::move(plan.srt_scratch);
   const auto user_data = plan.srt_user_data;
   const auto captures = plan.srt_captures;
@@ -93,6 +103,9 @@ inline bool EvaluateSrtValue(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan 
   std::vector<uint32_t> flat;
   const bool known = WalkSrt(plan, runtime, flat, nullptr) && WalkedValue(plan, value, result);
   plan.srt_code = std::move(code);
+  plan.walker_read_sites = std::move(read_sites);
+  plan.walker_control_disabled = std::move(controls);
+  plan.walker_control_rejected = rejected;
   plan.srt_scratch = std::move(scratch);
   plan.srt_user_data = user_data;
   plan.srt_captures = captures;

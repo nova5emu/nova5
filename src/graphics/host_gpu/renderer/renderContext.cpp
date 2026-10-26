@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/readbackProfile.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
@@ -68,8 +69,19 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false,
-		                          Common::SubmitProfile::WaitSite::ReadbackCpuReadFault);
+		const auto read = [this, fault_vaddr] {
+			m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false,
+			                          Common::SubmitProfile::WaitSite::ReadbackCpuReadFault);
+		};
+		if (Common::ReadbackProfile::Enabled() && !GuestGpu::IsGpuThread()) {
+			// ReadMemory already marshals to GuestGpu. Carry the requester's
+			// fault identity across that boundary in diagnostic runs only.
+			const auto origin = Common::ReadbackProfile::origin;
+			GetGpu().SendCommandSync([read, origin] {
+				Common::ReadbackProfile::OriginScope scope(origin);
+				read();
+			});
+		} else read();
 	}
 	return true;
 }
@@ -90,6 +102,20 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	return m_mapped_ranges.Contains(vaddr, size);
+}
+
+uint64_t RenderContext::ContiguousMappedSize(uint64_t vaddr, uint64_t limit) const {
+	if (!GuestRange {vaddr, 1}.Valid()) return 0;
+	const auto end = vaddr < LOWER_ADDRESS_SIZE ? LOWER_ADDRESS_SIZE :
+	    LibKernel::Memory::kExtendedMemoryBase + LibKernel::Memory::kExtendedMemorySize;
+	limit = std::min(limit, end - vaddr);
+	if (!limit) return 0;
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	uint64_t size = 0;
+	m_mapped_ranges.ForEachInRange(vaddr, limit, [&](uint64_t begin, uint64_t end) {
+		if (begin == vaddr) size = end - begin;
+	});
+	return size;
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {

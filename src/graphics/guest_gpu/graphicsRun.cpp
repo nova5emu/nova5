@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "common/readbackProfile.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -30,6 +31,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <thread>
 #include <utility>
@@ -199,6 +201,7 @@ void CommandProcessor::Reset() {
 	m_index_base_addr                  = 0;
 	m_num_instances                    = 1;
 	m_num_instances_addr               = 0;
+	m_pending_indirect_counts.clear();
 	m_predicate_skip                   = false;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
@@ -743,11 +746,29 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 
 	m_num_instances      = num_instances;
 	m_num_instances_addr = 0;
+	m_pending_indirect_counts.clear();
 }
 
 uint32_t CommandProcessor::NumInstances() {
+	// A zero indirect count preserves the previous state. Resolve newest first,
+	// from the immutable snapshot (the guest can already have overwritten count).
+	for (auto it = m_pending_indirect_counts.rbegin(); it != m_pending_indirect_counts.rend(); ++it) {
+		Common::SubmitProfile::WaitSiteScope wait_site(Common::SubmitProfile::WaitSite::IndirectCountState);
+		GetScheduler().Wait(it->snapshot.tick);
+		it->snapshot.buffer->Invalidate(0, sizeof(uint32_t));
+		uint32_t count;
+		std::memcpy(&count, it->snapshot.buffer->Mapped().data(), sizeof(count));
+		count = std::min(count, it->maximum);
+		if (count == 0) continue;
+		m_num_instances_addr = it->args + static_cast<uint64_t>(count - 1) * it->stride +
+		                       offsetof(vk::DrawIndirectCommand, instanceCount);
+		break;
+	}
+	m_pending_indirect_counts.clear();
 	if (m_num_instances_addr != 0) {
-		m_num_instances      = *reinterpret_cast<const uint32_t*>(m_num_instances_addr);
+		m_num_instances = Common::ReadbackProfile::Read(Common::ReadbackProfile::Kind::IndirectInstances,
+		    m_num_instances_addr, sizeof(uint32_t),
+		    [&] { return *reinterpret_cast<const uint32_t*>(m_num_instances_addr); });
 		m_num_instances_addr = 0;
 	}
 	return m_num_instances;
@@ -862,23 +883,86 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, IndirectDrawRegisters registers,
                                          uint32_t draw_initiator, bool indexed) {
+	using Common::SubmitProfile::AddExtra;
+	using Extra = Common::SubmitProfile::Extra;
+	const bool profile = Common::SubmitProfile::Recording();
+	const bool bad_stride = (stride_in_bytes & 3u) != 0 ||
+	    stride_in_bytes < (indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand));
+	if (profile) {
+		AddExtra(Extra::IndirectPackets);
+		AddExtra(indexed ? Extra::IndirectIndexed : Extra::IndirectAuto);
+		if (max_count_or_count > 1) AddExtra(Extra::IndirectMultiple);
+		if (!count_addr) AddExtra(Extra::IndirectNoCount);
+		if (!max_count_or_count) AddExtra(Extra::IndirectZeroMax);
+		if (bad_stride) AddExtra(Extra::IndirectBadStride);
+		if (registers.vertex_offset != Pm4::SH_NOP) AddExtra(Extra::IndirectPatchVertex);
+		if (registers.instance_offset != Pm4::SH_NOP) AddExtra(Extra::IndirectPatchInstance);
+		if (registers.index_offset != Pm4::SH_NOP) AddExtra(Extra::IndirectPatchIndex);
+		if (indexed && !m_index_buffer_size) AddExtra(Extra::IndirectMissingIndexSize);
+	}
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 	// The guest records match Vulkan's indirect commands byte for byte.
-	EXIT_NOT_IMPLEMENTED((stride_in_bytes & 3u) != 0 ||
-	                     stride_in_bytes < (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
-	                                                : sizeof(vk::DrawIndirectCommand)));
+	EXIT_NOT_IMPLEMENTED(bad_stride);
+	if (max_count_or_count == 0) return;
+	auto& executor = m_renderer.GetRenderExecutor();
+	const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
+	const bool native_registers = registers.vertex_offset == Pm4::SH_NOP &&
+	    registers.instance_offset == Pm4::SH_NOP && registers.index_offset == Pm4::SH_NOP &&
+	    (!indexed || m_index_buffer_size != 0);
+	if (count_addr && Common::SubmitProfile::ExperimentActive(Common::SubmitProfile::Experiment::IndirectCountGpu)) {
+		AddExtra(Extra::IndirectCountAttempts);
+		// Keep the original short-circuit order and mapping checks. Record the
+		// first failed eligibility check; SGPR requirements above are independent.
+		const auto eligible = [&] {
+			const auto reject = [](Extra reason) { AddExtra(reason); return false; };
+			if (!native_registers) return false;
+			if ((reinterpret_cast<uint64_t>(count_addr) & 3u) != 0) return reject(Extra::IndirectCountUnaligned);
+			if (!m_renderer.GetGraphics().draw_indirect_count_enabled) return reject(Extra::IndirectCountDevice);
+			if (max_count_or_count > m_renderer.GetGraphics().physical_device_properties.limits.maxDrawIndirectCount)
+				return reject(Extra::IndirectCountLimit);
+			if (m_pending_indirect_counts.size() >= 64) return reject(Extra::IndirectCountHistoryFull);
+			if (!m_renderer.IsMapped(reinterpret_cast<uint64_t>(count_addr), sizeof(uint32_t)))
+				return reject(Extra::IndirectCountUnmapped);
+			if (!m_renderer.IsMapped(args_addr, static_cast<uint64_t>(max_count_or_count - 1) * stride_in_bytes +
+			    (indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand))))
+				return reject(Extra::IndirectArgsUnmapped);
+			return true;
+		};
+		if (eligible()) {
+			// At capacity use the CPU count path. Never read an otherwise unused
+			// old instance record merely to bound history (it may have been unmapped).
+			auto snapshot = SnapshotIndirectCount(m_renderer, reinterpret_cast<uint64_t>(count_addr), max_count_or_count);
+			const DrawIndirectArgs records {args_addr, max_count_or_count, stride_in_bytes, snapshot.buffer->Handle()};
+			const bool drawn = indexed
+			    ? executor.DrawIndex(m_submit_id, CurrentBuffer(),
+			          {.index_count = m_index_buffer_size, .index_addr = IndexAddress(0),
+			           .index_type_and_size = m_index_type_and_size, .indirect = records})
+			    : executor.DrawAuto(m_submit_id, CurrentBuffer(), {.indirect = records});
+			if (drawn) {
+				GetScheduler().DeferOperation([keep_alive = snapshot.buffer] {});
+				m_pending_indirect_counts.push_back({std::move(snapshot), args_addr, max_count_or_count, stride_in_bytes});
+				return;
+			}
+			AddExtra(Extra::IndirectRendererRejected);
+		}
+		Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::IndirectCountGpuFallbacks);
+	} else if (count_addr && profile) {
+		AddExtra(Extra::IndirectCountGateClosed);
+	}
 
 	const auto draw_count = count_addr == nullptr
 	                            ? max_count_or_count
-	                            : std::min(uint32_t {*count_addr}, max_count_or_count);
+	                            : std::min(Common::ReadbackProfile::Read(
+	                                  Common::ReadbackProfile::Kind::IndirectCount,
+	                                  reinterpret_cast<uint64_t>(count_addr), sizeof(uint32_t),
+	                                  [&] { return uint32_t {*count_addr}; }), max_count_or_count);
 	if (draw_count == 0) {
 		return;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
 
-	auto&      executor  = m_renderer.GetRenderExecutor();
-	const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
+	m_pending_indirect_counts.clear(); // A nonzero CPU-count draw replaces previous state.
 	// NUM_INSTANCES keeps the last draw's instance count.
 	m_num_instances_addr = args_addr + static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
 	                       offsetof(vk::DrawIndirectCommand, instanceCount);
@@ -894,35 +978,70 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	                                   .index_type_and_size = m_index_type_and_size,
 	                                   .indirect            = records})
 	             : executor.DrawAuto(m_submit_id, CurrentBuffer(), {.indirect = records}))) {
+		AddExtra(Extra::IndirectGpuRecords, draw_count);
 		return;
 	}
 
-	const uint32_t max_indices = m_index_buffer_size != 0 ? m_index_buffer_size : UINT32_MAX;
+	AddExtra(Extra::IndirectCpuRecords, draw_count);
+	const uint32_t max_indices = m_index_buffer_size;
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto addr = args_addr + static_cast<uint64_t>(i) * stride_in_bytes;
+		std::optional<Common::ReadbackProfile::OriginScope> reader_scope;
+		if (Common::ReadbackProfile::Enabled()) {
+			Common::ReadbackProfile::Origin reader;
+			reader.kind = Common::ReadbackProfile::Kind::IndirectRecords;
+			reader.address = reader.record_address = addr;
+			reader.count_address = reinterpret_cast<uint64_t>(count_addr);
+			reader.bytes = indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
+			reader.record_index = i; reader.record_stride = stride_in_bytes; reader.record_count = draw_count;
+			reader.vertex_register = registers.vertex_offset; reader.instance_register = registers.instance_offset;
+			reader.index_register = registers.index_offset; reader.indexed = indexed;
+			reader_scope.emplace(reader);
+		}
 		if (!indexed) {
 			const auto& args = *reinterpret_cast<const vk::DrawIndirectCommand*>(addr);
 			PatchIndirectDrawOffsets(*this, registers, args.firstVertex, args.firstInstance, 0);
-			executor.DrawAuto(m_submit_id, CurrentBuffer(),
-			                  {.vertex_count   = args.vertexCount,
-			                   .instance_count = args.instanceCount,
-			                   .first_vertex   = args.firstVertex,
-			                   .first_instance = args.firstInstance,
-			                   .offset_source  = DrawOffsetSource::IndirectArgs});
+			const DrawAutoArgs draw {.vertex_count   = args.vertexCount,
+			                         .instance_count = args.instanceCount,
+			                         .first_vertex   = args.firstVertex,
+			                         .first_instance = args.firstInstance,
+			                         .offset_source  = DrawOffsetSource::IndirectArgs};
+			reader_scope.reset(); // Shader preparation must have its own attribution.
+			executor.DrawAuto(m_submit_id, CurrentBuffer(), draw);
 			continue;
 		}
 
 		const auto& args = *reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(addr);
 		PatchIndirectDrawOffsets(*this, registers, static_cast<uint32_t>(args.vertexOffset),
 		                         args.firstInstance, args.firstIndex);
-		executor.DrawIndex(m_submit_id, CurrentBuffer(),
-		                   {.index_count         = std::min(args.indexCount, max_indices),
-		                    .index_addr          = IndexAddress(args.firstIndex),
-		                    .instance_count      = args.instanceCount,
-		                    .index_type_and_size = m_index_type_and_size,
-		                    .base_vertex         = args.vertexOffset,
-		                    .first_instance      = args.firstInstance,
-		                    .offset_source       = DrawOffsetSource::IndirectArgs});
+		const DrawIndexArgs draw {.index_count         = args.indexCount,
+		                          .index_addr          = IndexAddress(std::min(args.firstIndex, max_indices)),
+		                          .instance_count      = args.instanceCount,
+		                          .index_type_and_size = m_index_type_and_size,
+		                          .base_vertex         = args.vertexOffset,
+		                          .first_instance      = args.firstInstance,
+		                          .offset_source       = DrawOffsetSource::IndirectArgs,
+		                          .valid_index_count   = args.firstIndex < max_indices ? max_indices - args.firstIndex : 0};
+		if (Common::ReadbackProfile::Enabled()) {
+			// These arguments have already been read by the CPU fallback: no extra
+			// guest access or readback to obtain the exact requested range.
+			static thread_local uint32_t samples = 0;
+			if (samples++ < 16) {
+				const auto base = reinterpret_cast<uint64_t>(IndexAddress(0));
+				const uint64_t element = m_index_type_and_size == 0 ? 2 : m_index_type_and_size == 1 ? 4 : 1;
+				char message[512];
+				std::snprintf(message, sizeof(message),
+				    "[INDIRECT_CPU_INDEX_RANGE] records=0x%016" PRIx64 " base=0x%016" PRIx64
+				    " index_bytes=%" PRIu64 " index_buffer_size=0x%08x first_index=%u raw_count=%u"
+				    " valid_count=%u instances=%u actual_begin=0x%016" PRIx64 " actual_end=0x%016" PRIx64 "\n",
+				    addr, base, element, m_index_buffer_size, args.firstIndex, args.indexCount,
+				    draw.valid_index_count, args.instanceCount, reinterpret_cast<uint64_t>(draw.index_addr),
+				    reinterpret_cast<uint64_t>(draw.index_addr) + uint64_t(std::min(draw.index_count, draw.valid_index_count)) * element);
+				Log::WriteToConsoleAndLog(message);
+			}
+		}
+		reader_scope.reset();
+		executor.DrawIndex(m_submit_id, CurrentBuffer(), draw);
 	}
 }
 

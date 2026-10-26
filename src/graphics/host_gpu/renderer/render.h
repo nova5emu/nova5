@@ -30,7 +30,9 @@ struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 class RenderContext;
 class CommandScheduler;
+class Buffer;
 struct RenderExecutorTestAccess;
+struct IndirectCountClamp;
 
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
@@ -50,7 +52,21 @@ struct DrawIndirectArgs {
 	uint64_t address = 0;
 	uint32_t count   = 0;
 	uint32_t stride  = 0;
+	// Immutable GPU snapshot at offset zero; count is its maximum, not a CPU read.
+	vk::Buffer count_buffer = nullptr;
 };
+
+struct IndirectCountSnapshot {
+	std::shared_ptr<Buffer> buffer;
+	uint64_t tick = 0;
+};
+IndirectCountSnapshot SnapshotIndirectCount(RenderContext& context, uint64_t address, uint32_t max_count);
+
+// 3 task-count dwords, 7 mesh parameters, status, then the 5 original draw dwords.
+// Exposed for the differential GPU tests; the buffer lives through its submission.
+std::shared_ptr<Buffer> ConvertIndirectMeshArgs(RenderContext& context, uint64_t address,
+    const ShaderMeshInputInfo& mesh, uint32_t max_indices, uint64_t index_address,
+    uint32_t index_bytes, uint64_t index_span, bool apply_offsets);
 
 struct DrawIndexArgs {
 	uint32_t         index_count                = 0;
@@ -63,6 +79,10 @@ struct DrawIndexArgs {
 	uint32_t         render_target_slice_offset = 0;
 	// With indirect records, index_count is INDEX_BUFFER_SIZE.
 	DrawIndirectArgs indirect;
+	// Number of valid elements at index_addr, independent of index_count.
+	// AMD SI Programming Guide 2.5.4/2.5.10: indirect firstIndex consumes
+	// INDEX_BUFFER_SIZE; CIK VGT_DMA_MAX_SIZE: subsequent indices read as zero.
+	uint32_t valid_index_count = UINT32_MAX;
 };
 
 struct DrawAutoArgs {
@@ -152,6 +172,9 @@ private:
 };
 
 class RenderExecutor {
+	friend IndirectCountSnapshot SnapshotIndirectCount(RenderContext&, uint64_t, uint32_t);
+	friend std::shared_ptr<Buffer> ConvertIndirectMeshArgs(RenderContext&, uint64_t,
+	    const ShaderMeshInputInfo&, uint32_t, uint64_t, uint32_t, uint64_t, bool);
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
 	KYTY_CLASS_NO_COPY(RenderExecutor);
@@ -164,17 +187,22 @@ public:
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
+	template <bool Profile> void RebindBuffersImpl(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value,
-	                                            bool profile_prepare = false,
-	                                            uint64_t description_program = 0,
-	                                            uint32_t description_resource = 0);
+	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 
 private:
+	template <bool Profile>
+	[[nodiscard]] TextureBinding ResolveTextureImpl(const ShaderRecompiler::IR::ImageResource& resource,
+	                                               const ShaderRecompiler::IR::DescriptorValue& value,
+	                                               uint64_t description_program, uint32_t description_resource);
+	template <bool Profile>
+	void PrepareImages(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
 	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
@@ -218,11 +246,13 @@ private:
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
+	std::shared_ptr<IndirectCountClamp>    m_indirect_count_clamp;
+	std::shared_ptr<struct IndirectMeshConvert> m_indirect_mesh_convert;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	BindingOverlapWrites                 m_binding_overlap_writes;
-	// Allocated only by the image-desc-reuse experiment; owned by this GPU executor.
+	// Descriptor-derived descriptions only; bounded and owned by this GPU executor.
 	std::unique_ptr<ImageDescriptionCache> m_image_descriptions;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;

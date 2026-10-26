@@ -1,4 +1,5 @@
 #include "loader/runtimeLinker.h"
+#include "common/readbackProfile.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -666,13 +667,21 @@ bool HandleGpuAccessFault(const Common::HostException::ExceptionInfo& exception_
 		}
 		bool handled = false;
 		{
+			namespace Attribution = Common::ReadbackProfile;
+			std::optional<Attribution::OriginScope> reader_scope;
+			if (Attribution::Enabled() && access == GpuAccess::Read) {
+				auto reader = Attribution::FaultOrigin(Attribution::origin, info->exception_address,
+				                                      info->access_violation_vaddr);
+				Libs::Graphics::ShaderRecompiler::IR::DescribeSrtWalkerRead(info->exception_address, reader);
+				reader_scope.emplace(reader);
+			}
 			Common::SubmitProfile::Diagnostics::FaultScope profile(access == GpuAccess::Write);
 			Common::SubmitProfile::Diagnostics::ReadFaults::Scope read_profile(
 			    access == GpuAccess::Read, info->exception_address, info->access_violation_vaddr);
 			namespace IR = Libs::Graphics::ShaderRecompiler::IR;
 			const bool walker_load = access == GpuAccess::Read && IR::SrtWalkerLoadLength(info->exception_address) != 0;
 			read_profile.SrtWalker(walker_load);
-			if (read_profile.Enabled() || walker_load) {
+			if (read_profile.Enabled() || walker_load || (Attribution::Enabled() && access == GpuAccess::Read)) {
 				// Do not probe across an instruction-page boundary. Incomplete or
 				// unsupported instructions remain unknown, without affecting recovery.
 				const auto bytes = std::min<uint64_t>(15, 4096 - (info->exception_address & 4095));
@@ -680,6 +689,10 @@ bool HandleGpuAccessFault(const Common::HostException::ExceptionInfo& exception_
 					const auto read = Loader::X64InstructionEmulator::DescribeReadAccess(
 					    {reinterpret_cast<const uint8_t*>(info->exception_address), static_cast<size_t>(bytes)}, *info);
 					read_profile.ReadAccess(read.address, read.size);
+					if (Attribution::Enabled()) {
+						Attribution::origin.address = read.size ? read.address : info->access_violation_vaddr;
+						Attribution::origin.bytes = read.size;
+					}
 					if (walker_load && Loader::X64InstructionEmulator::TryEmulateRead(
 					        {reinterpret_cast<const uint8_t*>(info->exception_address), static_cast<size_t>(bytes)},
 					        *info, IR::SrtWalkerTryReadClean)) {
@@ -690,7 +703,10 @@ bool HandleGpuAccessFault(const Common::HostException::ExceptionInfo& exception_
 					}
 				}
 			}
-			if (!handled) handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+			if (!handled) {
+				handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+				if (handled && walker_load) IR::NoteSrtControlReadback(info->exception_address);
+			}
 			if (handled) { profile.Handled(); read_profile.Handled(); }
 		}
 		if (handled) {

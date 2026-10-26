@@ -1,4 +1,5 @@
 #include "common/renderStageProfile.h"
+#include "common/readbackProfile.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
@@ -59,6 +60,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
+	// Outermost: aggregation/reporting must not inflate the existing wait timer.
+	Common::ReadbackProfile::WaitScope attribution(tick);
 	Common::RenderStageProfile::Scope stage_profile {Common::RenderStageProfile::Stage::GpuWait};
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);

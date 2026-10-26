@@ -680,15 +680,37 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME render_stage_profile COMMAND $<TARGET_FILE:render_stage_profile_tests>)
 	add_test(NAME render_stage_profile_enabled COMMAND $<TARGET_FILE:render_stage_profile_tests>)
-	set_tests_properties(render_stage_profile_enabled PROPERTIES ENVIRONMENT "KYTY_RENDER_STAGE_PROFILE=1")
+	set_tests_properties(render_stage_profile PROPERTIES ENVIRONMENT "KYTY_RENDER_STAGE_PROFILE=0;KYTY_RENDER_STAGE_DETAIL=0")
+	set_tests_properties(render_stage_profile_enabled PROPERTIES ENVIRONMENT "KYTY_RENDER_STAGE_PROFILE=1;KYTY_RENDER_STAGE_DETAIL=0")
+	add_test(NAME render_stage_profile_detailed COMMAND $<TARGET_FILE:render_stage_profile_tests>)
+	set_tests_properties(render_stage_profile_detailed PROPERTIES ENVIRONMENT "KYTY_RENDER_STAGE_PROFILE=1;KYTY_RENDER_STAGE_DETAIL=1")
+	add_test(NAME render_stage_detail_without_profile COMMAND $<TARGET_FILE:render_stage_profile_tests>)
+	set_tests_properties(render_stage_detail_without_profile PROPERTIES ENVIRONMENT "KYTY_RENDER_STAGE_PROFILE=0;KYTY_RENDER_STAGE_DETAIL=1")
 	add_test(NAME submit_profile COMMAND $<TARGET_FILE:submit_profile_tests>)
 	add_test(NAME submit_profile_enabled COMMAND $<TARGET_FILE:submit_profile_tests>)
 	set_tests_properties(submit_profile_enabled PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
 	add_test(NAME submit_profile_experiment_release
 	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-release)
-	add_test(NAME submit_profile_experiment_image_desc_reuse
-	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-image-desc-reuse)
-	set_tests_properties(submit_profile_experiment_image_desc_reuse PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
+	add_test(NAME submit_profile_retired_buffer_dirty_query
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired buffer-dirty-query)
+	set_tests_properties(submit_profile_retired_buffer_dirty_query PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
+	add_test(NAME submit_profile_retired_obtain_region
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired obtain-region-generation)
+	set_tests_properties(submit_profile_retired_obtain_region PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
+	add_test(NAME submit_profile_retired_walker_control
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired walker-control-gpu)
+	add_test(NAME submit_profile_retired_indirect_mesh
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired indirect-mesh-gpu)
+	add_test(NAME submit_profile_experiment_indirect_count
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-indirect-count)
+	add_test(NAME submit_profile_experiment_combined
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-combined)
+	add_test(NAME submit_profile_retired_image_find_hint
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired image-find-hint)
+	set_tests_properties(submit_profile_retired_image_find_hint PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
+	add_test(NAME submit_profile_retired_image_desc_reuse
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired image-desc-reuse)
+	set_tests_properties(submit_profile_retired_image_desc_reuse PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
 	add_test(NAME submit_profile_experiment_retired
 	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired)
 	add_test(NAME submit_profile_retired_read_fault_clean
@@ -708,9 +730,20 @@ if(BUILD_TESTING)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME submit_profile_retired_clean_read_early_reject
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired clean-read-early-reject)
+	set_tests_properties(submit_profile_retired_clean_read_early_reject PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
+	add_test(NAME walker_control_gpu COMMAND $<TARGET_FILE:resource_materialization_tests> --walker-control-only)
+	add_test(NAME walker_control_gpu_combined COMMAND $<TARGET_FILE:resource_materialization_tests> --walker-control-combined-only)
+	add_test(NAME walker_control_gpu_equivalence COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --walker-control-gpu-only)
+	add_test(NAME indirect_count_gpu COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-count-only)
+	add_test(NAME indirect_mesh_gpu COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-mesh-only)
+	set_tests_properties(indirect_mesh_gpu PROPERTIES SKIP_RETURN_CODE 77)
+	add_test(NAME resource_materialization_profile_enabled COMMAND $<TARGET_FILE:resource_materialization_tests>)
+	set_tests_properties(resource_materialization_profile_enabled PROPERTIES ENVIRONMENT "KYTY_RENDER_STAGE_PROFILE=1;KYTY_RENDER_STAGE_DETAIL=1")
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
@@ -732,10 +765,25 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME binding_overlap
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-overlap-only)
+	add_test(NAME submit_profile_retired_overlap_intervals
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired overlap-intervals)
+	set_tests_properties(submit_profile_retired_overlap_intervals PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
+	add_test(NAME submit_profile_retired_image_binding_inplace
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired image-binding-inplace)
+	set_tests_properties(submit_profile_retired_image_binding_inplace PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
+	add_test(NAME submit_profile_retired_vs_attrib_reuse
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired vs-attrib-reuse)
+	set_tests_properties(submit_profile_retired_vs_attrib_reuse PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
+	add_test(NAME gpu_rw_control
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rw-control-only)
 	add_test(NAME image_desc_reuse
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-desc-reuse-only)
 	add_test(NAME image_desc_reuse_live
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-desc-reuse-gpu-only)
+	add_test(NAME image_desc_reuse_live_profiled
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-desc-reuse-gpu-only)
+	set_tests_properties(image_desc_reuse_live PROPERTIES ENVIRONMENT "KYTY_RENDER_STAGE_PROFILE=0")
+	set_tests_properties(image_desc_reuse_live_profiled PROPERTIES ENVIRONMENT "KYTY_RENDER_STAGE_PROFILE=1")
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_float_min_max

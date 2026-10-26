@@ -109,6 +109,12 @@ struct PreparedBindings {
 class BindingOverlapWrites {
 public:
 	enum class Hit { None, Image, Buffer };
+	struct Decision {
+		Hit hit = Hit::None;
+		size_t first = SIZE_MAX; // Original ordinal within images or buffers, never sorted order.
+		bool invalid = false;
+		bool operator==(const Decision&) const = default;
+	};
 
 	void Clear() { m_images.clear(); m_buffers.clear(); }
 	[[nodiscard]] size_t Size() const { return m_images.size() + m_buffers.size(); }
@@ -128,23 +134,94 @@ public:
 		const auto size = linear ? std::min<uint64_t>(source.size, resource.write_extent) : source.size;
 		if (size != 0) m_buffers.push_back({source.address, size});
 	}
+	// Called once per commit, after collecting all writers and before querying.
+	// Do not raise errors here: the original traversal may hit an earlier writer
+	// before ever reaching an invalid range, or may never query these writes.
+	void PrepareIntervals() {
+		const bool images_valid = BuildIntervals(m_images, m_image_intervals);
+		const bool buffers_valid = BuildIntervals(m_buffers, m_buffer_intervals);
+		m_intervals_valid = images_valid && buffers_valid;
+	}
+	[[nodiscard]] size_t IntervalCount() const { return m_image_intervals.size() + m_buffer_intervals.size(); }
+	[[nodiscard]] Decision QueryIntervals(uint64_t address, uint64_t size, bool count,
+	                                      uint64_t& image_comparisons, uint64_t& buffer_comparisons) const {
+		if (Size() == 0) return {}; // Even invalid reads were ignored with no writers.
+		if (!m_intervals_valid || !ValidRange(address, size))
+			return FindFirstConflict(address, size, count, image_comparisons, buffer_comparisons);
+		const auto end = address + size;
+		if (!Intersects(m_image_intervals, address, end, count, image_comparisons) &&
+		    !Intersects(m_buffer_intervals, address, end, count, buffer_comparisons)) return {};
+		// Conflict path is cold. Recover the original first writer, not the
+		// spatially first interval. Keep image > buffer and failure provenance.
+		return FindFirstConflict(address, size, count, image_comparisons, buffer_comparisons);
+	}
 	[[nodiscard]] Hit CheckRead(uint64_t address, uint64_t size, bool count,
-	                            uint64_t& image_comparisons, uint64_t& buffer_comparisons) const {
-		// Preserve the old order (images before buffers) and its range validation.
-		for (const auto range: m_images) {
-			if (count) ++image_comparisons;
-			if (ImageRangeOverlaps(address, size, range.address, range.size)) return Hit::Image;
+	                                     uint64_t& image_comparisons, uint64_t& buffer_comparisons) const {
+		const auto decision = QueryIntervals(address, size, count, image_comparisons, buffer_comparisons);
+		if (decision.invalid) {
+			// Re-run only the offending primitive for its identical EXIT and text.
+			// FindFirstConflict preserves which validation is reached first.
+			const auto& ranges = decision.hit == Hit::Image ? m_images : m_buffers;
+			const auto range = ranges[decision.first];
+			(void)ImageRangeOverlaps(address, size, range.address, range.size);
 		}
-		for (const auto range: m_buffers) {
-			if (count) ++buffer_comparisons;
-			if (ImageRangeOverlaps(address, size, range.address, range.size)) return Hit::Buffer;
-		}
-		return Hit::None;
+		return decision.hit;
 	}
 
 private:
+	struct Interval { uint64_t begin, end; };
+	static bool ValidRange(uint64_t address, uint64_t size) {
+		return size != 0 && address <= UINT64_MAX - size;
+	}
+	static bool BuildIntervals(std::span<const GuestRange> source, std::vector<Interval>& intervals) {
+		intervals.clear();
+		for (const auto range : source) {
+			if (!ValidRange(range.address, range.size)) return false;
+			intervals.push_back({range.address, range.address + range.size});
+		}
+		std::sort(intervals.begin(), intervals.end(), [](const Interval& a, const Interval& b) {
+			return a.begin < b.begin;
+		});
+		size_t merged = 0;
+		for (const auto range : intervals) {
+			if (merged != 0 && range.begin <= intervals[merged - 1].end)
+				intervals[merged - 1].end = std::max(intervals[merged - 1].end, range.end);
+			else intervals[merged++] = range;
+		}
+		intervals.resize(merged);
+		return true;
+	}
+	static bool Intersects(std::span<const Interval> intervals, uint64_t begin, uint64_t end,
+	                       bool count, uint64_t& comparisons) {
+		size_t first = 0, last = intervals.size();
+		while (first < last) {
+			const auto middle = first + (last - first) / 2;
+			if (count) ++comparisons;
+			if (intervals[middle].end <= begin) first = middle + 1;
+			else last = middle;
+		}
+		if (first == intervals.size()) return false;
+		if (count) ++comparisons;
+		return intervals[first].begin < end;
+	}
+	[[nodiscard]] Decision FindFirstConflict(uint64_t address, uint64_t size, bool count,
+	                                        uint64_t& image_comparisons, uint64_t& buffer_comparisons) const {
+		for (const auto kind : {Hit::Image, Hit::Buffer}) {
+			const auto& ranges = kind == Hit::Image ? m_images : m_buffers;
+			auto& comparisons = kind == Hit::Image ? image_comparisons : buffer_comparisons;
+			for (size_t i = 0; i < ranges.size(); ++i) {
+				const auto range = ranges[i];
+				if (count) ++comparisons;
+				if (!ValidRange(address, size) || !ValidRange(range.address, range.size)) return {kind, i, true};
+				if (address < range.address + range.size && range.address < address + size) return {kind, i, false};
+			}
+		}
+		return {};
+	}
 	std::vector<GuestRange> m_images;
 	std::vector<GuestRange> m_buffers;
+	std::vector<Interval> m_image_intervals, m_buffer_intervals;
+	bool m_intervals_valid = false;
 };
 
 [[nodiscard]] vk::DescriptorType

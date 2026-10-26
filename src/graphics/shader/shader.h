@@ -88,6 +88,7 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
 	bool     fast_launch          = false;
+	bool     indirect_draw        = false; // Mesh parameters are in a private GPU snapshot.
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {

@@ -503,6 +503,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	const bool maintenance8_extension =
 	    HasExtension(device_extensions, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
 	vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8 {};
+	const bool maintenance5_extension = HasExtension(device_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+	vk::PhysicalDeviceMaintenance5FeaturesKHR maintenance5 {};
+	if (maintenance5_extension) {
+		maintenance5.pNext = supported_features2.pNext;
+		supported_features2.pNext = &maintenance5;
+	}
 	if (maintenance8_extension) {
 		maintenance8.pNext = supported_features2.pNext;
 		supported_features2.pNext = &maintenance8;
@@ -546,6 +552,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
+	features12.drawIndirectCount = supported_features12.drawIndirectCount;
+	graphics.draw_indirect_count_enabled = features12.drawIndirectCount;
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
@@ -601,6 +609,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.maintenance8_enabled = maintenance8_extension && maintenance8.maintenance8;
+	graphics.bounded_index_buffer_enabled = maintenance5_extension && maintenance5.maintenance5 &&
+	    supported_robustness2.robustBufferAccess2;
 	// The device clock ticks at timestampPeriod nanoseconds.
 	if (shader_clock_extension && shader_clock.shaderDeviceClock) {
 		graphics.device_clock_period_ps = static_cast<uint32_t>(
@@ -724,6 +734,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.maintenance8_enabled) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
+	}
+	if (graphics.bounded_index_buffer_enabled) {
+		maintenance5.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &maintenance5;
 	}
 	if (graphics.device_clock_period_ps != 0u) {
 		shader_clock.pNext = const_cast<void*>(create_info.pNext);
@@ -1103,7 +1117,7 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
-		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME, VK_KHR_MAINTENANCE_5_EXTENSION_NAME,
 		                             VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,

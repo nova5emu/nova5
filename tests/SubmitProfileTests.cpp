@@ -139,10 +139,14 @@ void TestReadFaultAttribution() {
 }
 
 int main(int argc, char** argv) {
-	const bool image_desc = argc > 1 && std::string_view(argv[1]) == "--experiment-image-desc-reuse";
 	const bool release_mem = argc > 1 && std::string_view(argv[1]) == "--experiment-release";
+	const bool walker_control = argc > 1 && std::string_view(argv[1]) == "--experiment-walker-control";
+	const bool indirect_count = argc > 1 && std::string_view(argv[1]) == "--experiment-indirect-count";
+	const bool combined = argc > 1 && std::string_view(argv[1]) == "--experiment-combined";
 	const bool retired = argc > 1 && std::string_view(argv[1]) == "--experiment-retired";
-	const auto* experiment = image_desc ? "image-desc-reuse" : release_mem ? "release-mem" : retired ? (argc > 2 ? argv[2] : "overlap-fast") : "";
+	const auto* experiment = combined ? " indirect-count-gpu,release-mem, walker-control-gpu,indirect-mesh-gpu,retired,, " :
+	    release_mem ? "release-mem" : walker_control ? "walker-control-gpu" : indirect_count ? "indirect-count-gpu" :
+	    retired ? (argc > 2 ? argv[2] : "overlap-fast") : "";
 #if defined(_WIN32)
 	_putenv_s("KYTY_EXPERIMENT", experiment);
 #else
@@ -150,19 +154,42 @@ int main(int argc, char** argv) {
 #endif
 	Check(ParseExperiment("") == Experiment::None && ParseExperiment("typo") == Experiment::None);
 	Check(ParseExperiment("release-mem") == Experiment::ReleaseMem);
-	Check(ParseExperiment("image-desc-reuse") == Experiment::ImageDescReuse);
+	Check(ParseExperiment("vs-attrib-reuse") == Experiment::None);
+	Check(static_cast<uint32_t>(ParseExperiment("vs-attrib-reuse,release-mem,indirect-count-gpu")) == 3);
+	Check(ParseExperiment("vs-attrib-reuse-extra") == Experiment::None);
+	Check(ParseExperiment("clean-read-early-reject") == Experiment::None);
+	Check(static_cast<uint32_t>(ParseExperiment("clean-read-early-reject,release-mem,indirect-count-gpu")) == 3);
+	Check(ParseExperiment("clean-read-early-reject-extra") == Experiment::None);
+	Check(ParseExperiment("overlap-intervals") == Experiment::None);
+	Check(static_cast<uint32_t>(ParseExperiment("overlap-intervals,release-mem,indirect-count-gpu")) == 3);
+	Check(ParseExperiment("overlap-intervals-extra") == Experiment::None);
+	Check(ParseExperiment("image-binding-inplace") == Experiment::None);
+	Check(static_cast<uint32_t>(ParseExperiment("image-binding-inplace,release-mem,indirect-count-gpu")) == 3);
+	Check(ParseExperiment("image-binding-inplace-extra") == Experiment::None);
+	Check(ParseExperiment("walker-control-gpu") == Experiment::None);
+	Check(ParseExperiment("indirect-count-gpu") == Experiment::IndirectCountGpu);
+	Check(ParseExperiment("indirect-mesh-gpu") == Experiment::None);
+	Check(ParseExperiment("walker-control-gpu,indirect-mesh-gpu") == Experiment::None);
+	Check(ParseExperiment("indirect-mesh-gpu,indirect-count-gpu,walker-control-gpu") == Experiment::IndirectCountGpu);
+	Check(ParseExperiment("walker-control-gpu,indirect-count-gpu") == Experiment::IndirectCountGpu);
+	Check(ParseExperiment(" indirect-count-gpu,walker-control-gpu,walker-control-gpu,,typo ") == Experiment::IndirectCountGpu);
+	Check(static_cast<uint32_t>(ParseExperiment("walker-control-gpu,release-mem,indirect-count-gpu")) == 3);
+	Check(ParseExperiment("walker-control-gpu-extra,not-release-mem,, ") == Experiment::None);
 	// Old helpers may keep these names. None may activate RELEASE_MEM or
 	// disable the promoted clean reads when experiment.trigger is toggled.
-	for (const auto name: {"overlap-fast", "read-fault-clean", "attrib-clean-read", "srt-clean-read"})
+	for (const auto name: {"overlap-intervals", "obtain-region-generation", "walker-control-gpu", "indirect-mesh-gpu", "buffer-dirty-query", "overlap-fast", "read-fault-clean", "attrib-clean-read", "srt-clean-read", "image-desc-reuse", "image-find-hint"})
 		Check(ParseExperiment(name) == Experiment::None);
-	Check(std::string_view(ExperimentName()) == (image_desc ? "image-desc-reuse" : release_mem ? "release-mem" : "none"));
+	Check(ParseExperiment("obtain-region-generation,indirect-count-gpu") == Experiment::IndirectCountGpu);
+	Check(std::string_view(ExperimentName()) == (combined ? "release-mem,indirect-count-gpu" :
+	    release_mem || indirect_count ? experiment : "none"));
 	SetExperiment(true);
-	Check(ExperimentActive(Experiment::ReleaseMem) == release_mem);
-	Check(ExperimentActive(Experiment::ImageDescReuse) == image_desc);
+	Check(ExperimentActive(Experiment::ReleaseMem) == (release_mem || combined));
+	Check(ExperimentActive(Experiment::IndirectCountGpu) == (indirect_count || combined));
 	Check(!ExperimentActive(Experiment::None));
 	SetExperiment(false);
 	Check(!ExperimentActive(Experiment::ReleaseMem));
-	Check(!ExperimentActive(Experiment::ImageDescReuse));
+	Check(!ExperimentActive(Experiment::IndirectCountGpu));
+	Check(ExperimentSelected(Experiment::IndirectCountGpu) == (indirect_count || combined));
 	const bool armed = Armed();
 	// Disarmed builds never record and scopes leave thread-local state untouched.
 	SetRecording(true);
@@ -415,6 +442,26 @@ int main(int argc, char** argv) {
 	Check(Contains(image_report, "\"image_desc_reuse_hits\":7") &&
 	      Contains(image_report, "\"image_desc_reuse_misses\":2") &&
 	      Contains(image_report, "\"image_desc_history_capacity_resets\":1"));
+	Reset();
+	// Rejection diagnostics must be available even when the experiment never
+	// enters its attempt/fallback branch (e.g. a packet without a count address).
+	SetRecording(false);
+	AddExtra(Extra::IndirectNoCount);
+	Check(Detail::window.extra[static_cast<size_t>(Extra::IndirectNoCount)] == 0);
+	SetRecording(true);
+	AddExtra(Extra::IndirectPackets, 3);
+	AddExtra(Extra::IndirectNoCount, 2);
+	AddExtra(Extra::IndirectPatchInstance, 2);
+	AddExtra(Extra::IndirectCountAttempts);
+	AddExtra(Extra::IndirectArgsUnmapped);
+	AddExtra(Extra::IndirectCountGpuFallbacks);
+	const auto indirect_report = Capture(false);
+	Check(Contains(indirect_report, "\"indirect_packets\":3") &&
+	      Contains(indirect_report, "\"indirect_no_count\":2") &&
+	      Contains(indirect_report, "\"indirect_patch_instance\":2") &&
+	      Contains(indirect_report, "\"indirect_count_attempts\":1") &&
+	      Contains(indirect_report, "\"indirect_args_unmapped\":1") &&
+	      Contains(indirect_report, "\"indirect_count_gpu_fallbacks\":1"));
 	Reset();
 	std::puts("SubmitProfileTests: all cases passed");
 }

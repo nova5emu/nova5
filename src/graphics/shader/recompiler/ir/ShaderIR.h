@@ -365,7 +365,7 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
-	static constexpr uint32_t MeshDrawDwordCount = 6;
+	static constexpr uint32_t MeshDrawDwordCount = 7;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -687,6 +687,17 @@ struct ResourcePlan {
 	UniformFillPlan                     uniform_fill;
 	// x86 walker over the retained SRT, descriptor and condition values.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
+	// Diagnostic map rebuilt with native code, never serialized. Usage bits:
+	// 1 control, 2 flattened SRT, 4 descriptor, 8 materialization output.
+	struct WalkerReadSite {
+		uint32_t offset = 0, uses = 0, flat_slot = UINT32_MAX, descriptor = UINT32_MAX;
+		const Inst* inst = nullptr;
+		uint32_t control_slot = UINT32_MAX;
+	};
+	std::vector<WalkerReadSite> walker_read_sites;
+	// GPU-thread adaptive control state, derived with the JIT, never serialized.
+	mutable std::vector<uint8_t> walker_control_disabled;
+	mutable bool walker_control_rejected = false;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
 	// GPU-thread scratch for walker results and material keys.

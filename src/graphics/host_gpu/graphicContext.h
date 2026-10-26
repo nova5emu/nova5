@@ -35,7 +35,9 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
+	bool                               bounded_index_buffer_enabled           = false;
 	bool                               conditional_rendering_enabled         = false;
+	bool                               draw_indirect_count_enabled           = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               supports_block_texel_view              = false;

@@ -8407,7 +8407,10 @@ void TestBufferSwizzleSpecialization() {
 
 enum class ConditionalBufferUse { Optional, Shared, Loop, Writable };
 
-ResourcePlan ConditionalBufferPlan(ConditionalBufferUse use) {
+ResourcePlan ConditionalBufferPlan(ConditionalBufferUse use, uint32_t read_offset = 0,
+                                   bool fixed_control = false,
+                                   uint32_t descriptor_high = 16u << 16u,
+                                   uint32_t descriptor_flags = 0x4dfac) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   Fixture fixture;
   auto *entry = fixture.block;
@@ -8438,12 +8441,15 @@ ResourcePlan ConditionalBufferPlan(ConditionalBufferUse use) {
       .true_block = use == ConditionalBufferUse::Loop ? condition_block : done};
 
   const auto control = fixture.Buffer(
-      {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2),
-       fixture.UserData(3)}, 4);
+      fixed_control
+          ? std::array<Value, 4>{Value(0x1000u), Value(descriptor_high),
+                                Value(1u), Value(descriptor_flags)}
+          : std::array<Value, 4>{fixture.UserData(0), fixture.UserData(1),
+                                fixture.UserData(2), fixture.UserData(3)}, 4);
   MemoryInfo scalar;
   scalar.kind = ResourceKind::ScalarBuffer;
   auto flag = fixture.Emit(ValueOpcode::ReadConstBuffer,
-                           {control, Value(0u)}, fixture.AddMemory(scalar, 4));
+                           {control, Value(read_offset)}, fixture.AddMemory(scalar, 4));
   if (use == ConditionalBufferUse::Loop) {
     auto &phi = condition_block->AppendNewInst(ValueOpcode::Phi, {},
                                                static_cast<uint64_t>(Type::U32));
@@ -8647,13 +8653,48 @@ void TestConservativeBufferReachability() {
     for (const uint32_t flag : {0u, 1u}) {
       memory.words[0] = flag;
       std::array<uint32_t, 4> expected{};
-      if (use == ConditionalBufferUse::Shared || flag != 0u)
+      // Writable reads and writes the same control DWORD at offset zero.
+      // Its pre-dispatch value cannot safely prune a GPU branch.
+      if (use == ConditionalBufferUse::Shared ||
+          use == ConditionalBufferUse::Writable || flag != 0u)
         std::copy_n(user_data.begin() + 4, expected.size(), expected.begin());
+      memory.reads = 0;
       Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
                 snapshot.buffers.size() == 2 &&
                 std::equal(expected.begin(), expected.end(),
                            snapshot.buffers[1].dwords.begin()),
-            "shared or entered loop resource was pruned, or an untaken branch or loop retained");
+            "shared, writable or entered loop resource was pruned, or a read-only untaken branch retained");
+      if (use == ConditionalBufferUse::Writable) {
+        Check(plan.info.buffers[0].write_extent == 4 && memory.reads == 0 &&
+                  snapshot.specialization_reads.empty(),
+              "self-written control DWORD was still read speculatively by the host");
+      }
+    }
+  }
+  // A fixed write covers [base, base+4). Preserve host pruning for scalar
+  // reads at/after that end only when linear addressing is proved statically.
+  for (const uint32_t offset : {0u, 3u, 4u, 8u}) {
+    for (const uint32_t mode : {0u, 1u, 2u, 3u}) {
+      const bool fixed = mode != 3;
+      const uint32_t high = (16u << 16u) | (mode == 1 ? 1u << 31u : 0u);
+      const uint32_t flags = 0x4dfac | (mode == 2 ? 1u << 23u : 0u);
+      auto plan = ConditionalBufferPlan(ConditionalBufferUse::Writable, offset,
+                                        fixed, high, flags);
+      const bool disjoint = mode == 0 && offset >= 4;
+      for (const uint32_t flag : {0u, 1u}) {
+        memory.words.fill(0);
+        memory.words[offset / 4] = flag;
+        memory.reads = 0;
+        ResourceSnapshot snapshot;
+        ResourceSpecialization specialization;
+        Check(MaterializeResources(plan, runtime, snapshot, specialization),
+              "fixed RW control plan failed");
+        const bool active = !disjoint || flag != 0;
+        Check(snapshot.buffers[1].dwords[0] == (active ? user_data[4] : 0u) &&
+                  memory.reads == (disjoint ? 1u : 0u) &&
+                  snapshot.specialization_reads.empty() == !disjoint,
+              "fixed-write range proof lost safe pruning or admitted an overlapping/unknown read");
+      }
     }
   }
 }

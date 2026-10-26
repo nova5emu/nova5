@@ -3,6 +3,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/renderStageProfile.h"
+#include "common/readbackProfile.h"
 #include "common/submitProfile.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
@@ -166,7 +167,7 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 	return reinterpret_cast<const uint8_t*>(plan.srt_scratch.data());
 }
 
-thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
+thread_local const ResourcePlan* t_running_walker = nullptr;
 using CleanReader = bool (*)(uint64_t, void*, uint64_t);
 thread_local CleanReader t_clean_reader = nullptr;
 // Direct-mapped hints populated by the first clean fault. A stale/colliding
@@ -180,7 +181,7 @@ uint64_t KYTY_SYSV_ABI ReadCleanWord(uint64_t address) {
 }
 
 // Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, Xbyak::Label& clean_load) {
+uint32_t LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, Xbyak::Label& clean_load) {
 	code.lea(code.r10, code.ptr[address]);
 	Xbyak::Label direct, done;
 	code.mov(code.r11, code.r10);
@@ -196,8 +197,36 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, Xbyak::
 	code.mov(code.eax, code.eax);
 	code.jmp(done);
 	code.L(direct);
+	const auto offset = static_cast<uint32_t>(code.getSize());
 	code.mov(code.eax, code.dword[code.r10]);
 	code.L(done);
+	return offset;
+}
+
+// Compile-time proof only. packed_stride is not specialized yet here, so use
+// the retained descriptor expressions rather than its default metadata value.
+bool ReadBeyondFixedWrites(const ResourcePlan& program, const Inst& inst,
+                           const MemoryInfo& memory, const BufferResource& buffer) {
+	if (inst.GetOpcode() != ValueOpcode::ReadConstBuffer || inst.NumArgs() != 2 ||
+	    memory.kind != ResourceKind::ScalarBuffer || buffer.write_extent == 0 ||
+	    buffer.write_extent == UINT32_MAX || buffer.source >= program.descriptor_sources.size()) return false;
+	const auto& source = program.descriptor_sources[buffer.source];
+	if (source.dword_count != 4 || source.indirect_descriptor) return false;
+	const auto low = source.dwords[0].Resolve();
+	const auto high = source.dwords[1].Resolve();
+	const auto flags = source.dwords[3].Resolve();
+	const auto offset = inst.Arg(1).Resolve();
+	for (const auto value: {low, high, flags, offset}) {
+		if (!value.IsImmediate() || value.GetType() != Type::U32) return false;
+	}
+	// Scalar loads align the base/offset independently. Fixed vector writes
+	// need the same aligned base, without ADD_TID or swizzled addressing.
+	if ((low.U32() & 3u) != 0 || (high.U32() & (1u << 31u)) != 0 ||
+	    (flags.U32() & (1u << 23u)) != 0) return false;
+	const auto begin = int64_t {offset.U32() & ~3u} +
+	    (static_cast<int64_t>(static_cast<int32_t>(memory.offset)) & ~int64_t {3});
+	// Avoid U32 address arithmetic wrap and negative immediate offsets.
+	return begin >= buffer.write_extent && begin <= int64_t {UINT32_MAX} - 3;
 }
 
 class RuntimeValidator {
@@ -248,6 +277,23 @@ private:
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
+		if (m_type == RuntimeValueType::ReadOnlyControlInteger &&
+		    (op == ValueOpcode::LoadBufferU32 || op == ValueOpcode::ReadConstBuffer)) {
+			const auto index = inst->Flags<MemoryFlags>().index;
+			if (index >= m_program.memory_info.size()) return finish(false);
+			const auto& memory = m_program.memory_info[index];
+			// Control projection is optional. A GPU read that can overlap a write
+			// must not become a host decision that drops resource branches.
+			// Planning-only reads remain mandatory SRT dependencies: the renderer's
+			// overlap check still rejects them if they alias a write.
+			if (!memory.planning_only &&
+			    (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::ScalarBuffer ||
+			     memory.kind == ResourceKind::IndirectBuffer) &&
+			    memory.resource < m_program.info.buffers.size() &&
+			    m_program.info.buffers[memory.resource].written &&
+			    !ReadBeyondFixedWrites(m_program, *inst, memory,
+			                           m_program.info.buffers[memory.resource])) return finish(false);
+		}
 		if (m_type == RuntimeValueType::ImmutableInteger &&
 		    (op == ValueOpcode::ReadConst || BufferAccessOf(op) != BufferAccess::None ||
 		     AddressOpcodeInfoOf(op).access != AddressAccess::None ||
@@ -424,6 +470,8 @@ private:
 		uint32_t             slot = 0, state = 0;
 		Xbyak::Label         label;
 		bool                 pending = true, referenced = false, masked = false;
+		uint32_t uses = 0, flat_slot = UINT32_MAX, descriptor = UINT32_MAX;
+		uint32_t control_slot = UINT32_MAX;
 	};
 
 	static constexpr auto Near = Xbyak::CodeGenerator::T_NEAR;
@@ -445,6 +493,19 @@ private:
 	}
 
 	void AddOutput(Value value, uint32_t gate);
+	void MarkUses(Operand root, uint32_t uses, uint32_t index = UINT32_MAX) {
+		std::vector<Operand> pending {root};
+		while (!pending.empty()) {
+			const auto operand = pending.back(); pending.pop_back();
+			if (operand.kind != Kind::Node) continue;
+			auto& node = m_nodes[operand.value];
+			if (node.uses & uses) continue;
+			node.uses |= uses;
+			if (uses == 2) node.flat_slot = index;
+			if (uses == 4) node.descriptor = index;
+			pending.insert(pending.end(), node.args.begin(), node.args.end());
+		}
+	}
 	void Consume(std::vector<std::vector<uint32_t>>& gates);
 	Ref Evaluate(Value value, uint32_t context);
 	Operand Analyze(uint32_t index);
@@ -930,9 +991,22 @@ void WalkerCompiler::EmitNode(uint32_t index) {
 // Raw scalar and uniform DWORD buffer loads; out-of-bounds reads are zero.
 void WalkerCompiler::EmitRead(const Node& node) {
 	auto&      c    = m_code;
+	if (node.control_slot != UINT32_MAX) {
+		Xbyak::Label original;
+		// Unknown, not zero: resource reachability must follow both GPU branches.
+		c.test(c.r13, c.r13);
+		c.jz(original, Near);
+		c.cmp(c.byte[c.r13 + node.control_slot], 0);
+		c.jne(m_ret, Near);
+		c.L(original);
+	}
 	const auto& inst = *node.inst;
 	const auto op = inst.GetOpcode();
 	const bool vector = op == ValueOpcode::LoadBufferU32;
+	const auto load = [&](const Xbyak::RegExp& address) {
+		const auto offset = LoadGuest(c, address, m_clean_load);
+		m_plan.walker_read_sites.push_back({offset, node.uses, node.flat_slot, node.descriptor, node.inst, node.control_slot});
+	};
 	auto args = std::span(node.args);
 	Xbyak::Label zero;
 	if (vector) {
@@ -961,7 +1035,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.mov(c.rcx, c.rax);
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
-			LoadGuest(c, c.rax, m_clean_load);
+			load(c.rax);
 		} else {
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
@@ -991,7 +1065,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.lea(c.r11, c.ptr[c.r9 + static_cast<size_t>(immediate) + 4u]);
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
-			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_clean_load);
+			load(c.rax + c.r9 + static_cast<size_t>(immediate));
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
@@ -1223,6 +1297,23 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		}
 	}
 	for (const auto value: m_outputs) outputs.push_back(Evaluate(value, 0).operand);
+	{
+		for (const auto root: conditions) MarkUses(root, 1);
+		for (uint32_t i = 0; i < reads.size(); ++i) MarkUses(reads[i], 2, i);
+		for (uint32_t i = 0; i < descriptors.size(); ++i)
+			for (const auto root: descriptors[i]) MarkUses(root, 4, i);
+		for (const auto root: outputs) MarkUses(root, 8);
+	}
+	{
+		// Only optional control loads can learn to stay on the GPU. Descriptor,
+		// flattened SRT and explicit output dependencies must always be read.
+		for (auto& node: m_nodes) {
+			if (node.uses != 1 || !IsRawRead(m_plan, *node.inst) ||
+			    m_plan.memory_info[node.inst->Flags<MemoryFlags>().index].planning_only) continue;
+			node.control_slot = static_cast<uint32_t>(m_plan.walker_control_disabled.size());
+			m_plan.walker_control_disabled.push_back(0);
+		}
+	}
 	Layout();
 
 	Xbyak::Label pass, fail, reset;
@@ -1383,6 +1474,9 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 } // namespace
 
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
+	plan.walker_read_sites.clear();
+	plan.walker_control_disabled.clear();
+	plan.walker_control_rejected = false;
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 	auto& c = *plan.srt_code;
 	// One body. r12 holds page hints across thunks and the C++ clean-read
@@ -1390,7 +1484,10 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 	Xbyak::Label body;
 	c.push(c.r12);
 	c.mov(c.r12, c.r8);
+	c.push(c.r13);
+	c.mov(c.r13, c.r9);
 	c.call(body);
+	c.pop(c.r13);
 	c.pop(c.r12);
 	c.ret();
 	c.L(body);
@@ -1399,24 +1496,43 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 	EXIT_IF(Xbyak::GetError() != 0);
 }
 
-bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
-             std::vector<std::pair<uint64_t, uint64_t>>* reads) {
-	Common::RenderStageProfile::Scope stage_profile {Common::RenderStageProfile::Stage::ScalarTables};
+template <bool Profile>
+static bool WalkSrtImpl(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
+                        std::vector<std::pair<uint64_t, uint64_t>>* reads) {
+	using namespace Common::RenderStageProfile;
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
-	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t, const uint64_t*);
-	const auto* previous_walker = std::exchange(t_running_walker, plan.srt_code.get());
-	const auto previous_reader = std::exchange(t_clean_reader, runtime.read_clean_memory);
-	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
-	    plan.srt_scratch.data(), runtime.shader_base, t_clean_pages.data());
-	t_clean_reader = previous_reader;
-	t_running_walker = previous_walker;
+	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t, const uint64_t*, const uint8_t*);
+	const uint64_t* end;
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::SrtNative};
+		const auto* previous_walker = std::exchange(t_running_walker, &plan);
+		const auto previous_reader = std::exchange(t_clean_reader, runtime.read_clean_memory);
+		const auto* controls = !plan.walker_control_disabled.empty() && !plan.walker_control_rejected
+		    ? plan.walker_control_disabled.data() : nullptr;
+		if (controls) Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::WalkerControlWalks);
+		end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
+		    plan.srt_scratch.data(), runtime.shader_base, t_clean_pages.data(), controls);
+		t_clean_reader = previous_reader;
+		t_running_walker = previous_walker;
+	}
 	if (end == nullptr) return false;
 	if (reads != nullptr) {
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::SrtCapture};
 		for (auto* read = plan.srt_scratch.data() + plan.srt_captures / 8u; read != end; ++read)
 			reads->emplace_back(*read, sizeof(uint32_t));
 	}
 	return true;
+}
+
+bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
+             std::vector<std::pair<uint64_t, uint64_t>>* reads) {
+	using namespace Common::RenderStageProfile;
+	if (!Detail::Enabled()) return WalkSrtImpl<false>(plan, runtime, flat, reads);
+	Scope stage_profile {Stage::ScalarTables};
+	if (Detail::DetailedEnabled())
+		return WalkSrtImpl<true>(plan, runtime, flat, reads);
+	return WalkSrtImpl<false>(plan, runtime, flat, reads);
 }
 
 bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result) {
@@ -1460,11 +1576,48 @@ bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {
 	if (t_running_walker == nullptr ||
-	    t_running_walker->getSize() < 3 ||
-	    rip - reinterpret_cast<uint64_t>(t_running_walker->getCode()) > t_running_walker->getSize() - 3)
+	    t_running_walker->srt_code->getSize() < 3 ||
+	    rip - reinterpret_cast<uint64_t>(t_running_walker->srt_code->getCode()) > t_running_walker->srt_code->getSize() - 3)
 		return 0;
 	const auto* code = reinterpret_cast<const uint8_t*>(rip);
 	return code[0] == 0x41u && code[1] == 0x8bu && code[2] == 0x02u ? 3 : 0;
+}
+
+bool NoteSrtControlReadback(uint64_t rip) {
+	using namespace Common::SubmitProfile;
+	if (!SrtWalkerLoadLength(rip)) return false;
+	const auto& plan = *t_running_walker;
+	if (plan.walker_control_rejected) return false;
+	const auto offset = rip - reinterpret_cast<uint64_t>(plan.srt_code->getCode());
+	const auto site = std::lower_bound(plan.walker_read_sites.begin(), plan.walker_read_sites.end(), offset,
+	    [](const ResourcePlan::WalkerReadSite& site, uint64_t key) { return site.offset < key; });
+	if (site == plan.walker_read_sites.end() || site->offset != offset || site->control_slot == UINT32_MAX) return false;
+	auto& disabled = plan.walker_control_disabled[site->control_slot];
+	if (!disabled) AddExtra(Extra::WalkerControlPromotions);
+	disabled = 1;
+	return true;
+}
+
+bool DescribeSrtWalkerRead(uint64_t rip, Common::ReadbackProfile::Origin& origin) {
+	if (!SrtWalkerLoadLength(rip)) return false;
+	const auto& plan = *t_running_walker;
+	const auto offset = rip - reinterpret_cast<uint64_t>(plan.srt_code->getCode());
+	const auto site = std::lower_bound(plan.walker_read_sites.begin(), plan.walker_read_sites.end(), offset,
+	    [](const ResourcePlan::WalkerReadSite& site, uint64_t key) { return site.offset < key; });
+	if (site == plan.walker_read_sites.end() || site->offset != offset) return false;
+	origin.kind = Common::ReadbackProfile::Kind::Walker;
+	origin.hash = plan.shader_hash; origin.stage = static_cast<uint32_t>(plan.stage);
+	origin.jit_offset = site->offset; origin.uses = site->uses;
+	origin.flat_slot = site->flat_slot; origin.descriptor = site->descriptor;
+	origin.opcode = ValueOpcodeName(site->inst->GetOpcode()).data();
+	const auto flags = site->inst->Flags<MemoryFlags>();
+	origin.pc = flags.pc; origin.memory = flags.index;
+	if (flags.index < plan.memory_info.size()) {
+		const auto& memory = plan.memory_info[flags.index];
+		origin.resource = memory.resource; origin.memory_kind = static_cast<uint32_t>(memory.kind);
+		origin.immediate = memory.offset; origin.planning_only = memory.planning_only;
+	}
+	return true;
 }
 
 bool SrtWalkerTryReadClean(uint64_t address, void* data, uint64_t bytes) {

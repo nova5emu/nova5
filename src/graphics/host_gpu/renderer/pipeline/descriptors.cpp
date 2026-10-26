@@ -1,4 +1,5 @@
 #include "common/renderStageProfile.h"
+#include "common/readbackProfile.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include "common/alignment.h"
@@ -30,6 +31,7 @@
 #include <bit>
 #include <optional>
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
@@ -116,13 +118,17 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+template <bool Profile>
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+	using namespace Common::RenderStageProfile;
+	if constexpr (Profile) ++Detail::state.buffer_rebinds.descriptors;
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
 	if (address == 0 || size == 0) {
+		if constexpr (Profile) ++Detail::state.buffer_rebinds.null_descriptors;
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
 	const auto& graphics  = context.GetGraphics();
@@ -130,19 +136,25 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
-	    address, size, resource.written,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
-	const auto aligned_offset = Common::AlignDown(offset, alignment);
-	const auto adjustment     = offset - aligned_offset;
-	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment >= 256 || size > max_range - adjustment) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
-	}
-	buffer_offset = static_cast<uint32_t>(adjustment);
-	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
+	auto [buffer, offset] = [&] {
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::RebindObtain};
+		return context.GetBufferCache().ObtainBuffer<Profile>(address, size, resource.written,
+		    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	}();
+	const auto result = [&] {
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::RebindDescriptors};
+		const auto aligned_offset = Common::AlignDown(offset, alignment);
+		const auto adjustment     = offset - aligned_offset;
+		const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
+		if (adjustment >= 256 || size > max_range - adjustment) {
+			EXIT("storage buffer offset adjustment is unsupported\n");
+		}
+		buffer_offset = static_cast<uint32_t>(adjustment);
+		return vk::DescriptorBufferInfo {buffer->Handle(), aligned_offset, size + adjustment};
+	}();
 	if (resource.written) {
-		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::RebindInvalidate};
+		context.GetTextureCache().InvalidateMemoryFromGPU<Profile>(address, size);
 	}
 	return result;
 }
@@ -613,14 +625,21 @@ BuiltImageDescription BuildTextureDescription(const ShaderRecompiler::IR::ImageR
 	return built;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	// Heap/rebind callers do not have the immutable program/resource association.
+	return ResolveTextureImpl<false>(resource, value, 0, 0);
+}
+
+template <bool Profile>
+TextureBinding RenderExecutor::ResolveTextureImpl(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value,
-                                              bool profile_prepare, uint64_t description_program,
+                                              uint64_t description_program,
                                               uint32_t description_resource) {
 	using Stage = Common::RenderStageProfile::Stage;
-	using Scope = Common::RenderStageProfile::Scope;
+	using Scope = Common::RenderStageProfile::ScopeFor<Profile>;
 	{
-		Scope validation {Stage::ImageValidate, profile_prepare};
+		[[maybe_unused]] Scope validation {Stage::ImageValidate};
 		if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 			EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 		}
@@ -628,7 +647,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
 	if (storage) {
-		Scope validation {Stage::ImageValidate, profile_prepare};
+		[[maybe_unused]] Scope validation {Stage::ImageValidate};
 		ValidateStorageImageResource(resource);
 	}
 
@@ -637,55 +656,54 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
 
-	// Both A and B pay the same single scope, including lookup/copy on a hit.
-	std::optional<Scope> build_profile;
-	build_profile.emplace(Stage::ImageDescBuild, profile_prepare);
-	auto validate = [&](const ImageInfo& info) {
-		Scope validation {Stage::ImageValidate, profile_prepare};
-		const auto alignment = info.DataAlignment();
-		EXIT_NOT_IMPLEMENTED(info.data.size == 0 || alignment == 0 ||
-		                     (descriptor.Base40() & (static_cast<uint64_t>(alignment) - 1u)) != 0);
-		// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
-		if (resource.heap && !m_context.IsMapped(descriptor.Base40(), info.data.size)) {
-			return false;
-		}
-		if (storage) {
-			ValidateStorageTexture(resource, descriptor, info.data.size);
-		}
-		return true;
-	};
-
 	BuiltImageDescription built {};
-	const BuiltImageDescription* cached = nullptr;
-	if (description_program != 0) {
-		if (!m_image_descriptions) m_image_descriptions = std::make_unique<ImageDescriptionCache>();
-		cached = m_image_descriptions->Find(description_program, description_resource, value.dwords);
-	}
-	if (cached != nullptr) {
-		built = *cached;
-		if (!validate(built.desc.info)) return {.layout = vk::ImageLayout::eGeneral};
-		Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::ImageDescReuseHits);
-	} else {
-		if (!BuildTextureDescriptionImpl(resource, descriptor, built, validate))
-			return {.layout = vk::ImageLayout::eGeneral};
+	{
+		[[maybe_unused]] Scope build_profile {Stage::ImageDescBuild};
+		auto validate = [&](const ImageInfo& info) {
+			[[maybe_unused]] Scope validation {Stage::ImageValidate};
+			const auto alignment = info.DataAlignment();
+			EXIT_NOT_IMPLEMENTED(info.data.size == 0 || alignment == 0 ||
+			                     (descriptor.Base40() & (static_cast<uint64_t>(alignment) - 1u)) != 0);
+			// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
+			if (resource.heap && !m_context.IsMapped(descriptor.Base40(), info.data.size)) {
+				return false;
+			}
+			if (storage) {
+				ValidateStorageTexture(resource, descriptor, info.data.size);
+			}
+			return true;
+		};
+
+		const BuiltImageDescription* cached = nullptr;
 		if (description_program != 0) {
-			using namespace Common::SubmitProfile;
-			AddExtra(Extra::ImageDescReuseMisses);
-			if (m_image_descriptions->Store(description_program, description_resource, value.dwords, built))
-				AddExtra(Extra::ImageDescHistoryCapacityResets);
+			if (!m_image_descriptions) m_image_descriptions = std::make_unique<ImageDescriptionCache>();
+			cached = m_image_descriptions->Find(description_program, description_resource, value.dwords);
+		}
+		if (cached != nullptr) {
+			built = *cached;
+			if (!validate(built.desc.info)) return {.layout = vk::ImageLayout::eGeneral};
+			Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::ImageDescReuseHits);
+		} else {
+			if (!BuildTextureDescriptionImpl(resource, descriptor, built, validate))
+				return {.layout = vk::ImageLayout::eGeneral};
+			if (description_program != 0) {
+				using namespace Common::SubmitProfile;
+				AddExtra(Extra::ImageDescReuseMisses);
+				if (m_image_descriptions->Store(description_program, description_resource, value.dwords, built))
+					AddExtra(Extra::ImageDescHistoryCapacityResets);
+			}
 		}
 	}
 	auto& desc = built.desc;
 	const auto shader_conversion = built.shader_conversion;
 	const auto pixel_format = built.pixel_format;
 	const auto view_format = built.view_format;
-	build_profile.reset();
 	ImageId id;
 	{
-		Scope find {Stage::ImageFind, profile_prepare};
+		[[maybe_unused]] Scope find {Stage::ImageFind};
 		id = texture_cache.FindImage(desc, shader_conversion);
 	}
-	Scope validation {Stage::ImageValidate, profile_prepare};
+	[[maybe_unused]] Scope validation {Stage::ImageValidate};
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -758,6 +776,31 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+template <bool Profile>
+void RenderExecutor::PrepareImages(const ShaderStageRuntime& runtime, PreparedBindings& prepared) {
+	const auto& program = runtime.module->info;
+	const auto& snapshot = *runtime.resources;
+	[[maybe_unused]] Common::RenderStageProfile::ScopeFor<Profile> profile {Common::RenderStageProfile::Stage::PrepareImages};
+	// Vulkan modules survive PipelineCache's vector moves and are destroyed only
+	// with that cache. Its immutable resource metadata is part of this identity.
+	const uint64_t description_program = runtime.module->module
+	    ? std::bit_cast<uint64_t>(static_cast<VkShaderModule>(runtime.module->module)) : 0;
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		if (program.info.images[i].heap) {
+			prepared.images[i] = {};
+			continue;
+		}
+		auto binding = ResolveTextureImpl<Profile>(program.info.images[i], snapshot.images[i], description_program, i);
+		{
+			[[maybe_unused]] Common::RenderStageProfile::ScopeFor<Profile> bind {Common::RenderStageProfile::Stage::ImageBind};
+			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+		}
+		binding.mip_views.swap(prepared.images[i].mip_views);
+		binding.mip_views.clear();
+		prepared.images[i] = std::move(binding);
+	}
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	Common::RenderStageProfile::Scope stage_profile {Common::RenderStageProfile::Stage::PrepareBindings};
@@ -773,27 +816,11 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
-	{
-		Common::RenderStageProfile::Scope profile {Common::RenderStageProfile::Stage::PrepareImages};
-		const bool reuse = Common::SubmitProfile::ExperimentActive(Common::SubmitProfile::Experiment::ImageDescReuse);
-		// Vulkan modules survive PipelineCache's vector moves and are destroyed only
-		// with that cache. Its immutable resource metadata is part of this identity.
-		const uint64_t description_program = reuse && runtime.module->module
-		    ? std::bit_cast<uint64_t>(static_cast<VkShaderModule>(runtime.module->module)) : 0;
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			if (program.info.images[i].heap) {
-				prepared.images[i] = {};
-				continue;
-			}
-			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i], true, description_program, i);
-			{
-				Common::RenderStageProfile::Scope bind {Common::RenderStageProfile::Stage::ImageBind};
-				BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-			}
-			binding.mip_views.swap(prepared.images[i].mip_views);
-			binding.mip_views.clear();
-			prepared.images[i] = std::move(binding);
-		}
+	// The disabled path contains no per-image profiling checks or scope objects.
+	if (Common::RenderStageProfile::Detail::Enabled()) {
+		PrepareImages<true>(runtime, prepared);
+	} else {
+		PrepareImages<false>(runtime, prepared);
 	}
 	{
 		Common::RenderStageProfile::Scope profile {Common::RenderStageProfile::Stage::PrepareSamplers};
@@ -879,6 +906,16 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	Common::RenderStageProfile::Scope stage_profile {Common::RenderStageProfile::Stage::RebindBuffers};
+	// One gate outside the resource loop; disabled instantiations contain no
+	// detailed clocks, TLS counters or sampling state, including cache helpers.
+	if (Common::RenderStageProfile::Detail::DetailedEnabled()) RebindBuffersImpl<true>(prepared);
+	else RebindBuffersImpl<false>(prepared);
+}
+
+template <bool Profile>
+void RenderExecutor::RebindBuffersImpl(PreparedBindings& prepared) {
+	using namespace Common::RenderStageProfile;
+	if constexpr (Profile) ++Detail::state.buffer_rebinds.calls;
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = prepared.runtime->module->info;
@@ -886,10 +923,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& layout    = program.bindings;
 	EXIT_IF(prepared.buffer_sources.size() != layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 
-	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
-	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
-	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
-	          prepared.shader_data.end(), 0);
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::RebindSetup};
+		prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
+		EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
+		std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
+		          prepared.shader_data.end(), 0);
+	}
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
 		const auto dword = layout.memory_offset_dword + index / 4u;
 		const auto shift = (index % 4u) * 8u;
@@ -899,14 +939,24 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
-		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
+		prepared.buffers[index] = NativeStorageBuffer<Profile>(m_context, prepared.buffer_sources[index],
 		                                              resource, buffer_offset);
 		pack_memory_offset(index, buffer_offset);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::RebindFlattenedUpload};
+		if constexpr (Profile) {
+			++Detail::state.buffer_rebinds.flattened_uploads;
+			Detail::state.buffer_rebinds.flattened_bytes += snapshot.flattened_srt.size() * sizeof(uint32_t);
+		}
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::RebindShaderUpload};
+		if constexpr (Profile) {
+			++Detail::state.buffer_rebinds.shader_uploads;
+			Detail::state.buffer_rebinds.shader_bytes += prepared.shader_data.size() * sizeof(uint32_t);
+		}
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
 	}
 }
@@ -993,6 +1043,72 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
+// Cold failure diagnosis: recover the first writer with the pre-compaction
+// traversal. Do not retain provenance or decode descriptors on successful draws.
+[[gnu::noinline]] static void ReportBufferOverlap(
+    const PreparedBindings& reader, uint64_t address, uint64_t size,
+    std::span<PreparedBindings* const> stages, vk::PipelineBindPoint bind_point) {
+
+	const auto& reader_module = *reader.runtime->module;
+	const auto& reader_info = reader_module.info;
+	for (size_t stage_index = 0; stage_index < stages.size(); ++stage_index) {
+		const auto& writer = *stages[stage_index];
+		const auto& writer_module = *writer.runtime->module;
+		const auto& program = writer_module.info;
+		for (size_t index = 0; index < program.info.buffers.size(); ++index) {
+			const auto& resource = program.info.buffers[index];
+			if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
+			const auto& source = writer.buffer_sources[resource.descriptor_index];
+			const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
+			const auto written_size =
+			    linear ? std::min<uint64_t>(source.size, resource.write_extent) : source.size;
+			if (written_size == 0 || !ImageRangeOverlaps(address, size, source.address, written_size)) continue;
+
+			// Snapshot only: never reread guest memory while reporting this failure.
+			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(
+			    writer.runtime->resources->buffers[index]);
+			const auto descriptor_size = descriptor.GetSize();
+			const bool sentinel = descriptor.NumRecords() == UINT32_MAX;
+			auto table_limit = descriptor_size;
+			if (sentinel) {
+				for (const auto* bound: stages) {
+					for (const auto [read_address, read_size]: bound->runtime->resources->specialization_reads) {
+						if (read_size != 0 && read_address > source.address)
+							table_limit = std::min(table_limit, read_address - source.address);
+					}
+				}
+			}
+			const auto message = fmt::format(
+			    "scalar resource reads overlap a shader buffer write\n"
+			    "[BINDING_OVERLAP] legacy_buffer_match=1 operation={} same_stage={}\n"
+			    " reader: stage={} hash=0x{:016x} module=0x{:016x} read=0x{:016x}+0x{:x} read_count={}\n"
+			    " writer: stage={} hash=0x{:016x} module=0x{:016x} stage_index={} resource={} source={} descriptor_index={} first_use_pc=0x{:x}\n"
+			    " write: address=0x{:016x} checked_size=0x{:x} prepared_size=0x{:x} descriptor_address=0x{:016x} descriptor_size=0x{:x}\n"
+			    " buffer: NumRecords=0x{:08x} stride={} packed_stride=0x{:08x} write_extent=0x{:08x} max_byte_extent=0x{:08x} linear={} add_tid={} swizzle={} read={} written={} atomic={} formatted={} scalar={} live={}\n"
+			    " sentinel: present={} clipped={} table_clipped={} table_limit=0x{:x}\n"
+			    " descriptor_dwords={:08x},{:08x},{:08x},{:08x}\n",
+			    bind_point == vk::PipelineBindPoint::eCompute ? "dispatch" : "draw", &reader == &writer,
+			    ShaderRecompiler::StageName(reader_info.stage), reader_info.shader_hash, reader_module.id,
+			    address, size, reader.runtime->resources->specialization_reads.size(),
+			    ShaderRecompiler::StageName(program.stage), program.shader_hash, writer_module.id,
+			    stage_index, index, resource.source, resource.descriptor_index, resource.first_use_pc,
+			    source.address, written_size, source.size, descriptor.Base48(), descriptor_size,
+			    descriptor.NumRecords(), descriptor.Stride(), resource.packed_stride, resource.write_extent,
+			    resource.max_byte_extent, linear, (resource.packed_stride & (1u << 20u)) != 0,
+			    (resource.packed_stride & (1u << 14u)) != 0, resource.read, resource.written, resource.atomic,
+			    resource.formatted, resource.scalar, resource.live, sentinel,
+			    sentinel && source.size < descriptor_size, sentinel && table_limit < descriptor_size, table_limit,
+			    descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3]);
+			EXIT("%s", message.c_str());
+			return;
+		}
+	}
+	EXIT("scalar resource reads overlap a shader buffer write\n"
+	     "[BINDING_OVERLAP] legacy_buffer_match=0 (compact/legacy mismatch) "
+	     "reader_hash=0x%016" PRIx64 " read=0x%016" PRIx64 "+0x%" PRIx64 "\n",
+	     reader_info.shader_hash, address, size);
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -1064,17 +1180,20 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					}
 				}
 				if (count_ranges) write_ranges = m_binding_overlap_writes.Size();
+				m_binding_overlap_writes.PrepareIntervals();
+				Common::SubmitProfile::AddExtra(Extra::OverlapIntervalCommits);
+				Common::SubmitProfile::AddExtra(Extra::OverlapIntervalRanges, m_binding_overlap_writes.IntervalCount());
 				collected = true;
 			}
 			if (m_binding_overlap_writes.Size() == 0) continue;
 			for (const auto [address, size]: reads) {
 				switch (m_binding_overlap_writes.CheckRead(address, size, count_ranges,
-				                                            image_comparisons, buffer_comparisons)) {
+				                                           image_comparisons, buffer_comparisons)) {
 					case BindingOverlapWrites::Hit::Image:
 						EXIT("scalar resource reads overlap an image or attachment write\n");
 						break;
 					case BindingOverlapWrites::Hit::Buffer:
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+						ReportBufferOverlap(*reader, address, size, prepared_bindings, pipeline_bind_point);
 						break;
 					case BindingOverlapWrites::Hit::None: break;
 				}
@@ -1082,7 +1201,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 	// Writer ranges are counted once per commit that actually checks any reads;
-	// comparisons count every nonempty range passed to ImageRangeOverlaps.
+	// Comparisons count interval endpoints
+	// plus the original-order recovery on the cold conflict/invalid-range path.
 	if (count_ranges) {
 		Common::SubmitProfile::AddExtra(Extra::BindingReadRanges, read_ranges);
 		Common::SubmitProfile::AddExtra(Extra::BindingWriteRanges, write_ranges);
@@ -1272,6 +1392,22 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    nullptr);
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);
+		}
+	}
+	if (Common::ReadbackProfile::Enabled()) {
+		const auto tick = m_context.GetCommandScheduler().CurrentTick();
+		for (const auto* prepared: prepared_bindings) {
+			const auto& module = *prepared->runtime->module;
+			const auto& program = module.info;
+			for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+				const auto& resource = program.info.buffers[i];
+				if (!resource.written || resource.descriptor_index >= prepared->buffer_sources.size()) continue;
+				const auto& source = prepared->buffer_sources[resource.descriptor_index];
+				const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0;
+				const auto bytes = linear ? std::min<uint64_t>(source.size, resource.write_extent) : source.size;
+				Common::ReadbackProfile::RecordWriter({source.address, bytes, program.shader_hash,
+				    module.id, tick, 0, static_cast<uint32_t>(program.stage), i, resource.atomic});
+			}
 		}
 	}
 }

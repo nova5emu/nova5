@@ -8,6 +8,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/readbackProfile.h"
 #include "common/stringUtils.h"
 #include "common/submitProfile.h"
 #include "common/threads.h"
@@ -25,6 +26,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -611,12 +613,14 @@ struct DrawIndexBufferSource {
 	uint64_t      size      = 0;
 	vk::IndexType type      = vk::IndexType::eUint16;
 	uint32_t      guest_element_size = 0;
+	uint32_t      valid_count = UINT32_MAX;
 };
 
 struct PreparedIndexBuffer {
 	vk::Buffer     buffer = nullptr;
 	vk::DeviceSize offset = 0;
 	vk::IndexType  type   = vk::IndexType::eUint16;
+	vk::DeviceSize size = 0;
 };
 
 static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputInfo& info) {
@@ -660,87 +664,115 @@ struct PreparedVertexBuffers {
 	uint32_t                               count = 0;
 };
 
+template <bool Profile>
 static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
                                                   const ShaderVertexInputInfo& vs_input_info) {
+	using namespace Common::RenderStageProfile;
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
+	if constexpr (Profile) {
+		++Detail::state.vertex_index.draws;
+		Detail::state.vertex_index.slots += vs_input_info.buffers_num;
+	}
 
 	// Collect the non-empty guest vertex ranges.
 	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
 	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
 	uint32_t                                                      range_count = 0;
-	for (int i = 0; i < vs_input_info.buffers_num; i++) {
-		const auto& vertex = vs_input_info.buffers[i];
-		const auto  size   = VertexBufferDescriptorSize(i, vs_input_info);
-		sizes[i]           = size;
-		if (size == 0) {
-			continue;
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::VertexSizes};
+		for (int i = 0; i < vs_input_info.buffers_num; i++) {
+			const auto& vertex = vs_input_info.buffers[i];
+			const auto  size   = VertexBufferDescriptorSize(i, vs_input_info);
+			sizes[i]           = size;
+			if (size == 0) {
+				continue;
+			}
+			if (vertex.addr == 0 || size > UINT64_MAX - vertex.addr) {
+				EXIT("invalid vertex buffer range: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     vertex.addr, size);
+			}
+			ranges[range_count++] = {vertex.addr, vertex.addr + size};
 		}
-		if (vertex.addr == 0 || size > UINT64_MAX - vertex.addr) {
-			EXIT("invalid vertex buffer range: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-			     vertex.addr, size);
-		}
-		ranges[range_count++] = {vertex.addr, vertex.addr + size};
 	}
+	if constexpr (Profile) Detail::state.vertex_index.nonempty_slots += range_count;
 
-	std::sort(ranges.begin(), ranges.begin() + range_count,
-	          [](const VertexBufferRange& left, const VertexBufferRange& right) {
-		          return left.base_address < right.base_address;
-	          });
-
-	// Merge overlapping or touching ranges before acquiring host buffers.
 	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges {};
 	uint32_t                                                      merged_count = 0;
-	for (uint32_t i = 0; i < range_count; i++) {
-		const auto& range = ranges[i];
-		if (merged_count != 0 &&
-		    merged_ranges[merged_count - 1].requested_end >= range.base_address) {
-			merged_ranges[merged_count - 1].requested_end =
-			    std::max(merged_ranges[merged_count - 1].requested_end, range.requested_end);
-			continue;
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::VertexRanges};
+		std::sort(ranges.begin(), ranges.begin() + range_count,
+		          [](const VertexBufferRange& left, const VertexBufferRange& right) {
+			          return left.base_address < right.base_address;
+		          });
+
+		// Merge overlapping or touching ranges before acquiring host buffers.
+		for (uint32_t i = 0; i < range_count; i++) {
+			const auto& range = ranges[i];
+			if (merged_count != 0 &&
+			    merged_ranges[merged_count - 1].requested_end >= range.base_address) {
+				merged_ranges[merged_count - 1].requested_end =
+				    std::max(merged_ranges[merged_count - 1].requested_end, range.requested_end);
+				continue;
+			}
+			merged_ranges[merged_count++] = {range.base_address, range.requested_end};
 		}
-		merged_ranges[merged_count++] = {range.base_address, range.requested_end};
 	}
+	if constexpr (Profile) Detail::state.vertex_index.merged_ranges += merged_count;
 
 	auto& cache = buffer.GetContext().GetBufferCache();
-	for (uint32_t i = 0; i < merged_count; i++) {
-		auto& range = merged_ranges[i];
-		// PPSA20298
-		const auto size =
-		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
-		range.acquired_end = range.base_address + size;
-		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::VertexObtain};
+		for (uint32_t i = 0; i < merged_count; i++) {
+			auto& range = merged_ranges[i];
+			// PPSA20298
+			const auto size =
+			    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
+			range.acquired_end = range.base_address + size;
+			range.binding      = cache.ObtainBuffer(range.base_address, size, false);
+			if constexpr (Profile) {
+				auto& counts = Detail::state.vertex_index;
+				++counts.obtain_calls;
+				counts.requested_bytes += range.RequestedSize();
+				counts.acquired_bytes += size;
+				counts.clipped_ranges += size != range.RequestedSize();
+			}
+		}
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
 	PreparedVertexBuffers prepared;
 	prepared.count         = static_cast<uint32_t>(vs_input_info.buffers_num);
 	vk::Buffer null_buffer = nullptr;
-	for (int i = 0; i < vs_input_info.buffers_num; i++) {
-		const auto& vertex = vs_input_info.buffers[i];
-		const auto  size   = sizes[i];
-		if (size == 0) {
-			if (null_buffer == nullptr) {
-				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::VertexSlots};
+		for (int i = 0; i < vs_input_info.buffers_num; i++) {
+			const auto& vertex = vs_input_info.buffers[i];
+			const auto  size   = sizes[i];
+			if (size == 0) {
+				if (null_buffer == nullptr) {
+					null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
+				}
+				prepared.buffers[i] = null_buffer;
+				prepared.offsets[i] = 0;
+				continue;
 			}
-			prepared.buffers[i] = null_buffer;
-			prepared.offsets[i] = 0;
-			continue;
-		}
 
-		const auto range = std::find_if(merged_ranges.begin(), merged_ranges.begin() + merged_count,
-		                                [&](const VertexBufferRange& value) {
-			                                return vertex.addr >= value.base_address &&
-			                                       vertex.addr < value.acquired_end;
-		                                });
-		if (range == merged_ranges.begin() + merged_count) {
-			EXIT("vertex buffer address is outside the acquired range: addr=0x%016" PRIx64 "\n",
-			     vertex.addr);
-		}
+			const auto range = std::find_if(merged_ranges.begin(), merged_ranges.begin() + merged_count,
+			                                [&](const VertexBufferRange& value) {
+				                                if constexpr (Profile) ++Detail::state.vertex_index.slot_comparisons;
+				                                return vertex.addr >= value.base_address &&
+				                                       vertex.addr < value.acquired_end;
+			                                });
+			if (range == merged_ranges.begin() + merged_count) {
+				EXIT("vertex buffer address is outside the acquired range: addr=0x%016" PRIx64 "\n",
+				     vertex.addr);
+			}
 
-		prepared.buffers[i] = range->binding.first->Handle();
-		prepared.offsets[i] = range->binding.second + vertex.addr - range->base_address;
-		prepared.sizes[i]   = std::min(size, range->acquired_end - vertex.addr);
+			prepared.buffers[i] = range->binding.first->Handle();
+			prepared.offsets[i] = range->binding.second + vertex.addr - range->base_address;
+			prepared.sizes[i]   = std::min(size, range->acquired_end - vertex.addr);
+		}
 	}
 
 	return prepared;
@@ -828,7 +860,8 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	// Keep restart off in that case; fail if we actually find the value.
 	// Scan before preparing draw resources: readback can restart the command buffer.
 	EXIT_NOT_IMPLEMENTED(source.address == 0);
-	const auto* indices = reinterpret_cast<const uint8_t*>(source.address);
+	const auto* indices = source.host_data ? static_cast<const uint8_t*>(source.host_data) :
+	    reinterpret_cast<const uint8_t*>(source.address);
 	for (uint64_t offset = 0; offset < source.size; offset += element_size) {
 		uint32_t index = 0;
 		std::memcpy(&index, indices + offset, element_size);
@@ -905,18 +938,29 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	return true;
 }
 
+template <bool Profile>
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
                                               const DrawIndexBufferSource& source) {
+	using namespace Common::RenderStageProfile;
+	[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::IndexPrepare};
+	if constexpr (Profile) {
+		++Detail::state.vertex_index.index_calls;
+		Detail::state.vertex_index.index_bytes += source.size;
+	}
 	PreparedIndexBuffer prepared;
 	if (source.size == 0) {
+		if constexpr (Profile) ++Detail::state.vertex_index.index_empty;
 		return prepared;
 	}
 	prepared.type = source.type;
+	prepared.size = source.size;
 	if (source.host_data != nullptr) {
+		if constexpr (Profile) ++Detail::state.vertex_index.index_stream_copies;
 		auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 		prepared.offset = stream.Copy(source.host_data, source.size, 16);
 		prepared.buffer = stream.Handle();
 	} else {
+		if constexpr (Profile) ++Detail::state.vertex_index.index_obtain_calls;
 		auto [buffer_ptr, offset] =
 		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
 		prepared.buffer = buffer_ptr->Handle();
@@ -937,11 +981,12 @@ static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
 	}
 }
 
-static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
+static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared, bool bounded) {
 	if (prepared.buffer == nullptr) {
 		return;
 	}
-	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
+	if (bounded) vk_buffer.bindIndexBuffer2KHR(prepared.buffer, prepared.offset, prepared.size, prepared.type);
+	else vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
 }
 
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -1057,6 +1102,280 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
+// Vulkan's countBuffer-02717 constrains the stored value, independently of the
+// command's maxDrawCount. Guest counters are arbitrary uint32_t values: clamp the
+// private snapshot in GPU order, without reading it on the CPU or modifying guest data.
+struct IndirectCountClamp {
+	vk::Device device;
+	vk::DescriptorSetLayout descriptors;
+	vk::PipelineLayout layout;
+	vk::Pipeline pipeline;
+
+	explicit IndirectCountClamp(vk::Device device): device(device) {
+		using namespace spv;
+		ShaderRecompiler::Spirv::Builder b;
+		b.RequireCapability(CapabilityShader);
+		b.AddMemoryModel(AddressingModelLogical, MemoryModelGLSL450);
+		const auto u32 = b.Type(OpTypeInt, 32u, 0u);
+		const auto boolean = b.Type(OpTypeBool);
+		const auto void_type = b.Type(OpTypeVoid);
+		const auto function_type = b.Type(OpTypeFunction, void_type);
+		const auto block = b.DecoratedType(OpTypeStruct,
+		    {{OpDecorate, {DecorationBlock}}, {OpMemberDecorate, {0u, DecorationOffset, 0u}}}, u32);
+		const auto storage_ptr = b.Type(OpTypePointer, StorageClassStorageBuffer, u32);
+		const auto push_ptr = b.Type(OpTypePointer, StorageClassPushConstant, u32);
+		const auto storage = b.DefineGlobalVariable(b.Type(OpTypePointer, StorageClassStorageBuffer, block), StorageClassStorageBuffer);
+		const auto push = b.DefineGlobalVariable(b.Type(OpTypePointer, StorageClassPushConstant, block), StorageClassPushConstant);
+		b.AddAnnotation(OpDecorate, storage, DecorationDescriptorSet, 0u);
+		b.AddAnnotation(OpDecorate, storage, DecorationBinding, 0u);
+		const auto zero = b.Constant(OpConstant, u32, 0u);
+		const auto entry = b.AllocateId();
+		b.AddEntryPoint(ExecutionModelGLCompute, entry, "main", {});
+		b.AddExecutionMode(entry, ExecutionModeLocalSize, 1u, 1u, 1u);
+		b.AddFunction(OpFunction, void_type, entry, FunctionControlMaskNone, function_type);
+		b.AddFunction(OpLabel, b.AllocateId());
+		const auto count_address = b.AllocateId(), max_address = b.AllocateId();
+		const auto count = b.AllocateId(), maximum = b.AllocateId();
+		const auto below = b.AllocateId(), clamped = b.AllocateId();
+		b.AddFunction(OpAccessChain, storage_ptr, count_address, storage, zero);
+		b.AddFunction(OpAccessChain, push_ptr, max_address, push, zero);
+		b.AddFunction(OpLoad, u32, count, count_address);
+		b.AddFunction(OpLoad, u32, maximum, max_address);
+		b.AddFunction(OpULessThan, boolean, below, count, maximum);
+		b.AddFunction(OpSelect, u32, clamped, below, count, maximum);
+		b.AddFunction(OpStore, count_address, clamped);
+		b.AddFunction(OpReturn);
+		b.AddFunction(OpFunctionEnd);
+
+		const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute};
+		vk::DescriptorSetLayoutCreateInfo descriptor_info {};
+		descriptor_info.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		descriptor_info.bindingCount = 1;
+		descriptor_info.pBindings = &binding;
+		RequireVulkanSuccess(device.createDescriptorSetLayout(&descriptor_info, nullptr, &descriptors), "create indirect count descriptor layout");
+		const vk::PushConstantRange push_range {vk::ShaderStageFlagBits::eCompute, 0, sizeof(uint32_t)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount = 1;
+		layout_info.pSetLayouts = &descriptors;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges = &push_range;
+		RequireVulkanSuccess(device.createPipelineLayout(&layout_info, nullptr, &layout), "create indirect count pipeline layout");
+		const auto module = CompileSPV(b.Build(), device);
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.layout = layout;
+		pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+		pipeline_info.stage.module = module;
+		pipeline_info.stage.pName = "main";
+		const auto result = device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline);
+		device.destroyShaderModule(module);
+		RequireVulkanSuccess(result, "create indirect count clamp pipeline");
+	}
+	~IndirectCountClamp() {
+		device.destroyPipeline(pipeline);
+		device.destroyPipelineLayout(layout);
+		device.destroyDescriptorSetLayout(descriptors);
+	}
+	void Run(CommandBuffer& command, Buffer& snapshot, uint32_t maximum) {
+		command.EndRendering();
+		const auto native = command.Handle();
+		const vk::DescriptorBufferInfo info {snapshot.Handle(), 0, sizeof(uint32_t)};
+		vk::WriteDescriptorSet write {};
+		write.dstBinding = 0;
+		write.descriptorCount = 1;
+		write.descriptorType = vk::DescriptorType::eStorageBuffer;
+		write.pBufferInfo = &info;
+		native.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+		native.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, 1, &write);
+		native.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(maximum), &maximum);
+		native.dispatch(1, 1, 1);
+		vk::BufferMemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead | vk::AccessFlagBits::eHostRead;
+		barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer = snapshot.Handle();
+		barrier.size = sizeof(uint32_t);
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+		    vk::PipelineStageFlagBits::eDrawIndirect | vk::PipelineStageFlagBits::eHost,
+		    {}, 0, nullptr, 1, &barrier, 0, nullptr);
+	}
+};
+
+IndirectCountSnapshot SnapshotIndirectCount(RenderContext& context, uint64_t address, uint32_t max_count) {
+	Common::LockGuard lock(context.GetMutex());
+	EXIT_IF(max_count > context.GetGraphics().physical_device_properties.limits.maxDrawIndirectCount);
+	auto& scheduler = context.GetCommandScheduler();
+	const auto source = context.GetBufferCache().ObtainBuffer(address, sizeof(uint32_t), false);
+	auto snapshot = std::make_shared<Buffer>(context.GetGraphics(), scheduler, MemoryUsage::Download,
+	    0, vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eIndirectBuffer |
+	       vk::BufferUsageFlagBits::eStorageBuffer, sizeof(uint32_t));
+	snapshot->CopyFrom(scheduler.Current(), *source.first, source.second, 0, sizeof(uint32_t),
+	    vk::AccessFlagBits::eMemoryWrite, {}, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+	    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+	auto& clamp = context.GetRenderExecutor().m_indirect_count_clamp;
+	if (!clamp) clamp = std::make_shared<IndirectCountClamp>(context.GetGraphics().device);
+	clamp->Run(scheduler.Current(), *snapshot, max_count);
+	const auto tick = scheduler.CurrentTick();
+	// NUM_INSTANCES may be overwritten before completion. Keep GPU ownership anyway.
+	scheduler.DeferOperation([snapshot] {});
+	return {std::move(snapshot), tick};
+}
+
+// Private conversion snapshot: tasks[3], draw parameters[7], status, source[5].
+// No guest bytes are written. A completion check reports invalid host limits
+// instead of submitting an invalid Vulkan command or silently truncating it.
+struct IndirectMeshConvert {
+	vk::Device device;
+	vk::DescriptorSetLayout descriptors;
+	vk::PipelineLayout layout;
+	vk::Pipeline pipeline;
+	explicit IndirectMeshConvert(vk::Device device): device(device) {
+		using namespace spv;
+		ShaderRecompiler::Spirv::Builder b;
+		b.RequireCapability(CapabilityShader);
+		b.RequireCapability(CapabilityInt64);
+		b.AddMemoryModel(AddressingModelLogical, MemoryModelGLSL450);
+		const auto u32 = b.Type(OpTypeInt, 32u, 0u), u64 = b.Type(OpTypeInt, 64u, 0u);
+		const auto boolean = b.Type(OpTypeBool), void_type = b.Type(OpTypeVoid);
+		const auto constant = [&](uint32_t x) { return b.Constant(OpConstant, u32, x); };
+		const auto array = b.DecoratedType(OpTypeArray, {{OpDecorate, {DecorationArrayStride, 4u}}},
+		                                  u32, constant(16));
+		const auto block = b.DecoratedType(OpTypeStruct,
+		    {{OpDecorate, {DecorationBlock}}, {OpMemberDecorate, {0u, DecorationOffset, 0u}}}, array);
+		const auto storage_ptr = b.Type(OpTypePointer, StorageClassStorageBuffer, u32);
+		const auto push_ptr = b.Type(OpTypePointer, StorageClassPushConstant, u32);
+		const auto storage = b.DefineGlobalVariable(b.Type(OpTypePointer, StorageClassStorageBuffer, block), StorageClassStorageBuffer);
+		const auto push = b.DefineGlobalVariable(b.Type(OpTypePointer, StorageClassPushConstant, block), StorageClassPushConstant);
+		b.AddAnnotation(OpDecorate, storage, DecorationDescriptorSet, 0u);
+		b.AddAnnotation(OpDecorate, storage, DecorationBinding, 0u);
+		const auto entry = b.AllocateId();
+		b.AddEntryPoint(ExecutionModelGLCompute, entry, "main", {});
+		b.AddExecutionMode(entry, ExecutionModeLocalSize, 1u, 1u, 1u);
+		b.AddFunction(OpFunction, void_type, entry, FunctionControlMaskNone, b.Type(OpTypeFunction, void_type));
+		b.AddFunction(OpLabel, b.AllocateId());
+		const auto op = [&](Op opcode, uint32_t type, auto... operands) {
+			const auto id = b.AllocateId(); b.AddFunction(opcode, type, id, operands...); return id;
+		};
+		const auto ptr = [&](bool is_push, uint32_t i) {
+			return op(OpAccessChain, is_push ? push_ptr : storage_ptr, is_push ? push : storage, constant(0), constant(i));
+		};
+		const auto param = [&](uint32_t i) { return op(OpLoad, u32, ptr(true, i)); };
+		const auto read = [&](uint32_t i) { return op(OpLoad, u32, ptr(false, 11 + i)); };
+		const auto store = [&](uint32_t i, uint32_t value) { b.AddFunction(OpStore, ptr(false, i), value); };
+		const auto select = [&](uint32_t test, uint32_t yes, uint32_t no) { return op(OpSelect, u32, test, yes, no); };
+		const auto count = read(0), maximum = param(0);
+		const auto instances = read(1), first = read(2);
+		const auto size = param(1), step = param(2), per_group = param(3);
+		const auto enough = op(OpUGreaterThanEqual, boolean, count, size);
+		const auto primitive_minus_one = op(OpUDiv, u32, op(OpISub, u32, count, size), step);
+		const auto groups = select(enough, op(OpIAdd, u32, op(OpUDiv, u32, primitive_minus_one, per_group), constant(1)), constant(0));
+		const auto nonzero = op(OpLogicalAnd, boolean, enough, op(OpINotEqual, boolean, instances, constant(0)));
+		const auto wide_groups = op(OpUConvert, u64, groups), wide_instances = op(OpUConvert, u64, instances);
+		auto valid = op(OpLogicalAnd, boolean, op(OpULessThanEqual, boolean, groups, param(8)),
+		                                    op(OpULessThanEqual, boolean, instances, param(9)));
+		valid = op(OpLogicalAnd, boolean, valid,
+		           op(OpULessThanEqual, boolean, op(OpIMul, u64, wide_groups, wide_instances), op(OpUConvert, u64, param(10))));
+		const auto index_bytes = param(4);
+		// INDEX_BUFFER_SIZE bounds memory, not the number of vertices dispatched.
+		const auto end = op(OpIMul, u64, op(OpUConvert, u64, maximum), op(OpUConvert, u64, index_bytes));
+		const auto span = op(OpBitwiseOr, u64, op(OpUConvert, u64, param(11)),
+		    op(OpShiftLeftLogical, u64, op(OpUConvert, u64, param(12)), constant(32)));
+		const auto bounds = op(OpULessThanEqual, boolean, end, span);
+		const auto status = select(nonzero, select(valid, select(bounds, constant(0), constant(2)), constant(1)), constant(0));
+		const auto active = op(OpLogicalAnd, boolean, nonzero, op(OpIEqual, boolean, status, constant(0)));
+		store(0, select(active, groups, constant(0)));
+		store(1, select(active, instances, constant(1)));
+		store(2, constant(1));
+		store(3, count);
+		const auto offsets = op(OpINotEqual, boolean, param(7), constant(0));
+		store(4, select(offsets, read(3), constant(0)));
+		store(5, select(offsets, read(4), constant(0)));
+		store(6, index_bytes);
+		const auto base = op(OpBitwiseOr, u64, op(OpUConvert, u64, param(5)),
+		    op(OpShiftLeftLogical, u64, op(OpUConvert, u64, param(6)), constant(32)));
+		const auto in_bounds = op(OpULessThan, boolean, first, maximum);
+		const auto safe_first = select(in_bounds, first, maximum);
+		const auto address = op(OpIAdd, u64, base, op(OpIMul, u64, op(OpUConvert, u64, safe_first), op(OpUConvert, u64, index_bytes)));
+		store(7, op(OpUConvert, u32, address));
+		store(8, op(OpUConvert, u32, op(OpShiftRightLogical, u64, address, constant(32))));
+		store(9, select(in_bounds, op(OpISub, u32, maximum, first), constant(0)));
+		store(10, status);
+		b.AddFunction(OpReturn); b.AddFunction(OpFunctionEnd);
+
+		const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute};
+		vk::DescriptorSetLayoutCreateInfo desc {};
+		desc.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		desc.bindingCount = 1; desc.pBindings = &binding;
+		RequireVulkanSuccess(device.createDescriptorSetLayout(&desc, nullptr, &descriptors), "create mesh conversion descriptors");
+		const vk::PushConstantRange range {vk::ShaderStageFlagBits::eCompute, 0, 16 * sizeof(uint32_t)};
+		vk::PipelineLayoutCreateInfo li {};
+		li.setLayoutCount = 1; li.pSetLayouts = &descriptors;
+		li.pushConstantRangeCount = 1; li.pPushConstantRanges = &range;
+		RequireVulkanSuccess(device.createPipelineLayout(&li, nullptr, &layout), "create mesh conversion layout");
+		const auto module = CompileSPV(b.Build(), device);
+		vk::ComputePipelineCreateInfo pi {};
+		pi.layout = layout; pi.stage.stage = vk::ShaderStageFlagBits::eCompute;
+		pi.stage.module = module; pi.stage.pName = "main";
+		const auto result = device.createComputePipelines(nullptr, 1, &pi, nullptr, &pipeline);
+		device.destroyShaderModule(module);
+		RequireVulkanSuccess(result, "create mesh conversion pipeline");
+	}
+	~IndirectMeshConvert() {
+		device.destroyPipeline(pipeline); device.destroyPipelineLayout(layout);
+		device.destroyDescriptorSetLayout(descriptors);
+	}
+	void Run(CommandBuffer& command, Buffer& snapshot, const std::array<uint32_t, 16>& params) {
+		command.EndRendering();
+		const auto native = command.Handle();
+		const vk::DescriptorBufferInfo info {snapshot.Handle(), 0, 64};
+		vk::WriteDescriptorSet write {};
+		write.dstBinding = 0; write.descriptorCount = 1;
+		write.descriptorType = vk::DescriptorType::eStorageBuffer; write.pBufferInfo = &info;
+		native.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+		native.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, 1, &write);
+		native.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), params.data());
+		native.dispatch(1, 1, 1);
+		vk::BufferMemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead | vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eHostRead;
+		barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer = snapshot.Handle(); barrier.size = 44;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+		    vk::PipelineStageFlagBits::eDrawIndirect | vk::PipelineStageFlagBits::eMeshShaderEXT | vk::PipelineStageFlagBits::eHost,
+		    {}, 0, nullptr, 1, &barrier, 0, nullptr);
+	}
+};
+
+std::shared_ptr<Buffer> ConvertIndirectMeshArgs(RenderContext& context, uint64_t address,
+    const ShaderMeshInputInfo& mesh, uint32_t max_indices, uint64_t index_address,
+    uint32_t index_bytes, uint64_t index_span, bool apply_offsets) {
+	Common::LockGuard lock(context.GetMutex());
+	EXIT_IF(mesh.fast_launch || !mesh.primitives_per_group || !index_bytes);
+	auto& scheduler = context.GetCommandScheduler();
+	const auto source = context.GetBufferCache().ObtainBuffer(address, 20, false);
+	auto snapshot = std::make_shared<Buffer>(context.GetGraphics(), scheduler, MemoryUsage::Download, 0,
+	    vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer |
+	    vk::BufferUsageFlagBits::eIndirectBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress, 64);
+	snapshot->CopyFrom(scheduler.Current(), *source.first, source.second, 44, 20,
+	    vk::AccessFlagBits::eMemoryWrite, {}, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+	    vk::AccessFlagBits::eShaderRead);
+	auto& convert = context.GetRenderExecutor().m_indirect_mesh_convert;
+	if (!convert) convert = std::make_shared<IndirectMeshConvert>(context.GetGraphics().device);
+	const auto& limits = context.GetGraphics().mesh_shader_properties;
+	convert->Run(scheduler.Current(), *snapshot, {max_indices, mesh.InputPrimitiveSize(), mesh.InputPrimitiveStep(),
+	    mesh.primitives_per_group, index_bytes, static_cast<uint32_t>(index_address),
+	    static_cast<uint32_t>(index_address >> 32), static_cast<uint32_t>(apply_offsets),
+	    limits.maxMeshWorkGroupCount[0], limits.maxMeshWorkGroupCount[1], limits.maxMeshWorkGroupTotalCount,
+	    static_cast<uint32_t>(index_span), static_cast<uint32_t>(index_span >> 32)});
+	scheduler.DeferOperation([snapshot] {
+		snapshot->Invalidate(0, 64);
+		uint32_t status;
+		std::memcpy(&status, snapshot->Mapped().data() + 40, 4);
+		if (status) EXIT("indirect mesh arguments rejected on GPU: %s\n",
+		    status == 1 ? "host workgroup limits" : "indices outside mapped range");
+	});
+	return snapshot;
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          const DrawEmitInfo&          emit,
@@ -1068,8 +1387,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto vertex_stages = state.VertexStages();
 	const bool mesh_active = state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
+	const bool indirect_mesh = mesh_active && emit.indirect.address != 0;
 	uint32_t   mesh_groups = 0;
-	if (mesh_active) {
+	if (mesh_active && !indirect_mesh) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable));
 		static std::atomic_bool restart_warned = false;
@@ -1097,12 +1417,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
-	if (mesh_active && draw.IsIndexed()) {
+	if (mesh_active && draw.IsIndexed() && index_source.valid_count) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
 		// synchronizes registered BDA ranges before any draw commands are committed.
-		(void)m_context.GetBufferCache().FindBuffer(
-		    index_source.address, static_cast<uint64_t>(draw.index_count) *
-		                              index_source.guest_element_size);
+		auto& cache = m_context.GetBufferCache();
+		if (!indirect_mesh || !cache.TouchRegisteredRange(index_source.address, state.indirect_index_span)) {
+			(void)cache.FindBuffer(index_source.address, indirect_mesh ? state.indirect_index_span :
+			    static_cast<uint64_t>(std::min(draw.index_count, index_source.valid_count)) * index_source.guest_element_size);
+		}
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
@@ -1124,11 +1446,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		Common::RenderStageProfile::Scope vertex_profile {Common::RenderStageProfile::Stage::DrawVertexIndex};
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
-		index_binding   = PrepareIndexBuffer(buffer, index_source);
+		if (Common::RenderStageProfile::Detail::DetailedEnabled()) {
+			vertex_bindings = AcquireVertexBuffers<true>(buffer, state.vertex_info[0]);
+			index_binding   = PrepareIndexBuffer<true>(buffer, index_source);
+		} else {
+			vertex_bindings = AcquireVertexBuffers<false>(buffer, state.vertex_info[0]);
+			index_binding   = PrepareIndexBuffer<false>(buffer, index_source);
+		}
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
-	if (emit.indirect.address != 0) {
+	if (emit.indirect.address != 0 && !indirect_mesh) {
 		const auto size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
 		                  (draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
 		                                    : sizeof(vk::DrawIndirectCommand));
@@ -1150,6 +1477,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                         feedback_aspects, stages);
 
 	targets_profile.reset();
+	std::shared_ptr<Buffer> mesh_snapshot;
+	if (indirect_mesh) {
+		mesh_snapshot = ConvertIndirectMeshArgs(m_context, emit.indirect.address, state.vertex_info[0].mesh,
+		    draw.index_count, index_source.address, index_source.guest_element_size, state.indirect_index_span,
+		    state.vertex_info[0].fetch_embedded);
+	}
 	Common::RenderStageProfile::Scope emit_profile {Common::RenderStageProfile::Stage::DrawEmit};
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1164,7 +1497,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (!mesh_active) {
-		CommitIndexBuffer(vk_buffer, index_binding);
+		CommitIndexBuffer(vk_buffer, index_binding, m_context.GetGraphics().bounded_index_buffer_enabled);
 	}
 	using ShaderRecompiler::IR::PushData;
 	const auto draw_stages =
@@ -1174,13 +1507,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    PushData::GraphicsDrawDwords(mesh_active, state.ps_input_info.object_primitive_id);
 	if (draw_dwords != 0) {
 		std::array<uint32_t, PushData::MeshDrawDwordCount> draw_data {};
-		if (mesh_active) {
+		if (indirect_mesh) {
+			const auto address = mesh_snapshot->BufferDeviceAddress() + 12;
+			draw_data[0] = static_cast<uint32_t>(address);
+			draw_data[1] = static_cast<uint32_t>(address >> 32);
+		} else if (mesh_active) {
 			draw_data = {draw.index_count,
 			             static_cast<uint32_t>(emit.vertex_offset),
 			             emit.first_instance,
 			             index_source.guest_element_size,
 			             static_cast<uint32_t>(index_source.address),
-			             static_cast<uint32_t>(index_source.address >> 32u)};
+			             static_cast<uint32_t>(index_source.address >> 32u), index_source.valid_count};
 		} else {
 			draw_data[0] = buffer.GetUserConfig().GetObjectId();
 		}
@@ -1229,10 +1566,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
-	if (mesh_active) {
+	if (indirect_mesh) {
+		vk_buffer.drawMeshTasksIndirectEXT(mesh_snapshot->Handle(), 0, 1, sizeof(vk::DrawMeshTasksIndirectCommandEXT));
+		Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::IndirectMeshDraws);
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (args_buffer.first == nullptr) {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+	} else if (emit.indirect.count_buffer) {
+		if (draw.IsIndexed())
+			vk_buffer.drawIndexedIndirectCount(args_buffer.first->Handle(), args_buffer.second,
+			    emit.indirect.count_buffer, 0, emit.indirect.count, emit.indirect.stride);
+		else
+			vk_buffer.drawIndirectCount(args_buffer.first->Handle(), args_buffer.second,
+			    emit.indirect.count_buffer, 0, emit.indirect.count, emit.indirect.stride);
+		Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::IndirectCountGpuDraws);
 	} else if (draw.IsIndexed()) {
 		vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
 		                              emit.indirect.count, emit.indirect.stride);
@@ -1267,8 +1615,14 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
                                                    uint32_t                     first_instance,
                                                    const DrawIndirectArgs&      indirect) {
 	if (indirect.address != 0) {
-		if (vs.stage.module->info.stage == ShaderType::Mesh ||
-		    ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy) {
+		if (vs.stage.module->info.stage == ShaderType::Mesh) {
+			if (vs.mesh.indirect_draw) return DrawEmitInfo {.indirect = indirect};
+			Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::IndirectMeshFallbacks);
+			Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::IndirectRejectMesh);
+			return std::nullopt;
+		}
+		if (ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy) {
+			Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::IndirectRejectQuad);
 			return std::nullopt;
 		}
 		return DrawEmitInfo {.indirect = indirect};
@@ -1281,8 +1635,29 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 	return DrawEmitInfo {vertex_offset + first_vertex, instance_offset};
 }
 
+// These paths perform work outside the Vulkan draw. They require a CPU count so
+// a zero-count packet cannot execute a metadata operation, clear or copy.
+static bool CanUseIndirectCount(const CommandBuffer& buffer, const DrawIndirectArgs& args) {
+	if (!args.count_buffer && !args.address) return true;
+	const auto& hw = buffer.GetRegisters();
+	const auto& control = hw.GetRenderControl();
+	using Extra = Common::SubmitProfile::Extra;
+	const auto reject = [](Extra reason) { Common::SubmitProfile::AddExtra(reason); return false; };
+	if (args.count_buffer && !buffer.GetGraphics().draw_indirect_count_enabled) return reject(Extra::IndirectCountDevice);
+	if (!args.count) return reject(Extra::IndirectZeroMax);
+	if (args.count > buffer.GetGraphics().physical_device_properties.limits.maxDrawIndirectCount)
+		return reject(Extra::IndirectCountLimit);
+	if (hw.GetColorControl().mode != static_cast<uint8_t>(CbColorMode::Normal))
+		return reject(Extra::IndirectRejectColorMode);
+	if (control.copy_depth_to_color) return reject(Extra::IndirectRejectDepthCopy);
+	if (control.depth_clear_enable) return reject(Extra::IndirectRejectDepthClear);
+	if (control.stencil_clear_enable) return reject(Extra::IndirectRejectStencilClear);
+	return true;
+}
+
 bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
+	if (!CanUseIndirectCount(buffer, args.indirect)) return false;
 	Common::RenderStageProfile::Scope stage_profile {Common::RenderStageProfile::Stage::Draw};
 	KYTY_PROFILER_FUNCTION();
 
@@ -1303,7 +1678,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	mutex_profile.emplace(Common::RenderStageProfile::Stage::DrawMutex);
 	Common::LockGuard lock(m_context.GetMutex());
 	mutex_profile.reset();
-	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
+	if ((args.index_count == 0 || args.instance_count == 0) && args.indirect.address == 0) {
 		return true;
 	}
 
@@ -1345,6 +1720,25 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	hw_check(buffer);
 
 	DrawRenderState state {};
+	constexpr uint64_t max_new_index_span = 64ull * 1024 * 1024;
+	uint64_t mapped_index_span = 0, cached_index_span = 0;
+	const bool mesh_indirect_candidate = args.indirect.address &&
+	    m_context.GetGraphics().mesh_shader_enabled && m_context.GetGraphics().bounded_index_buffer_enabled;
+	if (mesh_indirect_candidate) {
+		// Single indexed record; no SGPR patches (the command processor already
+		// enforces that for GPU indirect draws). AMD SI Guide 2.5.10 defines
+		// INDEX_BUFFER_SIZE from INDEX_BASE; firstIndex cannot enlarge it.
+		const auto address = reinterpret_cast<uint64_t>(args.index_addr);
+		mapped_index_span = m_context.ContiguousMappedSize(address, UINT64_MAX);
+		const auto element = args.index_type_and_size == 0 ? 2u : args.index_type_and_size == 1 ? 4u : 1u;
+		const auto requested = uint64_t(args.index_count) * element;
+		cached_index_span = m_context.GetBufferCache().ContiguousRegisteredSize(address, requested);
+		state.indirect_mesh = args.indirect.count == 1 && !args.indirect.count_buffer &&
+		    requested && mapped_index_span >= requested && (requested <= max_new_index_span || cached_index_span == requested) &&
+		    args.index_type_and_size != static_cast<uint32_t>(Prospero::IndexType::kIndex8) &&
+		    m_context.IsMapped(args.indirect.address, sizeof(vk::DrawIndexedIndirectCommand));
+		state.indirect_index_span = state.indirect_mesh ? requested : 0;
+	}
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		return true;
 	}
@@ -1366,12 +1760,22 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
+	index_source.valid_count = std::min(args.index_count, args.valid_index_count);
+	// Cold CPU fallback: synthesize zero indices without reading beyond the
+	// hardware bound. Do this before resource preparation, since reads can wait.
+	std::vector<uint8_t> bounded_indices;
+	if (!args.indirect.address && index_source.valid_count < args.index_count) {
+		bounded_indices.resize(index_source.size, 0);
+		if (index_source.valid_count) std::memcpy(bounded_indices.data(), args.index_addr,
+		    uint64_t(index_source.valid_count) * index_source.guest_element_size);
+		index_source.host_data = bounded_indices.data();
+	}
 	state.primitive_restart_enable = ResolvePrimitiveRestart(buffer, index_source);
 
 	std::vector<uint16_t> expanded_indices;
 	if (index_source.guest_element_size == 1) {
 		EXIT_NOT_IMPLEMENTED(args.index_addr == nullptr);
-		const auto* src = static_cast<const uint8_t*>(args.index_addr);
+		const auto* src = static_cast<const uint8_t*>(index_source.host_data ? index_source.host_data : args.index_addr);
 		expanded_indices.resize(args.index_count);
 		for (uint32_t i = 0; i < args.index_count; i++) {
 			expanded_indices[i] =
@@ -1390,8 +1794,50 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
+	if (mesh_indirect_candidate && state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh) {
+		// Shader preparation may have changed owners. Revalidate before allowing
+		// the large resident-only path; never create/merge a giant allocation here.
+		const auto requested = uint64_t(args.index_count) * index_source.guest_element_size;
+		cached_index_span = m_context.GetBufferCache().ContiguousRegisteredSize(index_source.address, requested);
+		const bool range_ok = requested && mapped_index_span >= requested &&
+		    (requested <= max_new_index_span || cached_index_span == requested);
+		if (!range_ok) Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::IndirectMeshRangeFallbacks);
+		if (Common::ReadbackProfile::Enabled()) {
+			// Bound the diagnostic and suppress repeated identical layouts. This is
+			// the actual mesh packet, not the two ordinary indirect draws beside it.
+			using Key = std::array<uint64_t, 6>;
+			static thread_local std::array<Key, 32> seen {};
+			static thread_local size_t seen_count = 0;
+			const Key key {index_source.address, mapped_index_span, cached_index_span,
+			    args.index_count, index_source.guest_element_size, uint64_t(range_ok)};
+			if (seen_count < seen.size() && std::find(seen.begin(), seen.begin() + seen_count, key) == seen.begin() + seen_count) {
+				seen[seen_count++] = key;
+				char message[768];
+				std::snprintf(message, sizeof(message),
+				    "[INDIRECT_MESH_RANGE] base=0x%016" PRIx64 " mapped_bytes=0x%" PRIx64
+				    " cached_bytes=0x%" PRIx64 " index_bytes=%u index_buffer_size=0x%08x"
+				    " count_limit_bytes=0x%" PRIx64 " requested_bytes=0x%" PRIx64
+				    " new_allocation_limit=0x%" PRIx64 " range_ok=%u records=0x%016" PRIx64 "\n",
+				    index_source.address, mapped_index_span, cached_index_span, index_source.guest_element_size,
+				    args.index_count, uint64_t(args.index_count) * index_source.guest_element_size,
+				    requested, max_new_index_span, unsigned(range_ok), args.indirect.address);
+				Log::WriteToConsoleAndLog(message);
+			}
+		}
+		if (!range_ok && state.indirect_mesh) {
+			Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::IndirectMeshFallbacks);
+			Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::IndirectRejectMesh);
+			ResetBindings();
+			return false;
+		}
+	}
 	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
 	                                  args.base_vertex, args.first_instance, args.indirect);
+	if (emit && args.indirect.address && state.vertex_info[0].stage.module->info.stage != ShaderType::Mesh &&
+	    !m_context.GetGraphics().bounded_index_buffer_enabled) {
+		ResetBindings();
+		return false; // CPU zero padding on devices without exact robust index bounds.
+	}
 	if (emit) {
 		ExecutePreparedDraw(submit_id, buffer, draw, state, *emit, index_source);
 	}
@@ -1401,6 +1847,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
+	if (!CanUseIndirectCount(buffer, args.indirect)) return false;
 	Common::RenderStageProfile::Scope stage_profile {Common::RenderStageProfile::Stage::Draw};
 	KYTY_PROFILER_FUNCTION();
 

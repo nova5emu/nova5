@@ -65,13 +65,13 @@ static_assert(OriginNames.size() == static_cast<size_t>(Origin::Count));
 enum class WaitSite : uint8_t {
 	Other, StreamWrap, BufferReadback, BufferGc, FaultDownload, Finish, PriorityCallbacks,
 	Present, Shutdown, ReadbackIndirectArgs, ReadbackColorMetadata, ReadbackCpuReadFault,
-	ReadbackCpuWriteInvalidate, ReadbackPriorityOps, Count
+	ReadbackCpuWriteInvalidate, ReadbackPriorityOps, IndirectCountState, Count
 };
 inline constexpr std::array WaitSiteNames {
 	"other", "stream_wrap", "readback_other", "buffer_gc", "fault_download", "finish",
 	"priority_callbacks", "present", "shutdown", "readback_indirect_args",
 	"readback_color_metadata", "readback_cpu_read_fault", "readback_cpu_write_invalidate",
-	"readback_priority_ops"
+	"readback_priority_ops", "indirect_count_state"
 };
 static_assert(WaitSiteNames.size() == static_cast<size_t>(WaitSite::Count));
 
@@ -95,8 +95,18 @@ enum class Extra : uint8_t {
 	BindingImageComparisons, BindingBufferComparisons, PushDescriptorCalls, DescriptorSetCalls,
 	FalseSharedServed, AttribCleanReads, AttribCleanFallbacks,
 	WalkerCleanReads, WalkerCleanFallbacks, WalkerCleanFaults,
+	WalkerControlPromotions, WalkerControlWalks, WalkerControlFallbacks, IndirectCountGpuDraws, IndirectCountGpuFallbacks,
+	IndirectPackets, IndirectIndexed, IndirectAuto, IndirectMultiple, IndirectNoCount, IndirectZeroMax,
+	IndirectCountAttempts, IndirectCountGateClosed, IndirectPatchVertex, IndirectPatchInstance, IndirectPatchIndex,
+	IndirectMissingIndexSize, IndirectBadStride, IndirectCountUnaligned, IndirectCountDevice,
+	IndirectCountLimit, IndirectCountHistoryFull, IndirectCountUnmapped, IndirectArgsUnmapped,
+	IndirectRendererRejected, IndirectRejectColorMode, IndirectRejectDepthCopy, IndirectRejectDepthClear,
+	IndirectRejectStencilClear, IndirectRejectMesh, IndirectRejectQuad, IndirectCpuRecords, IndirectGpuRecords,
 	ImageDescObservations, ImageDescSameKey, ImageDescChangedKey, ImageDescFirstKey,
-	ImageDescHistoryCapacityResets, ImageDescReuseHits, ImageDescReuseMisses, Count
+	ImageDescHistoryCapacityResets, ImageDescReuseHits, ImageDescReuseMisses,
+	ImageFindHintHits, ImageFindHintMisses, ImageFindHintTooLarge,
+	IndirectMeshDraws, IndirectMeshFallbacks, IndirectMeshRangeFallbacks,
+	OverlapIntervalCommits, OverlapIntervalRanges, Count
 };
 inline constexpr std::array ExtraNames {
 	"flips", "occlusion_dumps", "predication_zpass", "predication_bool", "predication_off",
@@ -112,8 +122,18 @@ inline constexpr std::array ExtraNames {
 	"binding_image_comparisons", "binding_buffer_comparisons", "push_descriptor_calls", "descriptor_set_calls",
 	"false_shared_served", "attrib_clean_reads", "attrib_clean_fallbacks",
 	"walker_clean_reads", "walker_clean_fallbacks", "walker_clean_faults",
+	"walker_control_promotions", "walker_control_walks", "walker_control_fallbacks", "indirect_count_gpu_draws", "indirect_count_gpu_fallbacks",
+	"indirect_packets", "indirect_indexed", "indirect_auto", "indirect_multiple", "indirect_no_count", "indirect_zero_max",
+	"indirect_count_attempts", "indirect_count_gate_closed", "indirect_patch_vertex", "indirect_patch_instance", "indirect_patch_index",
+	"indirect_missing_index_size", "indirect_bad_stride", "indirect_count_unaligned", "indirect_count_device",
+	"indirect_count_limit", "indirect_count_history_full", "indirect_count_unmapped", "indirect_args_unmapped",
+	"indirect_renderer_rejected", "indirect_reject_color_mode", "indirect_reject_depth_copy", "indirect_reject_depth_clear",
+	"indirect_reject_stencil_clear", "indirect_reject_mesh", "indirect_reject_quad", "indirect_cpu_records", "indirect_gpu_records",
 	"image_desc_observations", "image_desc_same_key", "image_desc_changed_key", "image_desc_first_key",
-	"image_desc_history_capacity_resets", "image_desc_reuse_hits", "image_desc_reuse_misses"
+	"image_desc_history_capacity_resets", "image_desc_reuse_hits", "image_desc_reuse_misses",
+	"image_find_hint_hits", "image_find_hint_misses", "image_find_hint_too_large",
+	"indirect_mesh_gpu_draws", "indirect_mesh_gpu_fallbacks", "indirect_mesh_range_fallbacks",
+	"overlap_interval_commits", "overlap_interval_ranges"
 };
 static_assert(ExtraNames.size() == static_cast<size_t>(Extra::Count));
 
@@ -236,11 +256,22 @@ inline void TakeTag(ThreadTag& tag, uint32_t& tid, bool& multi) {
 	return Detail::Armed() && Detail::recording.load(std::memory_order_relaxed);
 }
 // Candidate under A/B (see SubmitProfileRuntime); off unless the experiment gate is open.
-enum class Experiment { None, ReleaseMem, ImageDescReuse };
-inline Experiment ParseExperiment(std::string_view name) {
-	if (name == "release-mem") return Experiment::ReleaseMem;
-	if (name == "image-desc-reuse") return Experiment::ImageDescReuse;
-	return Experiment::None;
+enum class Experiment : uint32_t { None = 0, ReleaseMem = 1, IndirectCountGpu = 2 };
+inline Experiment ParseExperiment(std::string_view names) {
+	uint32_t mask = 0;
+	while (!names.empty()) {
+		const auto comma = names.find(',');
+		auto name = names.substr(0, comma);
+		const auto first = name.find_first_not_of(" \t\r\n");
+		if (first != std::string_view::npos) {
+			name = name.substr(first, name.find_last_not_of(" \t\r\n") - first + 1);
+			if (name == "release-mem") mask |= static_cast<uint32_t>(Experiment::ReleaseMem);
+			if (name == "indirect-count-gpu") mask |= static_cast<uint32_t>(Experiment::IndirectCountGpu);
+		}
+		if (comma == std::string_view::npos) break;
+		names.remove_prefix(comma + 1);
+	}
+	return static_cast<Experiment>(mask);
 }
 inline Experiment SelectedExperiment() {
 	static const auto selected = [] {
@@ -250,17 +281,20 @@ inline Experiment SelectedExperiment() {
 	return selected;
 }
 inline const char* ExperimentName() {
-	switch (SelectedExperiment()) {
-		case Experiment::ReleaseMem: return "release-mem";
-		case Experiment::ImageDescReuse: return "image-desc-reuse";
-		default: return "none";
-	}
+	// Canonical names only: no environment text is interpolated into the JSON log.
+	static constexpr std::array names {"none", "release-mem", "indirect-count-gpu",
+	    "release-mem,indirect-count-gpu"};
+	return names[static_cast<uint32_t>(SelectedExperiment())];
+}
+[[nodiscard]] inline bool ExperimentSelected(Experiment selected) {
+	const auto mask = static_cast<uint32_t>(selected);
+	return mask != 0 && (static_cast<uint32_t>(SelectedExperiment()) & mask) == mask;
 }
 [[nodiscard]] inline bool ExperimentActive() {
 	return Detail::experiment.load(std::memory_order_relaxed);
 }
 [[nodiscard]] inline bool ExperimentActive(Experiment selected) {
-	return selected != Experiment::None && SelectedExperiment() == selected && ExperimentActive();
+	return ExperimentSelected(selected) && ExperimentActive();
 }
 inline void SetExperiment(bool active) {
 	Detail::experiment.store(active, std::memory_order_relaxed);

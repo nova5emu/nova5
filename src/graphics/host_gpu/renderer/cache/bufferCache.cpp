@@ -5,6 +5,8 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/readbackProfile.h"
+#include "common/renderStageProfile.h"
 #include "common/submitProfile.h"
 #include "graphics/guest_gpu/submitProfileRuntime.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -181,7 +183,10 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
-			    if constexpr (!async) Common::SubmitProfile::Diagnostics::ReadFaults::Download(start, end);
+			    if constexpr (!async) {
+				    Common::SubmitProfile::Diagnostics::ReadFaults::Download(start, end);
+				    Common::ReadbackProfile::RecordDownload(start, end);
+			    }
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
@@ -363,6 +368,32 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write,
 	});
 }
 
+uint64_t BufferCache::ContiguousRegisteredSize(uint64_t vaddr, uint64_t limit) const {
+	if (!GuestRange {vaddr, limit}.Valid()) return 0;
+	auto it = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) --it;
+	uint64_t end = vaddr;
+	const auto stop = vaddr + limit;
+	for (; it != m_buffers.end() && end < stop; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		if (buffer.CpuAddress() > end) break;
+		const auto buffer_end = buffer.CpuAddress() + buffer.Size();
+		if (buffer_end > end) end = std::min(stop, buffer_end);
+	}
+	return end - vaddr;
+}
+
+bool BufferCache::TouchRegisteredRange(uint64_t vaddr, uint64_t size) {
+	if (!size || ContiguousRegisteredSize(vaddr, size) != size) return false;
+	auto it = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) --it;
+	for (; it != m_buffers.end() && it->first < vaddr + size; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		if (buffer.CpuAddress() + buffer.Size() > vaddr) TouchBuffer(buffer);
+	}
+	return true;
+}
+
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
@@ -530,9 +561,11 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return source.first->Handle();
 }
 
+template <bool ProfileRebind>
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	if constexpr (ProfileRebind) ++Common::RenderStageProfile::Detail::state.buffer_rebinds.obtain_calls;
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -549,12 +582,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
 			m_stream_buffer.Commit();
+			if constexpr (ProfileRebind) Common::RenderStageProfile::Detail::state.buffer_rebinds.ObserveStream(size);
 			return {&m_stream_buffer, offset};
 		}
 	}
 
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		if constexpr (ProfileRebind) ++Common::RenderStageProfile::Detail::state.buffer_rebinds.searches;
 		id = FindBuffer(vaddr, size);
+	} else {
+		if constexpr (ProfileRebind) ++Common::RenderStageProfile::Detail::state.buffer_rebinds.hint_hits;
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
@@ -565,6 +602,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
+
+template std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer<false>(uint64_t, uint64_t, bool, bool, BufferId);
+template std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer<true>(uint64_t, uint64_t, bool, bool, BufferId);
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {

@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/renderStageProfile.h"
 #include "common/stringUtils.h"
 #include "common/submitProfile.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -76,10 +77,17 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	(*g_shader_map)[addr] = {mapped, hash};
 }
 
+template <bool Profile = false>
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 
-	std::scoped_lock lock(g_shader_map_mutex);
+	using namespace Common::RenderStageProfile;
+	std::unique_lock lock(g_shader_map_mutex, std::defer_lock);
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::VsMapLock};
+		lock.lock();
+	}
+	[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::VsMapLookup};
 
 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
 		return iter->second;
@@ -282,18 +290,23 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 	return reg;
 }
 
+template <bool Profile = false>
 static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
                                            uint32_t user_sgpr_num, const HW::ShaderRegisters& sh,
                                            const ShaderMapData&   data,
                                            ShaderVertexInputInfo& info) {
 	KYTY_PROFILER_FUNCTION();
 
-	info = {};
+	using namespace Common::RenderStageProfile;
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::VsInputReset};
+		info = {};
 
-	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
+		info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
-	EXIT_NOT_IMPLEMENTED(shader_addr == 0);
-	info.scratch_size_dwords = data.scratch_size_dwords;
+		EXIT_NOT_IMPLEMENTED(shader_addr == 0);
+		info.scratch_size_dwords = data.scratch_size_dwords;
+	}
 
 	if (data.user_data == nullptr) {
 		LOGF("ShaderGetVertexInputInfo(): no AGC user data for shader=0x%016" PRIx64
@@ -325,8 +338,14 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 			     shader_addr);
 			return false;
 		}
-		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
-		ShaderDetectBuffers(info);
+		{
+			[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::VsAttrib};
+			ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
+		}
+		{
+			[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::VsDetectBuffers};
+			ShaderDetectBuffers(info);
+		}
 	}
 	return true;
 }
@@ -459,7 +478,8 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.scratch_size_dwords, mesh.input_primitive,
 		                       mesh.primitives_per_group, mesh.vertices_per_group,
 		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
-		                       static_cast<uint32_t>(mesh.fast_launch)});
+		                       static_cast<uint32_t>(mesh.fast_launch),
+		                       static_cast<uint32_t>(mesh.indirect_draw)});
 	}
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
@@ -539,20 +559,25 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(static_cast<uint32_t>(info.tg_size_en));
 }
 
-ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
+template <bool Profile>
+static ShaderParams PrepareVertexProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& info) {
+	using namespace Common::RenderStageProfile;
 	const auto& sh     = context.GetShaderRegisters();
-	const auto [data, hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
+	const auto [data, hash] = ShaderGetMappedData<Profile>(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
 	const bool merged = (context.GetShaderStages() & 0x20u) != 0;
 	// GS_EN controls amplification, not whether an NGG shader uses a workgroup.
 	const bool native_ngg = !merged && data.type == Prospero::ShaderBinaryType::kGs &&
 	                        regs.gs_regs.rsrc2.lds_size != 0;
-	auto        params = GetShaderParams(
+	auto params = [&] {
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::VsParams};
+		return GetShaderParams(
 	    regs.es_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
 	    merged || native_ngg ? 8u : 0u);
+	}();
 	if (!merged && !native_ngg) {
-		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
+		if (!ShaderGetStaticVertexInputInfo<Profile>(regs.es_regs.data_addr, regs.gs_user_sgpr,
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
 			EXIT("failed to prepare vertex shader program\n");
 		}
@@ -577,7 +602,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	mesh.fast_launch = fast_launch != 0;
 	if (data.type == Prospero::ShaderBinaryType::kGsFront) {
 		EXIT_IF(regs.gs_regs.data_addr == 0);
-		const auto [back, back_hash] = ShaderGetMappedData(regs.gs_regs.data_addr, "ShaderGetInputInfoGS():");
+		const auto [back, back_hash] = ShaderGetMappedData<Profile>(regs.gs_regs.data_addr, "ShaderGetInputInfoGS():");
 		const auto back_params =
 		    GetShaderParams(regs.gs_regs.data_addr, back_hash, {}, back);
 		params.back_code = back_params.code;
@@ -626,6 +651,15 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	mesh.threads_num[0] = ((threads + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
 	mesh.threads_num[1] = mesh.threads_num[2] = 1u;
 	return params;
+}
+
+ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                            const HW::UserConfig& user_config, ShaderVertexInputInfo& info) {
+	// One dispatch per vertex preparation. The disabled specialization contains
+	// no sub-stage clocks, counters or sampling state, including attribute loops.
+	if (Common::RenderStageProfile::Detail::DetailedEnabled())
+		return PrepareVertexProgram<true>(regs, context, user_config, info);
+	return PrepareVertexProgram<false>(regs, context, user_config, info);
 }
 
 std::array<ShaderParams, 3>

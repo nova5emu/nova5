@@ -1454,13 +1454,26 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			entry.complete = true;
 			return result = projected;
 		};
-		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) {
+		if (ValidateRuntimeValue(program, value, RuntimeValueType::ReadOnlyControlInteger)) {
 			uniform_control = true;
 			capture_control_reads |=
 			    !ValidateRuntimeValue(program, value, RuntimeValueType::ImmutableInteger);
 			return finish(Clone(value));
 		}
 		const auto op = inst->GetOpcode();
+		if ((op == ValueOpcode::LoadBufferU32 || op == ValueOpcode::ReadConstBuffer) &&
+		    ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) {
+			// This load is still executed by the original GPU program. Only its
+			// optional CPU control projection becomes unknown; both successors
+			// stay reachable. Never change descriptor/SRT clones shared by it.
+			const auto flags = inst->Flags<MemoryFlags>();
+			std::fprintf(stderr,
+			    "[SHADER_CONTROL_DYNAMIC] hash=0x%016llx stage=%u pc=0x%x ir=%s resource=%u reason=possibly-overlapping-buffer-write\n",
+			    static_cast<unsigned long long>(program.shader_hash), static_cast<unsigned>(program.stage),
+			    flags.pc, op == ValueOpcode::LoadBufferU32 ? "LoadBufferU32" : "ReadConstBuffer",
+			    program.memory_info[flags.index].resource);
+			return finish(opaque());
+		}
 		if (op == ValueOpcode::ConditionRef) return finish(ClonePredicate(inst->Arg(0)));
 		if (op == ValueOpcode::Phi) {
 			if (inst->Parent() == nullptr || inst->Parent()->terminator.loop_header ||
@@ -1509,9 +1522,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
-	Common::RenderStageProfile::Scope stage_profile {Common::RenderStageProfile::Stage::Materialize};
+template <bool Profile>
+static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
+                                     ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	using namespace Common::RenderStageProfile;
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
@@ -1540,34 +1554,37 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	SrtReadCapture capture {runtime, reads};
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	std::array<uint32_t, 3> workgroup_counts {};
-	if (runtime.indirect_args_address != 0u) {
-		for (uint32_t source = 0; source < program.descriptor_sources.size(); ++source) {
-			if (!WalkedActive(program, source) ||
-			    !uses_workgroup_count(program.descriptor_sources[source])) continue;
-			if ((runtime.indirect_args_address & 3u) != 0u ||
-			    !ReadTable(runtime.indirect_args_address, sizeof(workgroup_counts), 0u,
-			               observed, workgroup_counts)) return false;
-			observed.workgroup_counts = workgroup_counts;
-			break;
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::MaterializeControl};
+		if (runtime.indirect_args_address != 0u) {
+			for (uint32_t source = 0; source < program.descriptor_sources.size(); ++source) {
+				if (!WalkedActive(program, source) ||
+				    !uses_workgroup_count(program.descriptor_sources[source])) continue;
+				if ((runtime.indirect_args_address & 3u) != 0u ||
+				    !ReadTable(runtime.indirect_args_address, sizeof(workgroup_counts), 0u,
+				               observed, workgroup_counts)) return false;
+				observed.workgroup_counts = workgroup_counts;
+				break;
+			}
 		}
-	}
-	snapshot.uniform_fill = {};
-	const auto& fill = program.uniform_fill;
-	auto words = fill.fill.words;
-	std::array<uint32_t, 4> stored {};
-	bool uniform_fill = words != 0;
-	if (uniform_fill && !fill.pattern_size.IsEmpty())
-		uniform_fill = WalkedValue(program, fill.pattern_size, words) && words >= 1 && words <= 4;
-	uint32_t elements = 0;
-	if (uniform_fill && !fill.element_count.IsEmpty())
-		uniform_fill = WalkedValue(program, fill.element_count, elements) && elements != 0;
-	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
-		uniform_fill = WalkedValue(program, fill.values[i], stored[i]) && stored[i] == stored[0];
-	}
-	if (uniform_fill) {
-		snapshot.uniform_fill = fill.fill;
-		snapshot.uniform_fill.value = stored[0];
-		snapshot.uniform_fill.bounded_elements = elements;
+		snapshot.uniform_fill = {};
+		const auto& fill = program.uniform_fill;
+		auto words = fill.fill.words;
+		std::array<uint32_t, 4> stored {};
+		bool uniform_fill = words != 0;
+		if (uniform_fill && !fill.pattern_size.IsEmpty())
+			uniform_fill = WalkedValue(program, fill.pattern_size, words) && words >= 1 && words <= 4;
+		uint32_t elements = 0;
+		if (uniform_fill && !fill.element_count.IsEmpty())
+			uniform_fill = WalkedValue(program, fill.element_count, elements) && elements != 0;
+		for (uint32_t i = 0; i < words && uniform_fill; ++i) {
+			uniform_fill = WalkedValue(program, fill.values[i], stored[i]) && stored[i] == stored[0];
+		}
+		if (uniform_fill) {
+			snapshot.uniform_fill = fill.fill;
+			snapshot.uniform_fill.value = stored[0];
+			snapshot.uniform_fill.bounded_elements = elements;
+		}
 	}
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value) {
 		if (source >= program.descriptor_sources.size()) {
@@ -1586,141 +1603,178 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		return SpecializationFail(fmt::format("indirect {} resource={} source={} candidates={}",
 		    kind, resource, source, candidates));
 	};
-	snapshot.buffers.resize(program.info.buffers.size());
-	specialization.buffers.assign(program.info.buffers.size(), {});
-	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
-		const auto base_index =
-		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
-		if (base_index >= program.info.buffers.size()) return false;
-		const auto& base = program.info.buffers[base_index];
-		if (i < program.info.buffers.size()) {
-			const auto* source = Source(program, base.source);
-			if (source == nullptr) return false;
-			if (source->indirect_descriptor.has_value()) {
-				snapshot.buffers[i] = {.dword_count = 4u};
-				if (WalkedActive(program, base.source)) {
-					if (!MaterializeIndirectDescriptor(
-					        program, base.source, i, 4u, 4u, observed, snapshot,
-					        snapshot.buffers, specialization.buffers,
-					        [&](DescriptorValue& value) {
-						        return NormalizeIndirectBuffer(
-						            value, source->indirect_descriptor->indexed, base);
-					        }))
-						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::MaterializeBuffers};
+		snapshot.buffers.resize(program.info.buffers.size());
+		specialization.buffers.assign(program.info.buffers.size(), {});
+		for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
+			const auto base_index =
+			    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
+			if (base_index >= program.info.buffers.size()) return false;
+			const auto& base = program.info.buffers[base_index];
+			if (i < program.info.buffers.size()) {
+				const auto* source = Source(program, base.source);
+				if (source == nullptr) return false;
+				if (source->indirect_descriptor.has_value()) {
+					snapshot.buffers[i] = {.dword_count = 4u};
+					if (WalkedActive(program, base.source)) {
+						if (!MaterializeIndirectDescriptor(
+						        program, base.source, i, 4u, 4u, observed, snapshot,
+						        snapshot.buffers, specialization.buffers,
+						        [&](DescriptorValue& value) {
+							        return NormalizeIndirectBuffer(
+							            value, source->indirect_descriptor->indexed, base);
+						        }))
+							return resource_failed("buffer", i, base.source, snapshot.buffers.size());
+					}
+				} else if (!evaluate(base.source, snapshot.buffers[i])) {
+					return false;
 				}
-			} else if (!evaluate(base.source, snapshot.buffers[i])) {
-				return false;
 			}
-		}
-		auto&                descriptor_value = snapshot.buffers[i];
-		ShaderBufferResource descriptor;
-		if (!DecodeBufferDescriptor(descriptor_value, descriptor)) {
-			return SpecializationFail(fmt::format("buffer descriptor {} has invalid width", i));
-		}
-		if (descriptor.Type() != 0) {
-			descriptor_value.dwords.fill(0);
-			descriptor = {};
-		}
-		auto       packed_stride = descriptor.PackedStride();
-		const auto stride        = packed_stride & 0x3fffu;
-		const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
-		if (stride == 0u) {
-			packed_stride &= ~((1u << 14u) | (3u << 16u));
-		} else if (!swizzle) {
-			packed_stride &= ~(3u << 16u);
-		}
-		auto& buffer         = specialization.buffers[i];
-		buffer.packed_stride = packed_stride;
-		buffer.descriptor_format =
-		    base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
-		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
-		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
-		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
-	}
-	snapshot.images.resize(program.info.images.size());
-	specialization.images.resize(program.info.images.size());
-	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
-		const auto& image = program.info.images[i];
-		specialization.images[i] = {
-		    .numeric_class = image.numeric_class,
-		    .dimension = image.dimension,
-		    .mip_count = image.mip_count,
-		    .conversion_format = image.conversion_format,
-		    .shader_swizzle = image.shader_swizzle,
-		    .indirect_root = image.indirect_root,
-		    .indirect_mapping_offset = image.indirect_mapping_offset,
-		    .indirect_search_iterations = image.indirect_search_iterations,
-		    .cube = image.cube,
-		};
-		const auto* source = Source(program, image.source);
-		if (source == nullptr) {
-			return false;
-		}
-		if (source->indirect_descriptor.has_value()) {
-			snapshot.images[i] = {.dword_count = 8u};
-			if (!WalkedActive(program, image.source)) {
-				continue;
+			auto&                descriptor_value = snapshot.buffers[i];
+			ShaderBufferResource descriptor;
+			if (!DecodeBufferDescriptor(descriptor_value, descriptor)) {
+				return SpecializationFail(fmt::format("buffer descriptor {} has invalid width", i));
 			}
-			const auto& indirect = *source->indirect_descriptor;
-			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
-			if (!MaterializeIndirectDescriptor(
-			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
-			        specialization.images, [&](DescriptorValue& value) {
-				        // A broad heap also contains resources for other typed image operations.
-				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
-				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
-					        value.dwords.fill(0u);
-				        return true;
-			        })) {
-				return resource_failed("image", i, image.source, snapshot.images.size());
+			if (descriptor.Type() != 0) {
+				descriptor_value.dwords.fill(0);
+				descriptor = {};
 			}
-		} else {
-			if (!evaluate(image.source, snapshot.images[i])) {
-				return false;
+			auto       packed_stride = descriptor.PackedStride();
+			const auto stride        = packed_stride & 0x3fffu;
+			const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
+			if (stride == 0u) {
+				packed_stride &= ~((1u << 14u) | (3u << 16u));
+			} else if (!swizzle) {
+				packed_stride &= ~(3u << 16u);
 			}
-			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
-				snapshot.images[i].dwords.fill(0);
-			}
+			auto& buffer         = specialization.buffers[i];
+			buffer.packed_stride = packed_stride;
+			buffer.descriptor_format =
+			    base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
+			buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
+			buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
+			buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 		}
 	}
-	snapshot.samplers.resize(program.info.samplers.size());
-	specialization.samplers.assign(program.info.samplers.size(), {});
-	for (uint32_t i = 0; i < snapshot.samplers.size(); ++i) {
-		const auto base_index =
-		    i < program.info.samplers.size() ? i : specialization.samplers[i].indirect_root;
-		if (base_index >= program.info.samplers.size()) return false;
-		if (i < program.info.samplers.size()) {
-			auto source = program.info.samplers[i].source;
-			const auto* descriptor = Source(program, source);
-			if (descriptor == nullptr) return false;
-			const auto* indirect = descriptor->indirect_descriptor ? &*descriptor->indirect_descriptor : nullptr;
-			if (indirect != nullptr && indirect->sources.empty()) {
-				snapshot.samplers[i] = {.dword_count = 4u};
-				if (WalkedActive(program, source) && !MaterializeIndirectDescriptor(
-				        program, source, i, 4u, 4u, observed, snapshot, snapshot.samplers,
-				        specialization.samplers,
-				        [](DescriptorValue&) { return true; }))
-					return resource_failed("sampler", i, source, snapshot.samplers.size());
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::MaterializeImages};
+		snapshot.images.resize(program.info.images.size());
+		specialization.images.resize(program.info.images.size());
+		for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+			const auto& image = program.info.images[i];
+			specialization.images[i] = {
+			    .numeric_class = image.numeric_class,
+			    .dimension = image.dimension,
+			    .mip_count = image.mip_count,
+			    .conversion_format = image.conversion_format,
+			    .shader_swizzle = image.shader_swizzle,
+			    .indirect_root = image.indirect_root,
+			    .indirect_mapping_offset = image.indirect_mapping_offset,
+			    .indirect_search_iterations = image.indirect_search_iterations,
+			    .cube = image.cube,
+			};
+			const auto* source = Source(program, image.source);
+			if (source == nullptr) {
+				return false;
+			}
+			if (source->indirect_descriptor.has_value()) {
+				snapshot.images[i] = {.dword_count = 8u};
+				if (!WalkedActive(program, image.source)) {
+					continue;
+				}
+				const auto& indirect = *source->indirect_descriptor;
+				const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
+				if (!MaterializeIndirectDescriptor(
+				        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, snapshot, snapshot.images,
+				        specialization.images, [&](DescriptorValue& value) {
+					        // A broad heap also contains resources for other typed image operations.
+					        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
+					            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
+						        value.dwords.fill(0u);
+					        return true;
+				        })) {
+					return resource_failed("image", i, image.source, snapshot.images.size());
+				}
 			} else {
-				if (indirect != nullptr) source = indirect->sources[0];
-				if (!evaluate(source, snapshot.samplers[i])) return false;
-			}
-		}
-		if (program.info.samplers[base_index].gather_lod) {
-			const auto control = snapshot.samplers[i].dwords[2];
-			const auto filter = (control >> 26u) & 3u;
-			const auto perf_mip = (snapshot.samplers[i].dwords[1] >> 24u) & 15u;
-			// MipNone always selects the base level. Point/linear selection requires zero
-			// primary/secondary bias; linear mip snapping is not implemented.
-			if (filter > 2u || (filter != 0u && (control & 0xfffffu) != 0u) ||
-			    (filter == 2u && perf_mip != 0u)) {
-				return SpecializationFail(
-				    "explicit-LOD gather requires None, unbiased Point, or unbiased Linear without mip snapping");
+				if (!evaluate(image.source, snapshot.images[i])) {
+					return false;
+				}
+				if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+					snapshot.images[i].dwords.fill(0);
+				}
 			}
 		}
 	}
-	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::MaterializeSamplers};
+		snapshot.samplers.resize(program.info.samplers.size());
+		specialization.samplers.assign(program.info.samplers.size(), {});
+		for (uint32_t i = 0; i < snapshot.samplers.size(); ++i) {
+			const auto base_index =
+			    i < program.info.samplers.size() ? i : specialization.samplers[i].indirect_root;
+			if (base_index >= program.info.samplers.size()) return false;
+			if (i < program.info.samplers.size()) {
+				auto source = program.info.samplers[i].source;
+				const auto* descriptor = Source(program, source);
+				if (descriptor == nullptr) return false;
+				const auto* indirect = descriptor->indirect_descriptor ? &*descriptor->indirect_descriptor : nullptr;
+				if (indirect != nullptr && indirect->sources.empty()) {
+					snapshot.samplers[i] = {.dword_count = 4u};
+					if (WalkedActive(program, source) && !MaterializeIndirectDescriptor(
+					        program, source, i, 4u, 4u, observed, snapshot, snapshot.samplers,
+					        specialization.samplers,
+					        [](DescriptorValue&) { return true; }))
+						return resource_failed("sampler", i, source, snapshot.samplers.size());
+				} else {
+					if (indirect != nullptr) source = indirect->sources[0];
+					if (!evaluate(source, snapshot.samplers[i])) return false;
+				}
+			}
+			if (program.info.samplers[base_index].gather_lod) {
+				const auto control = snapshot.samplers[i].dwords[2];
+				const auto filter = (control >> 26u) & 3u;
+				const auto perf_mip = (snapshot.samplers[i].dwords[1] >> 24u) & 15u;
+				// MipNone always selects the base level. Point/linear selection requires zero
+				// primary/secondary bias; linear mip snapping is not implemented.
+				if (filter > 2u || (filter != 0u && (control & 0xfffffu) != 0u) ||
+				    (filter == 2u && perf_mip != 0u)) {
+					return SpecializationFail(
+					    "explicit-LOD gather requires None, unbiased Point, or unbiased Linear without mip snapping");
+				}
+			}
+		}
+	}
+	{
+		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::MaterializeSpecialization};
+		snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+		return BuildResourceSpecialization(program, snapshot, specialization);
+	}
+}
+
+template <bool Profile>
+static bool MaterializeWithControlFallback(const ResourcePlan& program, const SrtRuntime& runtime,
+                                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	if (MaterializeResourcesImpl<Profile>(program, runtime, snapshot, specialization)) return true;
+	using namespace Common::SubmitProfile;
+	if (program.walker_control_rejected ||
+	    std::ranges::none_of(program.walker_control_disabled, [](uint8_t v) { return v != 0; })) return false;
+	// Conservatively keeping both branches may expose a descriptor that cannot be
+	// represented by the host. Retire adaptation for this plan and retry the exact
+	// original pruning, rather than closing a game which previously worked.
+	program.walker_control_rejected = true;
+	AddExtra(Extra::WalkerControlFallbacks);
+	return MaterializeResourcesImpl<Profile>(program, runtime, snapshot, specialization);
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	using namespace Common::RenderStageProfile;
+	if (!Detail::Enabled()) return MaterializeWithControlFallback<false>(program, runtime, snapshot, specialization);
+	Scope stage_profile {Stage::Materialize};
+	if (Detail::DetailedEnabled())
+		return MaterializeWithControlFallback<true>(program, runtime, snapshot, specialization);
+	return MaterializeWithControlFallback<false>(program, runtime, snapshot, specialization);
 }
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
@@ -2073,7 +2127,9 @@ template <class S, class P> void IoPlan(S& io, P& plan) {
 	       selector_groups, control_flow, control_phis, srt_reads, source_reads, capture_specialization_reads,
 	       srt_plan_complete, resource_tracking_complete, info, uniform_fill,
 	       // Derived on load.
-	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
+	       srt_code, walker_read_sites, walker_control_disabled, walker_control_rejected,
+	       srt_user_data, srt_captures, srt_scratch, material_keys,
+	       selector_keys] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
 	      selector_groups, control_flow, srt_reads, source_reads, capture_specialization_reads,

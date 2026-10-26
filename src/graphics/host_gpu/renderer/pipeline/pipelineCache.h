@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
+#include "common/renderStageProfile.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -138,6 +139,8 @@ struct DrawRenderState {
 	vk::PrimitiveTopology                topology = vk::PrimitiveTopology::ePointList;
 	bool                                 primitive_restart_enable                 = false;
 	bool                                 ps_active                                = false;
+	bool                                 indirect_mesh                            = false;
+	uint64_t                             indirect_index_span                      = 0;
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo                 ps_input_info;
 
@@ -199,6 +202,9 @@ public:
 private:
 	friend struct PipelineCacheTestAccess;
 
+	template <bool Profile>
+	void GetGraphicsProgramsImpl(const CommandBuffer& command, DrawRenderState& state);
+
 	struct Program {
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
@@ -206,12 +212,16 @@ private:
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<ShaderModule>                    modules;
 		bool                                         skip_dispatch = false;
+		Common::RenderStageProfile::ModuleSelectionHistory profile_selection;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                         uint32_t                                push_data_cursor);
+		template <bool HasCalls, bool Profile>
+		ShaderModule* FindModuleImpl(const ShaderRecompiler::IR::SrtRuntime& runtime,
+		                             uint32_t push_data_cursor);
 	};
 
 	struct ProgramKey {
