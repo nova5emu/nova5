@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include "graphics/presentation/gameBar.h"
 
 namespace {
 void Check(bool condition, const char* message) {
@@ -16,6 +17,8 @@ std::array<Sint16, 2> physical_stick {};
 std::array<int, 2>    guest_stick {128, 128};
 uint32_t             guest_buttons = 0;
 bool                 guest_touch   = false;
+bool                 relative_mouse = false;
+SDL_MouseButtonFlags mouse_buttons = 0;
 } // namespace
 
 namespace Fake {
@@ -36,9 +39,11 @@ bool ShowCursor() {
 	return true;
 }
 SDL_MouseButtonFlags GetMouseState(float* x, float* y) {
-	*x = *y = 0.0f;
-	return 0;
+	if (x) *x = 0.0f;
+	if (y) *y = 0.0f;
+	return mouse_buttons;
 }
+bool SetWindowRelativeMouseMode(SDL_Window*, bool enabled) { relative_mouse = enabled; return true; }
 } // namespace Fake
 
 #define SDL_GetGamepadFromID Fake::GetGamepadFromID
@@ -47,6 +52,7 @@ SDL_MouseButtonFlags GetMouseState(float* x, float* y) {
 #define SDL_HideCursor       Fake::HideCursor
 #define SDL_ShowCursor       Fake::ShowCursor
 #define SDL_GetMouseState    Fake::GetMouseState
+#define SDL_SetWindowRelativeMouseMode Fake::SetWindowRelativeMouseMode
 #include "graphics/presentation/window/hostInput.cpp"
 #undef SDL_GetGamepadFromID
 #undef SDL_GetGamepadAxis
@@ -54,6 +60,7 @@ SDL_MouseButtonFlags GetMouseState(float* x, float* y) {
 #undef SDL_HideCursor
 #undef SDL_ShowCursor
 #undef SDL_GetMouseState
+#undef SDL_SetWindowRelativeMouseMode
 
 namespace Libs::Controller {
 void SetButton(int id, uint32_t button, bool down) {
@@ -86,10 +93,84 @@ struct Inputs {
 		guest_stick    = {128, 128};
 		guest_buttons  = 0;
 		guest_touch    = false;
+		relative_mouse = false;
+		mouse_buttons = 0;
 		HostInputInit(nullptr);
 	}
 	~Inputs() { HostInputShutdown(); }
 };
+
+void TestGameBar() {
+	GameBarState bar;
+	bar.Pointer(6, true);
+	Check(!bar.Visible(), "bar opened outside six-pixel edge");
+	bar.Pointer(5, true);
+	Check(bar.Visible(), "edge did not open bar");
+	const auto session = bar.Session();
+	bar.Pointer(40, true);
+	Check(bar.Visible(), "bar hid before pointer reached buttons");
+	bar.RequestExit();
+	Check(bar.ConfirmingExit() && bar.TakeAction() == GameBarAction::None, "exit was not confirmed");
+	bar.CancelExit();
+	bar.ConfirmExit();
+	Check(bar.TakeAction() == GameBarAction::None, "No allowed an exit");
+	bar.Pointer(GameBarState::Height, true);
+	Check(!bar.Visible() && !bar.ConfirmingExit(), "mouse departure did not dismiss bar");
+	bar.Pointer(0, true);
+	Check(bar.Visible() && bar.Session() != session, "mouse return reused stale input session");
+	bar.Escape(false);
+	bar.Pointer(0, true);
+	Check(!bar.Visible(), "Escape immediately reopened a stationary edge bar");
+	bar.Escape(true);
+	Check(!bar.Visible(), "key repeat toggled bar");
+	bar.Escape(false);
+	bar.Pointer(300, true);
+	bar.Pointer(0, false);
+	Check(bar.Visible(), "keyboard bar hid on mouse departure");
+	bar.Fullscreen();
+	Check(bar.TakeAction() == GameBarAction::Fullscreen && bar.TakeAction() == GameBarAction::None,
+	      "fullscreen action was lost or repeated");
+	bar.RequestExit(); bar.ConfirmExit();
+	bar.Hide();
+	Check(bar.TakeAction() == GameBarAction::Exit && bar.TakeAction() == GameBarAction::None,
+	      "pointer departure lost or repeated a confirmed exit");
+	bar.Escape(false);
+	bar.RequestExit(); bar.ConfirmExit();
+	bar.Block(true);
+	bar.Pointer(0, true); bar.Escape(false); bar.Fullscreen(); bar.ConfirmExit();
+	Check(!bar.Visible() && bar.TakeAction() == GameBarAction::None, "dialog did not override bar/actions");
+	bar.Block(false);
+	bar.Escape(false);
+	Check(bar.Visible() && !bar.ConfirmingExit(), "dialog left stale exit confirmation");
+	bar.Hide(); // Focus loss.
+	Check(!bar.Visible(), "focus loss retained bar");
+}
+
+void TestMouseCapture() {
+	Inputs inputs;
+	HostInputSetTouchPadMode(true);
+	HostInputMouseTouchPad(true, 0, 0);
+	HostInputToggleMouseToJoystick();
+	Check(relative_mouse, "relative mouse did not start");
+	HostInputCaptureMouse(true);
+	Check(!relative_mouse && !GetHostInputTouchPadVisualState().enabled,
+	      "bar retained relative mouse or touchpad");
+	HostInputSetTouchPadMode(true);
+	HostInputToggleMouseToJoystick();
+	HostInputMouseTouchPad(true, 0, 0);
+	Check(!relative_mouse && !GetHostInputTouchPadVisualState().enabled,
+	      "captured mouse was reenabled by a mapping");
+	mouse_buttons = SDL_BUTTON_LMASK;
+	HostInputCaptureMouse(false);
+	Check(relative_mouse && GetHostInputTouchPadVisualState().enabled,
+	      "closing bar lost previous mouse modes");
+	HostInputMouseTouchPad(true, 0, 0);
+	Check(!GetHostInputTouchPadVisualState().drawing, "drag started in bar leaked after closing");
+	mouse_buttons = 0;
+	HostInputMouseButton(SDL_BUTTON_LEFT, false);
+	HostInputMouseTouchPad(true, 0, 0);
+	Check(GetHostInputTouchPadVisualState().drawing, "new touch failed after captured release");
+}
 
 void TestTouchPadStickHandoff() {
 	Inputs inputs;
@@ -199,6 +280,8 @@ int main() {
 	TestKeyboardSwitchesFromGamepadTouchPad();
 	TestIndependentTriggerEdges();
 	TestTriggerLifecycleReset();
+	TestGameBar();
+	TestMouseCapture();
 	TestDisabledMappingTabs();
 	Config::Shutdown();
 	return 0;

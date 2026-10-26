@@ -493,6 +493,7 @@ void WindowContext::ProcessEvent(double time_s) {
 		return;
 	}
 	if (event->type >= SDL_EVENT_WINDOW_FIRST && event->type <= SDL_EVENT_WINDOW_LAST) {
+		if (event->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) GameEventQuit(game);
 		ProcessWindowEvent(event->window);
 		return;
 	}
@@ -747,6 +748,12 @@ void WindowContext::Run() {
 	auto               title_frames      = loop.presented_frames.load(std::memory_order_relaxed);
 
 	while (!loop.need_exit) {
+		switch (PollGameBarAction((SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0)) {
+			case GameBarAction::Fullscreen: ToggleDesktopFullscreen(); break;
+			case GameBarAction::Exit: GameEventTerminate(loop); break;
+			case GameBarAction::None: break;
+		}
+		if (loop.need_exit) break;
 		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
 				timer.Pause();

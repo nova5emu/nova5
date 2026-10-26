@@ -143,6 +143,9 @@ struct MouseJoystickState {
 };
 
 MouseJoystickState g_mouse;
+bool               g_mouse_captured = false;
+bool               g_restore_touchpad = false;
+uint32_t           g_mouse_ignore_until_up = 0;
 SDL_Window*        g_mouse_window   = nullptr;
 uint64_t           g_cursor_hide_at = 0;
 
@@ -749,6 +752,9 @@ void HostInputInit(SDL_Window* window) {
 }
 
 void HostInputShutdown() {
+	g_mouse_captured = false;
+	g_restore_touchpad = false;
+	g_mouse_ignore_until_up = 0;
 	g_pad_trigger_pressed.clear();
 	HostInputSetTouchPadMode(false);
 	int gamepad_touch_id = -1;
@@ -781,6 +787,12 @@ void HostInputKey(int key_code, bool down) {
 }
 
 void HostInputMouseButton(uint8_t mouse_button, bool down) {
+	if (g_mouse_captured || mouse_button == 0) return;
+	const auto mask = SDL_BUTTON_MASK(mouse_button);
+	if ((g_mouse_ignore_until_up & mask) != 0) {
+		if (!down) g_mouse_ignore_until_up &= ~mask;
+		return;
+	}
 	const auto& map = GetInputMap();
 	if (map.Custom() && mouse_button != 0) {
 		SetControl(map.FindMouseButton(mouse_button), down);
@@ -788,6 +800,7 @@ void HostInputMouseButton(uint8_t mouse_button, bool down) {
 }
 
 void HostInputMouseTouchPad(bool down, float x, float y) {
+	if (g_mouse_captured || (down && (g_mouse_ignore_until_up & SDL_BUTTON_LMASK) != 0)) return;
 	RecordMouseTouchPadPosition(x, y);
 	{
 		std::scoped_lock lock(g_touchpad_mutex);
@@ -806,6 +819,7 @@ void HostInputMouseTouchPad(bool down, float x, float y) {
 }
 
 void HostInputMouseMotion(float x, float y) {
+	if (g_mouse_captured) return;
 	RecordMouseTouchPadPosition(x, y);
 	std::scoped_lock lock(g_touchpad_mutex);
 	if (g_mouse_touchpad.enabled && g_mouse_touchpad.drawing) {
@@ -814,6 +828,7 @@ void HostInputMouseMotion(float x, float y) {
 }
 
 void HostInputSetTouchPadMode(bool enabled) {
+	if (enabled && g_mouse_captured) return;
 	if (enabled) {
 		int gamepad_id = -1;
 		{
@@ -860,6 +875,7 @@ void HostInputSetTouchPadMode(bool enabled) {
 }
 
 void HostInputToggleTouchPadMode() {
+	if (g_mouse_captured) return;
 	bool enabled = false;
 	{
 		std::scoped_lock lock(g_touchpad_mutex);
@@ -1001,6 +1017,7 @@ HostInputTouchPadVisualState GetHostInputTouchPadVisualState() {
 }
 
 void HostInputToggleMouseToJoystick() {
+	if (g_mouse_captured) return;
 	if (g_mouse.enabled) {
 		SetRelativeMouseMode(false);
 		CenterMouseStick();
@@ -1016,9 +1033,37 @@ void HostInputToggleMouseToJoystick() {
 	LOGF("Mouse to right stick: enabled (F7 to release)\n");
 }
 
+void HostInputCaptureMouse(bool captured) {
+	if (g_mouse_captured == captured) return;
+	if (captured) {
+		{
+			std::scoped_lock lock(g_touchpad_mutex);
+			g_restore_touchpad = g_mouse_touchpad.enabled;
+		}
+		HostInputSetTouchPadMode(false);
+		// Release mappings before capture, including a button held on entry.
+		for (uint8_t button = SDL_BUTTON_LEFT; button <= SDL_BUTTON_X2; ++button)
+			HostInputMouseButton(button, false);
+		if (g_mouse.enabled) SetRelativeMouseMode(false);
+		CenterMouseStick();
+		g_mouse_captured = true;
+		g_cursor_hide_at = 0;
+		SDL_ShowCursor();
+	} else {
+		g_mouse_captured = false;
+		g_mouse_ignore_until_up = SDL_GetMouseState(nullptr, nullptr);
+		if (g_restore_touchpad) HostInputSetTouchPadMode(true);
+		g_restore_touchpad = false;
+		if (TouchPadModeActive()) SDL_HideCursor();
+		if (g_mouse.enabled && !SetRelativeMouseMode(true)) g_mouse.enabled = false;
+		g_mouse.next_poll = 0;
+		if (Config::HideCursorEnabled()) g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;
+	}
+}
+
 bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 	int timeout = -1;
-	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
+	if (g_mouse_captured || !g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
 		g_mouse.next_poll = 0;
 		CenterMouseStick();
 	} else {
@@ -1041,7 +1086,7 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 	timeout              = timeout < 0 ? max_wait_ms : std::min(timeout, max_wait_ms);
 	const bool has_event = SDL_WaitEventTimeout(event, timeout);
 
-	if (Config::HideCursorEnabled() && !TouchPadModeActive()) {
+	if (!g_mouse_captured && Config::HideCursorEnabled() && !TouchPadModeActive()) {
 		const auto now_ms = SDL_GetTicks();
 		if (has_event && !g_mouse.enabled && IsCursorActivity(*event) &&
 		    SDL_GetWindowFromEvent(event) == g_mouse_window) {

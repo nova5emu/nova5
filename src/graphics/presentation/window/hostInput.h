@@ -29,6 +29,8 @@ void               HostInputPadButton(int id, int sdl_button, bool down);
 void               HostInputPadTrigger(int id, bool left, int value);
 void               HostInputDisconnectGamepad(int id);
 void               HostInputSetTouchPadMode(bool enabled);
+// Main/window thread only. Releases guest mouse input and suspends relative mode.
+void               HostInputCaptureMouse(bool captured);
 void               HostInputToggleTouchPadMode();
 void               HostInputToggleGamepadTouchPad(int id);
 [[nodiscard]] bool HostInputGamepadDrawButton(int id, bool down);

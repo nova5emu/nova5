@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_PRESENTATION_SYSTEMOVERLAY_H_
 
 #include "common/common.h"
+#include "graphics/presentation/gameBar.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstddef>
@@ -27,6 +28,8 @@ void                     HideSplashScreen();
 void                     InitializeSystemOverlayInput(SDL_Window* window);
 void                     ShutdownSystemOverlayInput();
 bool                     ProcessSystemOverlayInput(const SDL_Event& event);
+// Called on the SDL window thread; renderer buttons only enqueue actions.
+GameBarAction            PollGameBarAction(bool fullscreen);
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept;
 void                     NotifyTrophyUnlocked(std::string_view name, int32_t grade,
                                               std::span<const std::byte> icon_png);

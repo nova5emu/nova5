@@ -26,6 +26,9 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+
+#include <bit>
+#include <optional>
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -464,22 +467,13 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
-	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
-		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
-	}
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+// Called at the original point between size calculation and view construction.
+// Keeping the callback here preserves unmapped-heap early returns and EXIT order.
+template <typename Validate>
+static bool BuildTextureDescriptionImpl(
+    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
+    BuiltImageDescription& built, Validate&& validate) {
 	const bool storage = resource.written;
-	if (storage) {
-		ValidateStorageImageResource(resource);
-	}
-
-	auto& texture_cache = m_context.GetTextureCache();
-	if (descriptor.IsNull()) {
-		return {.layout = vk::ImageLayout::eGeneral};
-	}
-
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
@@ -557,7 +551,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                     ? storage_view_format
 	                                     : pixel_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
-	TextureCache::ImageDesc desc {};
+	auto& desc = built.desc;
 	desc.info.data         = {address, 0};
 	desc.info.pixel_format = pixel_format;
 	desc.info.guest_format = format;
@@ -583,16 +577,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else {
 		desc.info.UpdateSize();
 	}
-	const auto alignment = desc.info.DataAlignment();
-	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
-	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
-	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
-	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
-		return {.layout = vk::ImageLayout::eGeneral};
-	}
-	if (storage) {
-		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
-	}
+	if (!validate(desc.info)) return false;
+
 	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
 		TileSizeAlign metadata_size {};
 		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
@@ -606,7 +592,100 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	built.shader_conversion = shader_conversion;
+	built.pixel_format = pixel_format;
+	built.view_format = view_format;
+	return true;
+}
+
+BuiltImageDescription BuildTextureDescription(const ShaderRecompiler::IR::ImageResource& resource,
+                                               const ShaderTextureResource& descriptor) {
+	EXIT_IF(resource.heap || descriptor.IsNull());
+	if (resource.written) ValidateStorageImageResource(resource);
+	BuiltImageDescription built {};
+	BuildTextureDescriptionImpl(resource, descriptor, built, [&](const ImageInfo& info) {
+		const auto alignment = info.DataAlignment();
+		EXIT_NOT_IMPLEMENTED(info.data.size == 0 || alignment == 0 ||
+		                     (descriptor.Base40() & (static_cast<uint64_t>(alignment) - 1u)) != 0);
+		if (resource.written) ValidateStorageTexture(resource, descriptor, info.data.size);
+		return true;
+	});
+	return built;
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value,
+                                              bool profile_prepare, uint64_t description_program,
+                                              uint32_t description_resource) {
+	using Stage = Common::RenderStageProfile::Stage;
+	using Scope = Common::RenderStageProfile::Scope;
+	{
+		Scope validation {Stage::ImageValidate, profile_prepare};
+		if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+			EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
+		}
+	}
+	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const bool storage = resource.written;
+	if (storage) {
+		Scope validation {Stage::ImageValidate, profile_prepare};
+		ValidateStorageImageResource(resource);
+	}
+
+	auto& texture_cache = m_context.GetTextureCache();
+	if (descriptor.IsNull()) {
+		return {.layout = vk::ImageLayout::eGeneral};
+	}
+
+	// Both A and B pay the same single scope, including lookup/copy on a hit.
+	std::optional<Scope> build_profile;
+	build_profile.emplace(Stage::ImageDescBuild, profile_prepare);
+	auto validate = [&](const ImageInfo& info) {
+		Scope validation {Stage::ImageValidate, profile_prepare};
+		const auto alignment = info.DataAlignment();
+		EXIT_NOT_IMPLEMENTED(info.data.size == 0 || alignment == 0 ||
+		                     (descriptor.Base40() & (static_cast<uint64_t>(alignment) - 1u)) != 0);
+		// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
+		if (resource.heap && !m_context.IsMapped(descriptor.Base40(), info.data.size)) {
+			return false;
+		}
+		if (storage) {
+			ValidateStorageTexture(resource, descriptor, info.data.size);
+		}
+		return true;
+	};
+
+	BuiltImageDescription built {};
+	const BuiltImageDescription* cached = nullptr;
+	if (description_program != 0) {
+		if (!m_image_descriptions) m_image_descriptions = std::make_unique<ImageDescriptionCache>();
+		cached = m_image_descriptions->Find(description_program, description_resource, value.dwords);
+	}
+	if (cached != nullptr) {
+		built = *cached;
+		if (!validate(built.desc.info)) return {.layout = vk::ImageLayout::eGeneral};
+		Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::ImageDescReuseHits);
+	} else {
+		if (!BuildTextureDescriptionImpl(resource, descriptor, built, validate))
+			return {.layout = vk::ImageLayout::eGeneral};
+		if (description_program != 0) {
+			using namespace Common::SubmitProfile;
+			AddExtra(Extra::ImageDescReuseMisses);
+			if (m_image_descriptions->Store(description_program, description_resource, value.dwords, built))
+				AddExtra(Extra::ImageDescHistoryCapacityResets);
+		}
+	}
+	auto& desc = built.desc;
+	const auto shader_conversion = built.shader_conversion;
+	const auto pixel_format = built.pixel_format;
+	const auto view_format = built.view_format;
+	build_profile.reset();
+	ImageId id;
+	{
+		Scope find {Stage::ImageFind, profile_prepare};
+		id = texture_cache.FindImage(desc, shader_conversion);
+	}
+	Scope validation {Stage::ImageValidate, profile_prepare};
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -696,13 +775,21 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data.clear();
 	{
 		Common::RenderStageProfile::Scope profile {Common::RenderStageProfile::Stage::PrepareImages};
+		const bool reuse = Common::SubmitProfile::ExperimentActive(Common::SubmitProfile::Experiment::ImageDescReuse);
+		// Vulkan modules survive PipelineCache's vector moves and are destroyed only
+		// with that cache. Its immutable resource metadata is part of this identity.
+		const uint64_t description_program = reuse && runtime.module->module
+		    ? std::bit_cast<uint64_t>(static_cast<VkShaderModule>(runtime.module->module)) : 0;
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			if (program.info.images[i].heap) {
 				prepared.images[i] = {};
 				continue;
 			}
-			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
-			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i], true, description_program, i);
+			{
+				Common::RenderStageProfile::Scope bind {Common::RenderStageProfile::Stage::ImageBind};
+				BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+			}
 			binding.mip_views.swap(prepared.images[i].mip_views);
 			binding.mip_views.clear();
 			prepared.images[i] = std::move(binding);

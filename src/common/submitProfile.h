@@ -94,7 +94,9 @@ enum class Extra : uint8_t {
 	TrackedReadFaults, TrackedWriteFaults, BindingReadRanges, BindingWriteRanges,
 	BindingImageComparisons, BindingBufferComparisons, PushDescriptorCalls, DescriptorSetCalls,
 	FalseSharedServed, AttribCleanReads, AttribCleanFallbacks,
-	WalkerCleanReads, WalkerCleanFallbacks, WalkerCleanFaults, Count
+	WalkerCleanReads, WalkerCleanFallbacks, WalkerCleanFaults,
+	ImageDescObservations, ImageDescSameKey, ImageDescChangedKey, ImageDescFirstKey,
+	ImageDescHistoryCapacityResets, ImageDescReuseHits, ImageDescReuseMisses, Count
 };
 inline constexpr std::array ExtraNames {
 	"flips", "occlusion_dumps", "predication_zpass", "predication_bool", "predication_off",
@@ -109,7 +111,9 @@ inline constexpr std::array ExtraNames {
 	"tracked_read_faults", "tracked_write_faults", "binding_read_ranges", "binding_write_ranges",
 	"binding_image_comparisons", "binding_buffer_comparisons", "push_descriptor_calls", "descriptor_set_calls",
 	"false_shared_served", "attrib_clean_reads", "attrib_clean_fallbacks",
-	"walker_clean_reads", "walker_clean_fallbacks", "walker_clean_faults"
+	"walker_clean_reads", "walker_clean_fallbacks", "walker_clean_faults",
+	"image_desc_observations", "image_desc_same_key", "image_desc_changed_key", "image_desc_first_key",
+	"image_desc_history_capacity_resets", "image_desc_reuse_hits", "image_desc_reuse_misses"
 };
 static_assert(ExtraNames.size() == static_cast<size_t>(Extra::Count));
 
@@ -232,9 +236,10 @@ inline void TakeTag(ThreadTag& tag, uint32_t& tid, bool& multi) {
 	return Detail::Armed() && Detail::recording.load(std::memory_order_relaxed);
 }
 // Candidate under A/B (see SubmitProfileRuntime); off unless the experiment gate is open.
-enum class Experiment { None, ReleaseMem };
+enum class Experiment { None, ReleaseMem, ImageDescReuse };
 inline Experiment ParseExperiment(std::string_view name) {
 	if (name == "release-mem") return Experiment::ReleaseMem;
+	if (name == "image-desc-reuse") return Experiment::ImageDescReuse;
 	return Experiment::None;
 }
 inline Experiment SelectedExperiment() {
@@ -247,6 +252,7 @@ inline Experiment SelectedExperiment() {
 inline const char* ExperimentName() {
 	switch (SelectedExperiment()) {
 		case Experiment::ReleaseMem: return "release-mem";
+		case Experiment::ImageDescReuse: return "image-desc-reuse";
 		default: return "none";
 	}
 }

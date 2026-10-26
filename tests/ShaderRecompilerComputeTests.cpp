@@ -258,6 +258,11 @@ struct TextureCacheTestAccess {
 
   static uint64_t GcTick(const TextureCache &cache) { return cache.m_gc_tick; }
 
+  static void FreeForDescriptionReuseTest(TextureCache& cache, ImageId id) {
+    auto lock = Lock(cache);
+    cache.FreeImage(id);
+  }
+
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
   }
@@ -11334,6 +11339,90 @@ public:
     auto result = ReadBuffer(name, probe, bytes / 4);
     DestroyBuffer(&probe);
     return result;
+  }
+
+  void CheckImageDescriptionReuseLive() {
+    constexpr const char* name = "ImageDescriptionReuseLive";
+    constexpr uintptr_t base = 0x000000020fa00000ull;
+    constexpr uint64_t size = 0x10000;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "texture allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void*>(base),
+        "texture mapping failed");
+    std::memset(mapped, 0x3c, size);
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      using namespace Common::SubmitProfile;
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto& executor = context.GetRenderExecutor();
+      auto& images = context.GetTextureCache();
+      ShaderModule module;
+      // Only an identity token here: PrepareBindings never submits this module
+      // to Vulkan, and it is not owned/destroyed by PipelineCache.
+      module.module = vk::ShaderModule(std::bit_cast<VkShaderModule>(uint64_t{17}));
+      ShaderRecompiler::IR::ImageResource resource {};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      module.info.info.images.push_back(resource);
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      snapshot.images.resize(1);
+      snapshot.images[0].dword_count = 8;
+      // Linear 16x16 RGBA8, identity swizzle, one mip, no metadata.
+      snapshot.images[0].dwords = {static_cast<uint32_t>(base >> 8u), 0xc3800000u,
+                                  0x0003c003u, 0x90000facu, 0, 0x00700000u, 0, 0};
+      ShaderStageRuntime runtime {&module, &snapshot};
+      PreparedBindings bindings;
+      const auto prepare = [&] {
+        RenderExecutorTestAccess::ResetBindings(executor);
+        executor.PrepareBindings(runtime, bindings);
+        const auto id = bindings.images.at(0).image_id;
+        Require(name, "live BindImage", id && images.GetImage(id).binding.is_bound,
+                "cached description skipped live image binding");
+        return id;
+      };
+      Reset();
+      SetRecording(true);
+      SetExperiment(false);
+      const auto first = prepare(); // A, no history.
+      const auto desc = bindings.images[0].desc;
+      const auto serial = images.GetImage(first).serial;
+      SetExperiment(true);
+      Require(name, "B miss", prepare() == first, "miss resolved a different image");
+      Require(name, "B hit", prepare() == first && bindings.images[0].desc.view_info == desc.view_info &&
+                  bindings.images[0].desc.info.mip_layout == desc.info.mip_layout,
+              "hit changed the resolved view or layout");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      TextureCacheTestAccess::FreeForDescriptionReuseTest(images, first);
+      const auto replacement = prepare(); // Same key hits, FindImage must create a new image.
+      Require(name, "rediscovery after eviction", images.GetImage(replacement).serial != serial,
+              "description cache reused a dead image instead of calling FindImage");
+      SetExperiment(false);
+      Require(name, "back to A", prepare() == replacement, "A/B/A changed image discovery");
+      Require(name, "gate and counters",
+              Detail::window.extra[static_cast<size_t>(Extra::ImageDescReuseHits)] == 2 &&
+              Detail::window.extra[static_cast<size_t>(Extra::ImageDescReuseMisses)] == 1,
+              "cache path did not follow A/B/A or failed to reuse the description");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      SetRecording(false);
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "texture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckNullTextureDescriptors() {
@@ -48186,6 +48275,143 @@ void CheckImageSamplerSpecialization() {
   std::printf("[host]    %-32s ok\n", "ImageSpecializationPipelineId");
 }
 
+bool SameBuiltImageDescription(const BuiltImageDescription& a, const BuiltImageDescription& b) {
+  if (a.shader_conversion != b.shader_conversion || a.pixel_format != b.pixel_format ||
+      a.view_format != b.view_format) return false;
+  // Compare fields, not padding. Include the entire mip layout and view, not just
+  // the dimensions/format that most callers inspect.
+#define IMAGE_DESC_EQ(field) if (a.desc.field != b.desc.field) return false
+  IMAGE_DESC_EQ(type);
+  IMAGE_DESC_EQ(view_info);
+  IMAGE_DESC_EQ(info.data);
+  IMAGE_DESC_EQ(info.stencil);
+  IMAGE_DESC_EQ(info.metadata.range);
+  IMAGE_DESC_EQ(info.metadata.kind);
+  IMAGE_DESC_EQ(info.metadata.control);
+  IMAGE_DESC_EQ(info.metadata.clear_word);
+  IMAGE_DESC_EQ(info.metadata.compression);
+  IMAGE_DESC_EQ(info.metadata.stencil_compressed);
+  IMAGE_DESC_EQ(info.metadata.clear_register_valid);
+  IMAGE_DESC_EQ(info.metadata.dcc_alpha_msb);
+  IMAGE_DESC_EQ(info.htile_initial_clear);
+  IMAGE_DESC_EQ(info.pixel_format);
+  IMAGE_DESC_EQ(info.guest_format);
+  IMAGE_DESC_EQ(info.type);
+  IMAGE_DESC_EQ(info.extent);
+  IMAGE_DESC_EQ(info.resources);
+  IMAGE_DESC_EQ(info.pitch);
+  IMAGE_DESC_EQ(info.bytes_per_block);
+  IMAGE_DESC_EQ(info.samples);
+  IMAGE_DESC_EQ(info.tile_mode);
+  IMAGE_DESC_EQ(info.bgra16);
+  IMAGE_DESC_EQ(info.mip_layout);
+  IMAGE_DESC_EQ(info.tiling.block.family);
+  IMAGE_DESC_EQ(info.tiling.block.bytes_per_element);
+  IMAGE_DESC_EQ(info.tiling.block.block_size);
+  IMAGE_DESC_EQ(info.tiling.block.block_width);
+  IMAGE_DESC_EQ(info.tiling.block.block_height);
+  IMAGE_DESC_EQ(info.tiling.block.block_depth);
+  IMAGE_DESC_EQ(info.tiling.texel_width);
+  IMAGE_DESC_EQ(info.tiling.texel_height);
+  IMAGE_DESC_EQ(info.tiled_slice_stride);
+  IMAGE_DESC_EQ(info.linear_slice_stride);
+  IMAGE_DESC_EQ(info.first_tail_level);
+#undef IMAGE_DESC_EQ
+  return true;
+}
+
+void CheckImageDescriptionReuse() {
+  constexpr const char* name = "image_desc_reuse";
+  const auto check = [&](bool value, const char* message) { Require(name, "host", value, message); };
+  const auto words = [](const ShaderTextureResource& descriptor) {
+    ImageDescriptionCache::Words result;
+    std::copy_n(descriptor.fields, result.size(), result.begin());
+    return result;
+  };
+  ImageDescriptionCache cache;
+  auto sampled = BasicStorageTextureResource();
+  sampled.written = false;
+  sampled.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+  const auto descriptor = BasicStorageTextureDescriptor();
+  const auto original = BuildTextureDescription(sampled, descriptor);
+  const auto key = words(descriptor);
+  auto exercise = [&](uint64_t program, uint32_t resource,
+                      const ShaderRecompiler::IR::ImageResource& metadata,
+                      const ShaderTextureResource& current, bool expect_hit) {
+    // Recalculate independently even when the cache hits, using the same current
+    // descriptor and this program's metadata. This is the uncached reference.
+    const auto reference = BuildTextureDescription(metadata, current);
+    const auto* cached = cache.Find(program, resource, words(current));
+    check((cached != nullptr) == expect_hit, "wrong hit/miss for exact descriptor key");
+    if (cached == nullptr) {
+      cache.Store(program, resource, words(current), reference);
+      cached = cache.Find(program, resource, words(current));
+    }
+    check(cached && SameBuiltImageDescription(*cached, reference), "cached description differs from recalculation");
+    // FindImage may rebase the view onto an existing larger image. Mutating a
+    // working copy must not poison the next lookup of the pre-FindImage value.
+    auto working = *cached;
+    working.desc.view_info.base_level += 2;
+    working.desc.view_info.base_layer += 3;
+    working.desc.info.mip_layout[0].offset += 4096;
+    check(!SameBuiltImageDescription(working, reference), "comparison missed mutated layout/view");
+    check(SameBuiltImageDescription(*cache.Find(program, resource, words(current)), reference),
+          "working copy contaminated the stored description");
+  };
+  exercise(17, 2, sampled, descriptor, false);
+  exercise(17, 2, sampled, descriptor, true);
+  // Valid changes in each DWORD, including ignored metadata bits: even when the
+  // resulting layout happens to be equal, the key MUST miss and be rebuilt.
+  constexpr std::array<uint32_t, 8> masks {0x100u, 1u, 1u, 1u, 1u, 1u << 4u, 1u << 22u, 1u};
+  for (size_t i = 0; i < masks.size(); ++i) {
+    auto changed = descriptor;
+    changed.fields[i] ^= masks[i];
+    exercise(17, 2, sampled, changed, false);
+    exercise(17, 2, sampled, changed, true);
+    exercise(17, 2, sampled, descriptor, false);
+  }
+  // Same words, different program and metadata: storage and sampled must not alias.
+  const auto storage = BasicStorageTextureResource();
+  check(!SameBuiltImageDescription(original, BuildTextureDescription(storage, descriptor)),
+        "fixture must distinguish sampled and storage descriptions");
+  exercise(18, 2, storage, descriptor, false);
+  exercise(18, 2, storage, descriptor, true);
+  exercise(17, 3, storage, descriptor, false);
+  exercise(17, 2, sampled, descriptor, true);
+  // Additional layouts: linear, swizzled, arrays, physical mip chains and DCC.
+  uint64_t program = 100;
+  const auto fixture = [&](const auto& metadata, const auto& current) {
+    exercise(++program, 0, metadata, current, false);
+    exercise(program, 0, metadata, current, true);
+  };
+  fixture(BasicLinearStorageTextureResource(), BasicLinearStorageTextureDescriptor());
+  fixture(BasicBgraStorageTextureResource(), BasicBgraStorageTextureDescriptor());
+  fixture(BasicArrayStorageTextureResource(), BasicArrayStorageTextureDescriptor());
+  fixture(Ppsa01530MaxMipStorageTextureResource(), Ppsa01530MaxMipStorageTextureDescriptor());
+  fixture(BasicBgraStorageTextureResource(), Ppsa01340MipRangeStorageTextureDescriptor());
+  auto mip_view = descriptor;
+  mip_view.fields[1] |= 256u << 8u; // MinLOD=1, last mip=2.
+  mip_view.fields[3] |= 2u << 16u;
+  mip_view.fields[5] |= 2u << 4u;
+  fixture(sampled, mip_view);
+  // A different executor, explicit clear and capacity eviction all miss safely.
+  ImageDescriptionCache other;
+  check(!other.Find(17, 2, key), "executors shared description state");
+  cache.Clear();
+  check(cache.Size() == 0 && !cache.Find(17, 2, key), "clear kept a stale description");
+  exercise(17, 2, sampled, descriptor, false);
+  cache.Clear();
+  for (uint32_t i = 0; i < ImageDescriptionCache::MaxEntries; ++i)
+    check(!cache.Store(17, i, key, original), "capacity reset too early");
+  check(!cache.Store(17, 0, key, original) && cache.Size() == ImageDescriptionCache::MaxEntries,
+        "replacement at capacity evicted unrelated descriptions");
+  check(cache.Store(18, 0, key, original) && cache.Size() == 1, "capacity is not bounded");
+  check(!cache.Find(17, 2, key), "capacity reset retained old pair");
+  exercise(17, 2, sampled, descriptor, false);
+  exercise(17, 2, sampled, descriptor, true);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckBindingOverlapWrites() {
   constexpr const char* name = "binding_overlap_writes";
   const auto check = [&](const char* message, bool value) { Require(name, "host", value, message); };
@@ -51178,6 +51404,19 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc == 2 && std::strcmp(argv[1], "--image-desc-reuse-gpu-only") == 0) {
+#if defined(_WIN32)
+    _putenv_s("KYTY_EXPERIMENT", "image-desc-reuse");
+    _putenv_s("KYTY_SUBMIT_PROFILE", "1");
+#else
+    setenv("KYTY_EXPERIMENT", "image-desc-reuse", 1);
+    setenv("KYTY_SUBMIT_PROFILE", "1", 1);
+#endif
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    vulkan.CheckImageDescriptionReuseLive();
+    return 0;
+  }
 #if defined(_WIN32)
   if (argc == 2 && std::strcmp(argv[1], "--clean-reads-only") == 0) {
     _putenv_s("KYTY_EXPERIMENT", "");
@@ -51190,6 +51429,10 @@ int main(int argc, char **argv) {
 #endif
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 1 || (argc == 2 && std::strcmp(argv[1], "--image-desc-reuse-only") == 0)) {
+    CheckImageDescriptionReuse();
+    if (argc == 2) return 0;
+  }
   if (argc == 1 || (argc == 2 && std::strcmp(argv[1], "--binding-overlap-only") == 0)) {
     CheckBindingOverlapWrites();
     if (argc == 2) return 0;

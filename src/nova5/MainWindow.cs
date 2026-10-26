@@ -320,6 +320,75 @@ public sealed class MainWindow : Window
 		}
 		if (!_emulator.Exists) ShowToast("No se encontró Nova5Emulator junto al lanzador");
 		Select(_index, force: true);
+		WatchFolders(roots);
+		InstallPendingPackages();
+	}
+
+	// ---- Packages -----------------------------------------------------------------------------
+
+	private readonly Dictionary<string, string> _packageStatus = new(StringComparer.OrdinalIgnoreCase);
+	private readonly HashSet<string>            _packageFailed = new(StringComparer.OrdinalIgnoreCase);
+	private readonly List<FileSystemWatcher>    _watchers = new();
+	private bool                                _installingPackages;
+
+	// Installs every new .pkg in the game folders, one at a time, as soon as it has finished copying.
+	private async void InstallPendingPackages()
+	{
+		if (_installingPackages) return;
+		_installingPackages = true;
+		try
+		{
+			while (_games.FirstOrDefault(g => g.Package is { } p && !_packageFailed.Contains(p)) is { Package: { } package } game)
+			{
+				SetPackageStatus(package, "Esperando a que termine de copiarse…");
+				if (!await Packages.WaitUntilStableAsync(package, CancellationToken.None))
+				{
+					_packageFailed.Add(package);
+					continue;
+				}
+				ShowToast($"Instalando {game.Name}…");
+				try
+				{
+					var progress = new Progress<double>(p => SetPackageStatus(package, $"Instalando {p * 100:0} %"));
+					await Task.Run(() => Packages.InstallAsync(package, progress, CancellationToken.None));
+					_packageStatus.Remove(package);
+					Reload();
+					ShowToast($"{game.Name} está listo para jugar");
+				}
+				catch (Exception e) when (e is IOException or InvalidDataException or InvalidOperationException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
+				{
+					try { Packages.CleanUp(package); } catch (IOException) { }
+					_packageFailed.Add(package);
+					SetPackageStatus(package, "No se pudo instalar: " + e.Message);
+					ShowToast($"No se pudo instalar {game.Name}");
+				}
+			}
+		}
+		finally
+		{
+			_installingPackages = false;
+		}
+	}
+
+	private void SetPackageStatus(string package, string status)
+	{
+		_packageStatus[package] = status;
+		var index = _games.FindIndex(g => g.Package == package);
+		if (index < 0) return;
+		if (_row.Children[index] is Border { Child: StackPanel panel } && panel.Children.LastOrDefault() is TextBlock label) label.Text = status;
+		if (index == _index) Select(_index, force: true);
+	}
+
+	private void WatchFolders(IEnumerable<string> roots)
+	{
+		if (_watchers.Count > 0) return;
+		foreach (var root in roots.Where(Directory.Exists))
+		{
+			var watcher = new FileSystemWatcher(root, "*.pkg") { IncludeSubdirectories = true, EnableRaisingEvents = true };
+			watcher.Created += (_, _) => Dispatcher.UIThread.Post(() => { if (_running is null) Reload(); });
+			watcher.Renamed += (_, _) => Dispatcher.UIThread.Post(() => { if (_running is null) Reload(); });
+			_watchers.Add(watcher);
+		}
 	}
 
 	private Game? Current => _index < _games.Count ? _games[_index] : null;
@@ -342,6 +411,18 @@ public sealed class MainWindow : Window
 		if (game is null)
 		{
 			_meta.Children.Add(Text("Elige la carpeta donde tienes tus juegos de PS5 extraídos", 22, FontWeight.Normal, Palette.Muted));
+			SetBackground(null);
+			_music.Stop();
+			return;
+		}
+		if (game.Package is { } package)
+		{
+			foreach (var button in _buttons) button.IsVisible = false;
+			if (_statsBox is not null) _statsBox.IsVisible = false;
+			_meta.Children.Add(Badge("Paquete PKG"));
+			_meta.Children.Add(Text($"{new FileInfo(package).Length / 1e9:0.0} GB", 22, FontWeight.Normal, Palette.Muted));
+			_meta.Children.Add(Text(_packageStatus.GetValueOrDefault(package, "Pendiente de instalar"), 22, FontWeight.Normal, Palette.Muted));
+			if (_packageFailed.Contains(package)) _meta.Children.Add(Text("· pulsa A para reintentar", 22, FontWeight.Normal, Palette.AuroraA));
 			SetBackground(null);
 			_music.Stop();
 			return;
@@ -491,6 +572,9 @@ public sealed class MainWindow : Window
 		}
 		switch (action)
 		{
+			case 0 when game.Package is { } package:
+				if (_packageFailed.Remove(package)) InstallPendingPackages(); // Retry after a failure.
+				break;
 			case 0: Launch(game); break;
 			case 1: ShowTab(1); break;
 			case 2: Process.Start(new ProcessStartInfo(game.Dir) { UseShellExecute = true }); break;
@@ -759,6 +843,20 @@ public sealed class MainWindow : Window
 	private Border Tile(Game game)
 	{
 		var tile = NewTile();
+		if (game.Package is { } package)
+		{
+			tile.Background = new LinearGradientBrush
+			{
+				StartPoint = Palette.P(0, 0), EndPoint = Palette.P(1, 1),
+				GradientStops = { new GradientStop(Color.Parse("#12324A"), 0), new GradientStop(Color.Parse("#2A1F5C"), 1) },
+			};
+			var panel = new StackPanel { Margin = new Thickness(14), VerticalAlignment = VerticalAlignment.Bottom, Spacing = 6 };
+			panel.Children.Add(Text("PKG", 16, FontWeight.Bold, Palette.AuroraA));
+			panel.Children.Add(new TextBlock { Text = game.Name, FontSize = 17, FontWeight = FontWeight.SemiBold, TextWrapping = TextWrapping.Wrap, MaxLines = 3, Foreground = Palette.Brush(Palette.Text) });
+			panel.Children.Add(new TextBlock { Text = _packageStatus.GetValueOrDefault(package, "Pendiente"), FontSize = 14, TextWrapping = TextWrapping.Wrap, MaxLines = 2, Foreground = Palette.Brush(Palette.Muted) });
+			tile.Child = panel;
+			return tile;
+		}
 		tile.Background = new LinearGradientBrush
 		{
 			StartPoint = Palette.P(0, 0), EndPoint = Palette.P(1, 1),

@@ -123,7 +123,7 @@ bool HostQueueExternalInput(uint64_t generation, ExternalInput input) {
 
 } // namespace Ime
 
-enum class OverlayKind : uint8_t { None, Ime, Dialog };
+enum class OverlayKind : uint8_t { None, Ime, Dialog, GameBar };
 
 struct OverlaySession {
 	OverlayKind kind       = OverlayKind::None;
@@ -238,6 +238,63 @@ bool                         g_input_lifecycle_active     = false;
 bool                         g_controller_captured        = false;
 OverlaySession               g_session;
 SDL_Window*                  g_input_window               = nullptr;
+std::mutex                   g_bar_mutex;
+GameBarState                 g_bar;
+std::atomic<Uint32>           g_bar_event {static_cast<Uint32>(-1)};
+std::string                  g_bar_title;
+bool                         g_bar_fullscreen = false;
+int                          g_bar_window_height = 720;
+void QueueInput(InputEvent event);
+
+OverlaySession GameBarSession(bool blocked) {
+	std::scoped_lock lock(g_bar_mutex);
+	g_bar.Block(blocked);
+	return g_bar.Visible() ? OverlaySession {OverlayKind::GameBar, g_bar.Session()} : OverlaySession {};
+}
+
+// SDL/guest input lives on the window thread; the presenter only consumes
+// queued ImGui events. Coordinates are normalized for high-DPI windows.
+bool ProcessGameBarInput(const SDL_Event& event) {
+	OverlaySnapshot dialog;
+	const bool blocked = GetOverlaySnapshot(&dialog) || g_input_active;
+	std::scoped_lock lock(g_bar_mutex);
+	const bool was_visible = g_bar.Visible();
+	g_bar.Block(blocked);
+	const bool escape = (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
+	                    event.key.key == SDLK_ESCAPE;
+	if (escape && event.type == SDL_EVENT_KEY_DOWN) g_bar.Escape(event.key.repeat);
+	int width = 0, height = 0;
+	SDL_GetWindowSize(g_input_window, &width, &height);
+	const bool mouse = event.type == SDL_EVENT_MOUSE_MOTION || event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+	                   event.type == SDL_EVENT_MOUSE_BUTTON_UP || event.type == SDL_EVENT_MOUSE_WHEEL;
+	if (event.type == SDL_EVENT_MOUSE_MOTION) {
+		g_bar.Pointer(event.motion.y, event.motion.x >= 0 && event.motion.x < width &&
+		                            event.motion.y >= 0 && event.motion.y < height);
+	} else if (event.type == SDL_EVENT_WINDOW_MOUSE_LEAVE) {
+		g_bar.Pointer(0, false);
+	} else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+		g_bar.Hide();
+	}
+	HostInputCaptureMouse(g_bar.Visible());
+	if (blocked) return false;
+	if (escape) return true; // Includes repeats and key-up; never a guest key.
+	if (event.type == g_bar_event.load(std::memory_order_acquire)) return true;
+	if (!mouse || (!was_visible && !g_bar.Visible())) return false;
+	if (!g_bar.Visible()) return true; // Do not pass the closing motion into the game.
+	const OverlaySession session {OverlayKind::GameBar, g_bar.Session()};
+	const auto position = [&](float x, float y) {
+		QueueInput({InputKind::MousePosition, session, 0, x / std::max(width, 1), y / std::max(height, 1)});
+	};
+	if (event.type == SDL_EVENT_MOUSE_MOTION) position(event.motion.x, event.motion.y);
+	else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
+		QueueInput({InputKind::MouseWheel, session, 0, event.wheel.x, event.wheel.y});
+	} else {
+		position(event.button.x, event.button.y);
+		QueueInput({InputKind::MouseButton, session, event.button.button,
+		            event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ? 1.0f : 0.0f, 0});
+	}
+	return true;
+}
 struct TrophyNotification {
 	std::string            name;
 	int32_t                grade;
@@ -657,9 +714,16 @@ void HideSplashScreen() {
 
 void InitializeSystemOverlayInput(SDL_Window* window) {
 	EXIT_IF(window == nullptr);
-	const Uint32 type = SDL_RegisterEvents(1);
+	const Uint32 type = SDL_RegisterEvents(2);
 	EXIT_IF(type == static_cast<Uint32>(-1));
 	g_input_window = window;
+	{
+		std::scoped_lock lock(g_bar_mutex);
+		g_bar = {};
+		Loader::SystemContentParamSfoGetString("TITLE", &g_bar_title);
+		if (g_bar_title.empty()) g_bar_title = "Nova5";
+	}
+	g_bar_event.store(type + 1, std::memory_order_release);
 	{
 		std::scoped_lock lock(g_visibility_mutex);
 		g_input_lifecycle_active = true;
@@ -672,6 +736,11 @@ void InitializeSystemOverlayInput(SDL_Window* window) {
 }
 
 void ShutdownSystemOverlayInput() {
+	{
+		std::scoped_lock lock(g_bar_mutex);
+		g_bar.Hide();
+	}
+	g_bar_event.store(static_cast<Uint32>(-1), std::memory_order_release);
 	g_splash_active.store(false, std::memory_order_release);
 	CoreIme::SetVisibilityCallback(nullptr);
 	DialogIme::SetVisibilityCallback(nullptr);
@@ -709,15 +778,30 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
 	const auto cursor        = GetHostInputTouchPadVisualState();
+	std::scoped_lock bar_lock(g_bar_mutex);
 	return {core.active || dialog.active || system.active || trophy_active || splash ||
-	            (cursor.enabled && cursor.cursor_visible),
+	            (cursor.enabled && cursor.cursor_visible) || g_bar.Visible(),
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
 	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision) +
-	            PerformanceOverlayRevision()};
+	            PerformanceOverlayRevision() + g_bar.Revision()};
+}
+
+GameBarAction PollGameBarAction(bool fullscreen) {
+	OverlaySnapshot dialog;
+	const bool blocked = GetOverlaySnapshot(&dialog) || g_input_active;
+	int width = 0, height = 0;
+	SDL_GetWindowSize(g_input_window, &width, &height);
+	std::scoped_lock lock(g_bar_mutex);
+	g_bar.Block(blocked);
+	g_bar_fullscreen = fullscreen;
+	g_bar_window_height = std::max(height, 1);
+	HostInputCaptureMouse(g_bar.Visible());
+	return g_bar.TakeAction();
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	RetryVisibilityWakeup();
+	if (ProcessGameBarInput(event)) return true;
 	if (event.type == g_visibility_event.load(std::memory_order_acquire)) {
 		VisibilityUpdate update {};
 		{
@@ -1131,7 +1215,7 @@ struct SystemOverlay::Impl {
 		vulkan_initialized = true;
 	}
 
-	void DrainInput(OverlaySession session) {
+	void DrainInput(OverlaySession session, vk::Extent2D frame_extent) {
 		std::deque<InputEvent> events;
 		bool                   reset = false;
 		{
@@ -1186,7 +1270,11 @@ struct SystemOverlay::Impl {
 					}
 					break;
 				}
-				case InputKind::MousePosition: io.AddMousePosEvent(event.x, event.y); break;
+				case InputKind::MousePosition:
+					if (session.kind == OverlayKind::GameBar)
+						io.AddMousePosEvent(event.x * frame_extent.width, event.y * frame_extent.height);
+					else io.AddMousePosEvent(event.x, event.y);
+					break;
 				case InputKind::MouseButton: {
 					int button = -1;
 					if (event.id == SDL_BUTTON_LEFT) button = 0;
@@ -1793,11 +1881,87 @@ struct SystemOverlay::Impl {
 		draw->PopClipRect();
 	}
 
+	float DrawGameBar(vk::Extent2D frame_extent, OverlaySession prepared) {
+		OverlaySnapshot dialog;
+		const bool blocked = GetOverlaySnapshot(&dialog);
+		std::scoped_lock lock(g_bar_mutex);
+		g_bar.Block(blocked);
+		if (!g_bar.Visible() || prepared != OverlaySession {OverlayKind::GameBar, g_bar.Session()}) return 0.0f;
+		const float width = static_cast<float>(frame_extent.width);
+		const float dpi = static_cast<float>(frame_extent.height) / g_bar_window_height;
+		const float scale = std::min(dpi, width / 420.0f);
+		const float height = GameBarState::Height * dpi;
+		const float pad = 14.0f * scale, gap = 10.0f * scale;
+		const float button_height = 36.0f * scale;
+		const ImVec4 text(244 / 255.0f, 246 / 255.0f, 1.0f, 1.0f);
+		const ImVec4 accent(94 / 255.0f, 234 / 255.0f, 212 / 255.0f, 1.0f);
+		const ImVec4 red(229 / 255.0f, 72 / 255.0f, 77 / 255.0f, 1.0f);
+		ImGui::SetNextWindowPos({0, 0});
+		ImGui::SetNextWindowSize({width, height});
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {pad, (height - button_height) * 0.5f});
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f * scale);
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(13 / 255.0f, 18 / 255.0f, 48 / 255.0f, 0.97f));
+		ImGui::PushStyleColor(ImGuiCol_Text, text);
+		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.10f, 0.20f, 0.27f, 1));
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.36f, 0.40f, 1));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.12f, 0.29f, 0.32f, 1));
+		ImGui::PushFont(nullptr, 18.0f * scale);
+		ImGui::Begin("##Nova5GameBar", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+		             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
+		ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
+		const bool confirming = g_bar.ConfirmingExit();
+		const char* fullscreen = g_bar_fullscreen ? "Ventana" : "Pantalla completa";
+		const float first_width = ImGui::CalcTextSize(confirming ? "¿Salir?" : fullscreen).x + 24 * scale;
+		const float exit_width = ImGui::CalcTextSize(confirming ? "Sí" : "Salir del juego").x + 24 * scale;
+		const float no_width = confirming ? ImGui::CalcTextSize("No").x + 24 * scale + gap : 0;
+		const float right = width - pad - first_width - gap - exit_width - no_width;
+		ImGui::PushClipRect({pad, 0}, {std::max(right - gap, pad), height}, true);
+		ImGui::SetCursorPos({pad, (height - ImGui::GetFontSize()) * 0.5f});
+		ImGui::TextUnformatted(g_bar_title.c_str());
+		ImGui::PopClipRect();
+		ImGui::SetCursorPos({right, (height - button_height) * 0.5f});
+		bool wake = false;
+		if (confirming) {
+			ImGui::AlignTextToFramePadding();
+			ImGui::TextUnformatted("¿Salir?");
+		} else if (ImGui::Button(fullscreen, {first_width, button_height})) {
+			g_bar.Fullscreen(); wake = true;
+		}
+		ImGui::SetCursorPos({right + first_width + gap, (height - button_height) * 0.5f});
+		ImGui::PushStyleColor(ImGuiCol_Button, red);
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.98f, 0.36f, 0.38f, 1));
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.72f, 0.18f, 0.20f, 1));
+		if (ImGui::Button(confirming ? "Sí" : "Salir del juego", {exit_width, button_height})) {
+			if (confirming) { g_bar.ConfirmExit(); wake = true; }
+			else g_bar.RequestExit();
+		}
+		ImGui::PopStyleColor(3);
+		if (confirming) {
+			ImGui::SetCursorPos({right + first_width + gap + exit_width + gap, (height - button_height) * 0.5f});
+			if (ImGui::Button("No", {no_width - gap, button_height})) g_bar.CancelExit();
+		}
+		ImGui::GetWindowDrawList()->AddLine({0, height - 1}, {width, height - 1}, ImGui::ColorConvertFloat4ToU32(accent));
+		ImGui::End();
+		ImGui::PopFont();
+		ImGui::PopStyleColor(5);
+		ImGui::PopStyleVar(4);
+		if (wake) {
+			SDL_Event event {};
+			event.type = g_bar_event.load(std::memory_order_acquire);
+			SDL_PushEvent(&event); // PollGameBarAction also retries without a wakeup.
+		}
+		return height;
+	}
+
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
 		OverlaySnapshot snapshot;
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
+		const auto bar_session = GameBarSession(has_overlay);
+		if (!has_overlay) snapshot.session = bar_session;
 		const auto now = Clock::now();
-		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire) &&
+		if (!has_overlay && bar_session.kind == OverlayKind::None && !g_trophy_notification_active.load(std::memory_order_acquire) &&
 		    !g_splash_active.load(std::memory_order_acquire) &&
 		    !GetHostInputTouchPadVisualState().enabled && !PerformanceOverlayEnabled()) {
 			return false;
@@ -1817,7 +1981,7 @@ struct SystemOverlay::Impl {
 			io.ClearInputKeys();
 			io.ClearInputMouse();
 		}
-		DrainInput(snapshot.session);
+		DrainInput(snapshot.session, frame_extent);
 
 		auto& io       = ImGui::GetIO();
 		io.DisplaySize = {static_cast<float>(frame_extent.width),
@@ -1839,8 +2003,9 @@ struct SystemOverlay::Impl {
 				DrawIme(snapshot.ime, frame_extent);
 			}
 		}
-		DrawTrophyNotification(frame_extent, now, performance_bottom);
-		DrawTouchPadCursor(GetHostInputTouchPadVisualState());
+		if (bar_session.kind == OverlayKind::None) DrawTouchPadCursor(GetHostInputTouchPadVisualState());
+		const float bar_bottom = DrawGameBar(frame_extent, prepared_session);
+		DrawTrophyNotification(frame_extent, now, std::max(performance_bottom, bar_bottom));
 		ImGui::Render();
 		extent = frame_extent;
 		return true;

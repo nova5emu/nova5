@@ -22,6 +22,7 @@ enum class Stage {
 	BindingsOverlap, BindingsImageHeap, BindingsTransitions, BindingsBuild, BindingsEmit,
 	DrawHeapBegin, DrawPrograms, ProgramKeyLookup, DrawResolveTargets, TargetFindImage,
 	PrepareImages, PrepareSamplers, PrepareShaderData,
+	ImageDescBuild, ImageFind, ImageBind, ImageValidate, ImageDescObserve,
 	Count
 };
 inline constexpr std::array Names {
@@ -32,7 +33,8 @@ inline constexpr std::array Names {
 	"prepare_graphics_bindings", "reset_bindings", "bindings_overlap", "bindings_image_heap",
 	"bindings_transitions", "bindings_build", "bindings_emit",
 	"draw_heap_begin", "draw_programs", "program_key_lookup", "draw_resolve_targets", "target_find_image",
-	"prepare_images", "prepare_samplers", "prepare_shader_data"
+	"prepare_images", "prepare_samplers", "prepare_shader_data",
+	"image_desc_build", "image_find", "image_bind", "image_validate", "image_desc_observe"
 };
 static_assert(Names.size() == static_cast<size_t>(Stage::Count));
 struct Totals { uint64_t calls = 0, inclusive_ns = 0, exclusive_ns = 0; };
@@ -131,8 +133,8 @@ inline void Report(State& state, uint64_t now) {
 
 class Scope {
 public:
-	explicit Scope(Stage stage): m_frame {stage, 0} {
-		if (!Detail::Enabled()) return;
+	explicit Scope(Stage stage, bool enabled = true): m_frame {stage, 0} {
+		if (!enabled || !Detail::Enabled()) return;
 		m_state = &Detail::state;
 		m_frame.start = Detail::Now();
 		if (m_state->window_start == 0) {

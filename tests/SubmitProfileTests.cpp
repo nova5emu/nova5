@@ -139,9 +139,10 @@ void TestReadFaultAttribution() {
 }
 
 int main(int argc, char** argv) {
+	const bool image_desc = argc > 1 && std::string_view(argv[1]) == "--experiment-image-desc-reuse";
 	const bool release_mem = argc > 1 && std::string_view(argv[1]) == "--experiment-release";
 	const bool retired = argc > 1 && std::string_view(argv[1]) == "--experiment-retired";
-	const auto* experiment = release_mem ? "release-mem" : retired ? (argc > 2 ? argv[2] : "overlap-fast") : "";
+	const auto* experiment = image_desc ? "image-desc-reuse" : release_mem ? "release-mem" : retired ? (argc > 2 ? argv[2] : "overlap-fast") : "";
 #if defined(_WIN32)
 	_putenv_s("KYTY_EXPERIMENT", experiment);
 #else
@@ -149,16 +150,19 @@ int main(int argc, char** argv) {
 #endif
 	Check(ParseExperiment("") == Experiment::None && ParseExperiment("typo") == Experiment::None);
 	Check(ParseExperiment("release-mem") == Experiment::ReleaseMem);
+	Check(ParseExperiment("image-desc-reuse") == Experiment::ImageDescReuse);
 	// Old helpers may keep these names. None may activate RELEASE_MEM or
 	// disable the promoted clean reads when experiment.trigger is toggled.
 	for (const auto name: {"overlap-fast", "read-fault-clean", "attrib-clean-read", "srt-clean-read"})
 		Check(ParseExperiment(name) == Experiment::None);
-	Check(std::string_view(ExperimentName()) == (release_mem ? "release-mem" : "none"));
+	Check(std::string_view(ExperimentName()) == (image_desc ? "image-desc-reuse" : release_mem ? "release-mem" : "none"));
 	SetExperiment(true);
 	Check(ExperimentActive(Experiment::ReleaseMem) == release_mem);
+	Check(ExperimentActive(Experiment::ImageDescReuse) == image_desc);
 	Check(!ExperimentActive(Experiment::None));
 	SetExperiment(false);
 	Check(!ExperimentActive(Experiment::ReleaseMem));
+	Check(!ExperimentActive(Experiment::ImageDescReuse));
 	const bool armed = Armed();
 	// Disarmed builds never record and scopes leave thread-local state untouched.
 	SetRecording(true);
@@ -401,5 +405,16 @@ int main(int argc, char** argv) {
 	RecordSubmit(1);
 	RecordIdleWait(NowNs(), NowNs() + 1, true, 1);
 	Check(w.submits[0] == 0 && w.idle_waits == 0);
+	AddExtra(Extra::ImageDescReuseHits);
+	Check(Detail::window.extra[static_cast<size_t>(Extra::ImageDescReuseHits)] == 0);
+	SetRecording(true);
+	AddExtra(Extra::ImageDescReuseHits, 7);
+	AddExtra(Extra::ImageDescReuseMisses, 2);
+	AddExtra(Extra::ImageDescHistoryCapacityResets);
+	const auto image_report = Capture(false);
+	Check(Contains(image_report, "\"image_desc_reuse_hits\":7") &&
+	      Contains(image_report, "\"image_desc_reuse_misses\":2") &&
+	      Contains(image_report, "\"image_desc_history_capacity_resets\":1"));
+	Reset();
 	std::puts("SubmitProfileTests: all cases passed");
 }

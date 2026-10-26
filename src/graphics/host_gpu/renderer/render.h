@@ -4,12 +4,14 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/submitProfile.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -167,7 +169,10 @@ public:
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	                                            const ShaderRecompiler::IR::DescriptorValue& value,
+	                                            bool profile_prepare = false,
+	                                            uint64_t description_program = 0,
+	                                            uint32_t description_resource = 0);
 
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
@@ -217,6 +222,8 @@ private:
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	BindingOverlapWrites                 m_binding_overlap_writes;
+	// Allocated only by the image-desc-reuse experiment; owned by this GPU executor.
+	std::unique_ptr<ImageDescriptionCache> m_image_descriptions;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 

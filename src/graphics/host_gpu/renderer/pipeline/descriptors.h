@@ -14,6 +14,7 @@
 #include <cstring>
 #include <span>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -26,6 +27,59 @@ struct TextureBinding {
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+};
+
+// Descriptor-derived data only, captured BEFORE FindImage adjusts the view.
+// No ImageId, residency, memory contents or mutable image state is retained.
+struct BuiltImageDescription {
+	TextureCache::ImageDesc desc;
+	bool shader_conversion = false;
+	vk::Format pixel_format = vk::Format::eUndefined;
+	vk::Format view_format = vk::Format::eUndefined;
+};
+
+// CPU-only construction for non-null, non-heap descriptors (also used by tests).
+[[nodiscard]] BuiltImageDescription BuildTextureDescription(
+    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor);
+
+class ImageDescriptionCache {
+public:
+	static constexpr size_t MaxEntries = 4096;
+	using Words = std::array<uint32_t, 8>;
+	[[nodiscard]] const BuiltImageDescription* Find(uint64_t program, uint32_t resource,
+	                                               const Words& words) const {
+		const auto it = m_last.find({program, resource});
+		return it != m_last.end() && it->second.words == words ? &it->second.built : nullptr;
+	}
+	// One last descriptor per immutable program/resource, bounded per executor.
+	// Returns true only when a new pair exhausted the bound.
+	bool Store(uint64_t program, uint32_t resource, const Words& words,
+	           const BuiltImageDescription& built) {
+		const Key key {program, resource};
+		if (auto it = m_last.find(key); it != m_last.end()) {
+			it->second = {words, built};
+			return false;
+		}
+		const bool reset = m_last.size() == MaxEntries;
+		if (reset) Clear();
+		m_last.emplace(key, Entry {words, built});
+		return reset;
+	}
+	void Clear() { m_last.clear(); }
+	[[nodiscard]] size_t Size() const { return m_last.size(); }
+private:
+	struct Key {
+		uint64_t program;
+		uint32_t resource;
+		bool operator==(const Key&) const = default;
+	};
+	struct Hash {
+		size_t operator()(const Key& key) const {
+			return static_cast<size_t>((key.program * 0x9e3779b97f4a7c15ull) ^ key.resource);
+		}
+	};
+	struct Entry { Words words; BuiltImageDescription built; };
+	std::unordered_map<Key, Entry, Hash> m_last;
 };
 
 struct PreparedBindings {

@@ -47,9 +47,21 @@ foreach ($dir in Get-ChildItem (Join-Path $repo '3rdparty') -Directory) {
 }
 Copy-Item (Join-Path $PSScriptRoot 'LEEME.txt') $stage
 
+# PKG installer: pkg-to-anyps5 (GPL-3.0, https://github.com/awake-devel/pkg-to-anyps5), run by the launcher.
+$extractor = Join-Path $repo '..\herramientas\pkg-extractor\pkg-to-anyps5-v0.2.5-windows-x86_64'
+New-Item -ItemType Directory -Force (Join-Path $stage 'tools') | Out-Null
+Copy-Item (Join-Path $extractor 'pkg-to-anyps5.exe') (Join-Path $stage 'tools')
+Copy-Item (Join-Path $extractor 'LICENSE') (Join-Path $licenses 'pkg-to-anyps5-LICENSE.txt')
+Copy-Item (Join-Path $extractor 'README.md') (Join-Path $licenses 'pkg-to-anyps5-README.md')
+
 $iscc = @("$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe", 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe') |
     Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $iscc) { throw 'Inno Setup 6 not found (winget install JRSoftware.InnoSetup)' }
 & $iscc /Q "/DStage=$stage" "/DOutput=$package" "/DAppVersion=$version" (Join-Path $PSScriptRoot 'Nova5.iss')
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
-Get-Item (Join-Path $package 'Nova5-Setup.exe')
+
+# Portable copy of the same files, for launchers that unpack emulators themselves (Nexo).
+$portable = Join-Path $package 'Nova5-Portable.zip'
+if (Test-Path $portable) { Remove-Item $portable }
+Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $portable -CompressionLevel Optimal
+Get-Item (Join-Path $package 'Nova5-Setup.exe'), $portable

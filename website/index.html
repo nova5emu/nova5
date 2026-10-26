@@ -54,7 +54,7 @@
         </a>
         <a class="btn ghost" data-source href="#">Ver el código fuente</a>
       </div>
-      <p class="fine">Versión <span data-version>0.2.0</span> · Windows 10/11 de 64 bits · 52 MB · Proyecto experimental</p>
+      <p class="fine">Versión <span data-version>0.3.0</span> · Windows 10/11 de 64 bits · 52 MB · Proyecto experimental</p>
     </div>
 
     <figure class="screen" aria-label="Vista del lanzador de Nova5">
@@ -105,13 +105,20 @@
 
   <section id="compatibilidad" class="section">
     <h2>Compatibilidad</h2>
-    <p class="section-lead">La emulación de PS5 está empezando. Esto es lo que hemos comprobado nosotros, en un PC con gráfica NVIDIA y procesador Intel.</p>
-    <div class="table" role="table" aria-label="Juegos probados">
-      <div class="row head" role="row"><span role="columnheader">Juego</span><span role="columnheader">Estado</span><span role="columnheader">Notas</span></div>
-      <div class="row" role="row"><span role="cell">Astro Bot</span><span role="cell"><b class="tag ok">En juego</b></span><span role="cell">Jugable a unos 10 FPS. Llega a los niveles y se puede caminar y volar.</span></div>
-      <div class="row" role="row"><span role="cell">Marvel's Wolverine</span><span role="cell"><b class="tag mid">Arranca</b></span><span role="cell">Ya no se cierra al iniciar; compila shaders. Pendiente de pruebas.</span></div>
+    <p class="section-lead">Nova5 usa el núcleo de KytyPS5 con mejoras propias, así que los juegos que funcionan allí deberían ir igual o mejor aquí. La lista se carga en directo desde los informes de la comunidad de KytyPS5; los marcados <b class="tag nova">Probado en Nova5</b> los hemos comprobado nosotros.</p>
+    <div class="compat-stats" id="compat-stats" aria-live="polite">
+      <button class="stat-chip on" data-filter="all"><b data-count="all">—</b><span>Probados</span></button>
+      <button class="stat-chip" data-filter="in-game"><b data-count="in-game">—</b><span>En juego</span></button>
+      <button class="stat-chip" data-filter="main-menu"><b data-count="main-menu">—</b><span>Menú</span></button>
+      <button class="stat-chip" data-filter="logo"><b data-count="logo">—</b><span>Logo</span></button>
+      <button class="stat-chip" data-filter="doesnt-boot"><b data-count="doesnt-boot">—</b><span>No arranca</span></button>
     </div>
-    <p class="fine">El rendimiento depende mucho del procesador y la tarjeta gráfica. Probamos cada mejora activándola y desactivándola en la misma partida.</p>
+    <label class="compat-search"><span class="sr-only">Buscar juego</span>
+      <input id="compat-search" type="search" placeholder="Buscar por nombre o código (PPSA…)" autocomplete="off">
+    </label>
+    <div class="compat-grid" id="compat-grid"><p class="fine">Cargando la lista de compatibilidad…</p></div>
+    <div class="compat-more"><button class="btn small" id="compat-more" hidden>Ver más juegos</button></div>
+    <p class="fine">Datos: <a href="https://kytyps5.github.io/compatibility">informes de la comunidad KytyPS5</a> (GPL-2.0). "En juego" no garantiza que todo el juego sea jugable; el rendimiento depende mucho del procesador y la tarjeta gráfica.</p>
   </section>
 
   <section id="empezar" class="section">
@@ -156,10 +163,11 @@
   <p>Nova5 no está afiliado, respaldado ni patrocinado por Sony Interactive Entertainment. "PlayStation" y "PS5" son marcas de sus respectivos dueños.</p>
 </footer>
 
+<script src="compat.js" defer></script>
 <script>
   // Release and repository links; the version must match the latest GitHub release.
   const NOVA5 = {
-    version: '0.2.0',
+    version: '0.3.0',
     download: 'https://github.com/nova5emu/nova5/releases/latest/download/Nova5-Setup.exe',
     source: 'https://github.com/nova5emu/nova5',
   };

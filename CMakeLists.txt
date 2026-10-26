@@ -686,6 +686,9 @@ if(BUILD_TESTING)
 	set_tests_properties(submit_profile_enabled PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
 	add_test(NAME submit_profile_experiment_release
 	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-release)
+	add_test(NAME submit_profile_experiment_image_desc_reuse
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-image-desc-reuse)
+	set_tests_properties(submit_profile_experiment_image_desc_reuse PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
 	add_test(NAME submit_profile_experiment_retired
 	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired)
 	add_test(NAME submit_profile_retired_read_fault_clean
@@ -729,6 +732,10 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME binding_overlap
 	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --binding-overlap-only)
+	add_test(NAME image_desc_reuse
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-desc-reuse-only)
+	add_test(NAME image_desc_reuse_live
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-desc-reuse-gpu-only)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_float_min_max

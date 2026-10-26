@@ -43,6 +43,29 @@ int main() {
 	Check(Detail::state.totals[1].calls == (enabled ? 1u : 0u));
 	Check(Detail::state.plans.calls == (enabled ? 20u : 19u));
 	Check(Detail::state.plans.reads == (enabled ? 2u : 0u));
+	// These sub-stages are restricted to PrepareBindings, not heap/rebind callers.
+	{
+		Scope disabled {Stage::ImageDescBuild, false};
+		Check(Detail::state.active == nullptr);
+	}
+	Check(Detail::state.totals[static_cast<size_t>(Stage::ImageDescBuild)].calls == 0);
+	State images;
+	Frame prepare {Stage::PrepareImages, 0}, build {Stage::ImageDescBuild, 10};
+	Frame validate {Stage::ImageValidate, 20}, find {Stage::ImageFind, 55};
+	Frame observe {Stage::ImageDescObserve, 80}, bind {Stage::ImageBind, 90};
+	Detail::Begin(images, prepare);
+	Detail::Begin(images, build);
+	Detail::Begin(images, validate); Detail::End(images, validate, 30);
+	Detail::End(images, build, 50);
+	Detail::Begin(images, find); Detail::End(images, find, 80);
+	Detail::Begin(images, observe); Detail::End(images, observe, 90);
+	Detail::Begin(images, bind); Detail::End(images, bind, 95);
+	Detail::End(images, prepare, 100);
+	Check(images.totals[static_cast<size_t>(Stage::ImageDescBuild)].exclusive_ns == 30);
+	Check(images.totals[static_cast<size_t>(Stage::ImageFind)].exclusive_ns == 25);
+	sum = 0;
+	for (const auto& t: images.totals) sum += t.exclusive_ns;
+	Check(sum == 100 && images.active == nullptr);
 	// Deterministic output sample also checks reset and the bounded log budget.
 	s.window_start = 1;
 	s.thread = 999;
