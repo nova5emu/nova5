@@ -1,13 +1,16 @@
+#include "common/stallDump.h"
 #include "kernel/eventQueue.h"
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/frameTimeline.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "kernel/pthread.h"
 
 #include <algorithm>
 #include <chrono>
@@ -251,6 +254,9 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
 			event.triggered = true;
 		}
 
+		Common::FrameTimeline::Current(Common::FrameTimeline::Kind::EventTrigger, 0,
+		    static_cast<uint64_t>(m_handle), ident, static_cast<uint64_t>(static_cast<int64_t>(filter)),
+		    static_cast<uint64_t>(event.pending_events.empty() ? event.event.data : event.pending_events.back().data));
 		m_cond_var.Signal();
 
 		return OK;
@@ -396,6 +402,7 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo) {
+	Common::StallDump::Scope stall_wait(__func__, static_cast<uintptr_t>(eq), true);
 	PRINT_NAME();
 
 	auto owner = KernelPinEqueue(eq);
@@ -412,6 +419,14 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	}
 
 	EXIT_NOT_IMPLEMENTED(out == nullptr);
+	if (Common::FrameTimeline::Recording()) {
+		if (Common::FrameTimeline::NeedsName()) {
+			char name[32] {};
+			if (PthreadGetname(PthreadSelfOrNull(), name) == OK) Common::FrameTimeline::Name(name);
+		}
+		Common::FrameTimeline::Event(Common::FrameTimeline::Kind::EqueueBegin, 0, 0, 0,
+		    static_cast<uint64_t>(eq), timo ? *timo : UINT64_MAX, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	}
 
 	LOGF("\tEqueue wait: %s, caller = 0x%016" PRIx64 ", eq = 0x%016" PRIx64 ", ev = 0x%016" PRIx64
 	     ", num = %d, timo = %s, thread_id = %d\n",
@@ -432,6 +447,15 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 		}
 	}
 
+	Common::FrameTimeline::Event(Common::FrameTimeline::Kind::EqueueEnd, 0, 0, 0,
+	    static_cast<uint64_t>(eq), static_cast<uint64_t>(*out));
+	if (Common::FrameTimeline::Recording() && *out > 0) {
+		for (int i = 0; i < std::min(*out, num); ++i) {
+			Common::FrameTimeline::Event(Common::FrameTimeline::Kind::EqueueEvent, 0, 0, 0,
+			    static_cast<uint64_t>(eq), ev[i].ident, static_cast<uint64_t>(static_cast<int64_t>(ev[i].filter)),
+			    static_cast<uint64_t>(ev[i].data));
+		}
+	}
 	if (*out == KERNEL_ERROR_EBADF) {
 		return KERNEL_ERROR_EBADF;
 	}
@@ -486,6 +510,7 @@ int KYTY_SYSV_ABI KernelAddUserEventEdge(KernelEqueue eq, int id) {
 }
 
 int KYTY_SYSV_ABI KernelTriggerUserEvent(KernelEqueue eq, int id, void* udata) {
+	Common::StallDump::Scope stall_signal(__func__, static_cast<uintptr_t>(eq));
 	PRINT_NAME();
 
 	LOGF("\t user event trigger: eq = 0x%016" PRIx64 ", id = %d, udata = 0x%016" PRIx64 "\n",

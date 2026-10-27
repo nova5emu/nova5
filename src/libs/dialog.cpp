@@ -1,3 +1,4 @@
+#define KYTY_STALL_HLE
 #include "libs/dialog.h"
 
 #include "common/emulatorConfig.h"
@@ -221,12 +222,16 @@ int KYTY_SYSV_ABI LoginDialogUpdateStatus() {
 		g_login_status = LOGIN_STATUS_FINISHED;
 	}
 
+	Common::StallDump::Note(__func__, 0, g_login_status);
+	Common::StallDump::Observe(__func__, 0, g_login_status);
 	return g_login_status;
 }
 
 int KYTY_SYSV_ABI LoginDialogGetStatus() {
 	PRINT_NAME();
 
+	Common::StallDump::Note(__func__, 0, g_login_status);
+	Common::StallDump::Observe(__func__, 0, g_login_status);
 	return g_login_status;
 }
 
@@ -354,12 +359,16 @@ int KYTY_SYSV_ABI SigninDialogClose() {
 int KYTY_SYSV_ABI SigninDialogUpdateStatus() {
 	PRINT_NAME();
 	std::scoped_lock lock(g_dialog_mutex);
+	Common::StallDump::Note(__func__, 0, g_signin.status);
+	Common::StallDump::Observe(__func__, 0, g_signin.status);
 	return g_signin.status;
 }
 
 int KYTY_SYSV_ABI SigninDialogGetStatus() {
 	PRINT_NAME();
 	std::scoped_lock lock(g_dialog_mutex);
+	Common::StallDump::Note(__func__, 0, g_signin.status);
+	Common::StallDump::Observe(__func__, 0, g_signin.status);
 	return g_signin.status;
 }
 
@@ -458,6 +467,8 @@ int KYTY_SYSV_ABI SaveDataDialogInitialize() {
 int KYTY_SYSV_ABI SaveDataDialogGetStatus() {
 	PRINT_NAME();
 
+	Common::StallDump::Note(__func__, 0, g_save_status);
+	Common::StallDump::Observe(__func__, 0, g_save_status);
 	return g_save_status;
 }
 
@@ -472,6 +483,8 @@ int KYTY_SYSV_ABI SaveDataDialogUpdateStatus() {
 		g_save_running_polled = true;
 	}
 
+	Common::StallDump::Note(__func__, 0, g_save_status);
+	Common::StallDump::Observe(__func__, 0, g_save_status);
 	return g_save_status;
 }
 
@@ -651,12 +664,16 @@ int KYTY_SYSV_ABI MsgDialogOpen(const void* param) {
 int KYTY_SYSV_ABI MsgDialogUpdateStatus() {
 	PRINT_NAME();
 
+	Common::StallDump::Note(__func__, 0, g_status);
+	Common::StallDump::Observe(__func__, 0, g_status);
 	return g_status;
 }
 
 int KYTY_SYSV_ABI MsgDialogGetStatus() {
 	PRINT_NAME();
 
+	Common::StallDump::Note(__func__, 0, g_status);
+	Common::StallDump::Observe(__func__, 0, g_status);
 	return g_status;
 }
 
@@ -815,6 +832,8 @@ int KYTY_SYSV_ABI ErrorDialogUpdateStatus() {
 	PRINT_NAME();
 
 	std::scoped_lock lock(g_dialog_mutex);
+	Common::StallDump::Note(__func__, 0, g_error.status);
+	Common::StallDump::Observe(__func__, 0, g_error.status);
 	return g_error.status;
 }
 
@@ -822,6 +841,8 @@ int KYTY_SYSV_ABI ErrorDialogGetStatus() {
 	PRINT_NAME();
 
 	std::scoped_lock lock(g_dialog_mutex);
+	Common::StallDump::Note(__func__, 0, g_error.status);
+	Common::StallDump::Observe(__func__, 0, g_error.status);
 	return g_error.status;
 }
 

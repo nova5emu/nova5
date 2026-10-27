@@ -19,6 +19,8 @@ public:
 	KYTY_CLASS_NO_COPY(PageManager);
 
 	[[nodiscard]] uint64_t GetPageSize() const;
+	// Called under the buffer region lock; exclude its own write watcher.
+	bool HasForeignWatchers(uint64_t base, size_t first, size_t last, const RegionBits& buffer_writable);
 
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);

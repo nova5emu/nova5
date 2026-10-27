@@ -94,6 +94,10 @@ struct DynamicState {
 
 	/// Commits the dynamic state to the provided command buffer.
 	void Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf);
+	// Same dirty-state transition after a deep-copied packet has been accepted;
+	// no Vulkan calls. Shares Commit's conditions rather than clearing all bits.
+	void Acknowledge(const GraphicContext& graphics);
+	template <bool Emit> void CommitImpl(const GraphicContext& graphics, vk::CommandBuffer cmdbuf);
 
 	/// Invalidates all dynamic state to be flushed into the next command buffer.
 	void Invalidate() { std::memset(&dirty_state, 0xFF, sizeof(dirty_state)); }

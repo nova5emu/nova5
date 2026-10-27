@@ -140,6 +140,7 @@ details p { color: var(--muted); margin: 0 0 20px; }
 .tag.menu { color: #93c5fd; background: rgba(147, 197, 253, .1); border: 1px solid rgba(147, 197, 253, .4); }
 .tag.bad { color: #fca5a5; background: rgba(252, 165, 165, .08); border: 1px solid rgba(252, 165, 165, .35); }
 .tag.nova { color: #081022; background: var(--aurora); border: none; font-weight: 600; }
+.tag.full { color: #081022; background: #5eead4; border: none; font-weight: 700; }
 .compat-stats { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
 .stat-chip { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 120px; padding: 14px 18px; border-radius: 16px; cursor: pointer;
   font: inherit; color: var(--text); background: var(--ink); border: 1px solid var(--line); text-align: left; }

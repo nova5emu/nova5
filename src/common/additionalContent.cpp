@@ -1,4 +1,5 @@
 #include "common/additionalContent.h"
+#include "common/hostPath.h"
 
 #include "common/stringUtils.h"
 
@@ -57,16 +58,16 @@ std::vector<AddContentEntry> FindAddContent(const std::filesystem::path& dir,
 		const auto current = std::move(pending.back());
 		pending.pop_back();
 		std::filesystem::directory_iterator it(
-		    current, std::filesystem::directory_options::skip_permission_denied, ec);
+		    NativeHostPath(current), std::filesystem::directory_options::skip_permission_denied, ec);
 		const std::filesystem::directory_iterator end;
 		for (; !ec && it != end; it.increment(ec)) {
 			std::error_code entry_ec;
 			if (it->is_directory(entry_ec) && !it->is_symlink(entry_ec) && !entry_ec) {
-				pending.push_back(it->path());
+				pending.push_back(current / it->path().filename());
 			} else if (it->is_regular_file(entry_ec) && !entry_ec &&
 			           EqualNoCase(PathToString(it->path().filename()), "param.json") &&
 			           EqualNoCase(PathToString(it->path().parent_path().filename()), "sce_sys")) {
-				params.push_back(it->path());
+				params.push_back(current / it->path().filename());
 			}
 		}
 	}
@@ -76,11 +77,11 @@ std::vector<AddContentEntry> FindAddContent(const std::filesystem::path& dir,
 	    "^[A-Z]{2}[0-9]{4}-[A-Z]{4}[0-9]{5}_[0-9]{2}-[A-Z0-9]{16}$");
 	std::map<std::string, AddContentEntry> by_label;
 	for (const auto& file: params) {
-		const auto size = std::filesystem::file_size(file, ec);
+		const auto size = std::filesystem::file_size(NativeHostPath(file), ec);
 		if (ec || size > 1024 * 1024) {
 			continue;
 		}
-		std::ifstream stream(file, std::ios::binary);
+		std::ifstream stream(NativeHostPath(file), std::ios::binary);
 		if (!stream) {
 			continue;
 		}
@@ -121,7 +122,7 @@ std::optional<AddContentEntry> ParseAddContent(std::string_view value) {
 	if (eq != std::string_view::npos) {
 		entry.mount_dir = PathFromUtf8(FixFilenameSlash(value.substr(eq + 1)));
 		std::error_code ec;
-		if (!std::filesystem::is_directory(entry.mount_dir, ec)) {
+		if (!std::filesystem::is_directory(NativeHostPath(entry.mount_dir), ec)) {
 			return std::nullopt;
 		}
 	}

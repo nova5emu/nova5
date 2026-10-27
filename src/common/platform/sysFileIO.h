@@ -46,6 +46,7 @@ bool        SysFileUnlink(sys_file_t&                  f,
                           const std::filesystem::path& name); // NOLINT(google-runtime-references)
 uint64_t    SysFileSize(const std::filesystem::path& file_name);
 bool        SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size);
+bool        SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size, std::error_code* error);
 bool        SysFileIsError(sys_file_t& f); // NOLINT(google-runtime-references)
 bool        SysFileIsDirectoryExisting(const std::filesystem::path& path);
 bool        SysFileIsFileExisting(const std::filesystem::path& name);

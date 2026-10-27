@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/pageManager.h"
 
 #include "common/alignment.h"
+#include "common/assert.h"
+#include "common/guestCpuProfile.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -67,6 +69,7 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 class SpinGuard final {
 public:
 	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
+		Common::GuestCpuProfile::Stage acquire(Common::GuestCpuProfile::Part::PageLock);
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 #if defined(__x86_64__) || defined(_M_X64)
 			_mm_pause();
@@ -292,6 +295,18 @@ PageManager::~PageManager() = default;
 
 uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;
+}
+
+bool PageManager::HasForeignWatchers(uint64_t base, size_t first, size_t last, const RegionBits& buffer_writable) {
+	EXIT_IF(base % REGION_SIZE || first >= last || last > REGION_PAGES);
+	auto* region = m_impl->FindRegion(base);
+	if (!region) return false;
+	SpinGuard lock(region->lock);
+	for (size_t i = first; i < last; ++i) {
+		const auto& page = region->pages[i];
+		if (page.access_watchers || page.write_watchers > (buffer_writable.Get(i) ? 0u : 1u)) return true;
+	}
+	return false;
 }
 
 template <bool track>

@@ -100,7 +100,7 @@ bool DdsImage::Load(const std::filesystem::path& path) {
 	return true;
 }
 
-void DdsImage::Upload(vk::CommandBuffer command) {
+void DdsImage::Upload(NativeCommands command) {
 	if (m_image.state.layout == vk::ImageLayout::eShaderReadOnlyOptimal) {
 		return;
 	}

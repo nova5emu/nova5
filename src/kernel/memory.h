@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_KERNEL_MEMORY_H_
 
 #include "common/abi.h"
+#include "common/guestHostImport.h"
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
@@ -131,7 +132,12 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, 
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+// Atomic publication to an aligned backed word, without entering guest page faults.
+bool                   TryCompareExchangeBacking64(uint64_t vaddr, uint64_t expected, uint64_t value);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU command lane only; maps/physical reuse drain all active leases before mutation.
+std::shared_ptr<Common::GuestHostImport::Lease> AcquireHostImport(uint64_t vaddr, uint64_t size,
+    Common::GuestHostImport::Reject* reason = nullptr);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU-thread-only, no readback or protection changes. Rejects dirty bytes and
 // requires a GPU-dirty neighbor in the same tracking page.

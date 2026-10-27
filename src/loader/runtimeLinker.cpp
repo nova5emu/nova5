@@ -61,7 +61,7 @@ namespace Loader {
 
 Program::Program() = default;
 
-Program::~Program() = default;
+Program::~Program() { Common::GuestCpuProfile::UnregisterModule(base_vaddr); }
 
 static void FreeTlsBlock(ThreadLocalStorage::Block* block) {
 	if (block == nullptr || block->ptr == nullptr) {
@@ -666,6 +666,7 @@ bool HandleGpuAccessFault(const Common::HostException::ExceptionInfo& exception_
 			case CoreAccess::Unknown: return false;
 		}
 		bool handled = false;
+		Common::GuestCpuProfile::Fault write_profile(access == GpuAccess::Write, info->access_violation_vaddr);
 		{
 			namespace Attribution = Common::ReadbackProfile;
 			std::optional<Attribution::OriginScope> reader_scope;
@@ -705,11 +706,15 @@ bool HandleGpuAccessFault(const Common::HostException::ExceptionInfo& exception_
 			}
 			if (!handled) {
 				handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+				// Learn on the originating walker thread after synchronous recovery,
+				// including delegated readbacks. Independent of diagnostic gates and
+				// temporary control fallback; clean alias service above is not a readback.
 				if (handled && walker_load) IR::NoteSrtControlReadback(info->exception_address);
 			}
 			if (handled) { profile.Handled(); read_profile.Handled(); }
 		}
 		if (handled) {
+			write_profile.Handled();
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			// Count completed tracking faults, not individual stores or unique pages.
 			// Host copies into guest memory also reach this path. No per-fault logging
@@ -753,6 +758,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		std::printf("--- Guest fault context ---\n");
 		std::printf("thread: %s\n", thread_name);
+		std::printf("guest protection: redzone=%s amd_cpu=%s (static patching; coverage is reported at load)\n",
+		            Config::RedZoneProtectionEnabled() ? "on" : "off",
+		            Config::AmdCpuEnabled() ? "on" : "off");
 		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
 		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
 		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
@@ -1287,6 +1295,8 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 	}
 
 	m_programs.push_back(program_owner.release());
+	Common::GuestCpuProfile::RegisterModule(program->base_vaddr, program->mapped_size,
+	    program->file_name.filename().string().c_str());
 
 	if (!program->elf->IsShared()) {
 		program->fail_if_global_not_resolved = false;
@@ -1896,16 +1906,18 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			totals.rdpid += result.rdpid;
 			totals.clwb += result.clwb;
 			if (protect_memory_faults) {
-				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
-				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
-				     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
-				     module_name.c_str(),
-				     result.function_count, result.red_zone_function_count,
-				     result.memory_instruction_count, result.patched_memory_instruction_count,
-				     result.short_memory_instruction_count,
-				     result.stack_dependent_memory_instruction_count,
-				     result.control_flow_memory_instruction_count,
-				     result.unrelocatable_memory_instruction_count);
+				// LOGF can be silent in normal diagnostic runs. Coverage gaps matter:
+				// --redzone is static instrumentation, not an alternate exception stack.
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "[REDZONE] module={} segment=0x{:x}+0x{:x} functions={} red_zone={} "
+				    "memory={} patched={} short={} stack_skipped={} control_skipped={} "
+				    "unrelocatable={} boundaries={}\n",
+				    module_name, segment_addr, segment_size, result.function_count,
+				    result.red_zone_function_count, result.memory_instruction_count,
+				    result.patched_memory_instruction_count, result.short_memory_instruction_count,
+				    result.stack_dependent_memory_instruction_count,
+				    result.control_flow_memory_instruction_count,
+				    result.unrelocatable_memory_instruction_count, have_function_starts));
 			}
 		}
 		if (emulate_amd && have_function_starts) {

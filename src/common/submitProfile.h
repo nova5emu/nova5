@@ -1,4 +1,6 @@
 #pragma once
+#include "common/guestCpuProfile.h"
+#include "common/guestHostImport.h"
 
 #include <algorithm>
 #include <array>
@@ -7,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -82,7 +85,7 @@ inline constexpr std::array BlockNames {"wait_reg_mem", "wait_flip", "rewind", "
 static_assert(BlockNames.size() == static_cast<size_t>(Block::Count));
 
 // Plain event counters reported under "extra".
-enum class Extra : uint8_t {
+enum class Extra : uint16_t {
 	Flips, OcclusionDumps, PredicationZpass, PredicationBool, PredicationOff, PredicationNoWait,
 	PredicationNotReady, PredicationSkipOn, PacketsSkipped, MaterializeCalls,
 	MaterializeRepeatLastForProgram, MaterializeRepeatSameFrame, MaterializeRepeatPrevFrame,
@@ -106,7 +109,55 @@ enum class Extra : uint8_t {
 	ImageDescHistoryCapacityResets, ImageDescReuseHits, ImageDescReuseMisses,
 	ImageFindHintHits, ImageFindHintMisses, ImageFindHintTooLarge,
 	IndirectMeshDraws, IndirectMeshFallbacks, IndirectMeshRangeFallbacks,
-	OverlapIntervalCommits, OverlapIntervalRanges, Count
+	OverlapIntervalCommits, OverlapIntervalRanges,
+	WalkerControlPlans, WalkerControlLearnedSites, WalkerControlFallbackPlans,
+	WalkerControlRetries, WalkerControlRecoveries,
+	IndirectIndexSamples, IndirectIndexRequested, IndirectIndexAvailable, IndirectIndexValid,
+	IndirectIndexIssued, IndirectIndexInstances, IndirectIndexZeroInstances,
+	IndirectMeshGroups, MeshGroups, IndirectIndexProfileDropped,
+	IndirectMeshSnapshots, IndirectMeshEmpty, IndirectMeshNonempty,
+	IndirectMeshZeroInstances, IndirectMeshZeroIndices,
+	GpuIndirectMeshConverts, GpuIndirectMeshConvertNs,
+	GpuIndirectMeshPrepares, GpuIndirectMeshPrepareNs,
+	GpuIndirectMeshEmits, GpuIndirectMeshEmitNs,
+	GpuIndirectPrechecks, GpuIndirectPrecheckNs, GpuIndirectDiscoveries, GpuIndirectDiscoveryNs,
+	GpuTimestampsRecorded, GpuTimestampsPublished, GpuTimestampsLate, GpuTimestampsConflict,
+	GpuTimestampsFallback, GpuTimestampsFailed, GpuTimestampBatches,
+	GpuTimestampBufferInvalidations, GpuTimestampBuffersAbsent,
+	HostImports, HostReimports, HostImportBytesAvoided, HostImportFallbackUnsupported,
+	HostImportFallbackBacking, HostImportFallbackAlignment, HostImportFallbackType,
+	HostImportFallbackAllocation, HostImportFallbackProbe, HostImportFallbackGpu, HostImportFallbackImage,
+	HostImportFallbackResource, HostImportFallbackMerge, HostImportFallbackLimit,
+	HostImportRetireMapping, HostImportRetireGate, HostImportGuardWaits, HostImportGuardNs,
+	HostCandidateOwnerSmall, HostCandidateRequestSmall, HostCandidateClean, HostCandidateWarmup,
+	HostCandidateCooldown, HostCandidateUnsupported, HostCandidateLimitCount, HostCandidateLimitSize,
+	HostCandidateLimitTotal, HostCandidateDownloads, HostCandidateGpuDirty, HostCandidateGpuHistory,
+	HostCandidateImageLive, HostCandidateImageHistory, HostCandidateResource, HostCandidateBackingBusy,
+	HostCandidateBackingUnmapped, HostCandidateBackingDiscontiguous, HostCandidateBackingAlias,
+	HostCandidateAlignment, HostCandidateType, HostCandidateAllocation, HostCandidateImported,
+	HostImportRetirements, HostImportRetireNs, HostImportRestoreBytes, HostImportReadSnapshotBytes,
+	HostImportCreateAttempts, HostImportCreateNs, HostImportDescriptorReads,
+	HostImportExclusionCalls, HostImportExclusionSamples, HostImportExclusionNs,
+	HostImportExclusionCacheHits, HostImportRetireWaits, HostImportRetireWaitNs, HostImportRetireFlushes,
+	HostImportActivations, HostImportActivationNs,
+	HostImportCandidateCalls, HostImportCandidateSamples, HostImportCandidateNs,
+	HostImportGuardRangeWaits, HostImportGuardUnknownWaits, HostImportGuardBypassed,
+	HostImportGuardDisjoint, HostImportGuardCompleted, HostImportUnknownBdaDraws,
+	HostImportGuardLaneCalls, HostImportGuardLaneNs,
+	HostImportDmaBytes, HostImportStagingBytes, HostImportCopyFallbackBytes,
+	HostImportCopyFallbackNoImport, HostImportCopyFallbackProfile,
+	HotPromotions, HotReprotected, HotFaultsObserved, HotFaultsAvoidedEstimated,
+	HotResyncBytes, HotResyncUses, HotBdaBytes, HotRetireGate, HotRetireGpu,
+	HotRetireImage, HotRetireReadback, HotRetireBudget, HotRetireAge, HotRetireMerge,
+	HotRetireMapping, HotRejectGpu, HotRejectImage, HotRejectReadback, HotFrames, HotOwnerFrames,
+	HotRejectExcluded, HotRejectMapping, HotRejectBdaBudget,
+	HotCompletedFrames, HotFrameResyncBytes, HotFrameResyncUses, HotBdaCalls,
+	HotExclusionCalls, HotExclusionVisits, HotExclusionSamples, HotExclusionNs,
+	HotHistoryPages, HotMaintenanceNs,
+	FcFaults, FcUniquePageFrames, FcRepeatPageFrames, FcRefaultAfterUpload,
+	FcExpanded, FcDirtyBytes, FcNewDirtyBytes, FcExtraDirtyUpperBytes,
+	FcUploadBytes, FcExtraUploadUpperBytes, FcRejectGpu, FcRejectImport,
+	FcRejectWatcher, FcRejectReadback, FcPromotions, FcRetired, FcFrames, FcOwnerFrames, FcStreamBytes, Count
 };
 inline constexpr std::array ExtraNames {
 	"flips", "occlusion_dumps", "predication_zpass", "predication_bool", "predication_off",
@@ -133,9 +184,58 @@ inline constexpr std::array ExtraNames {
 	"image_desc_history_capacity_resets", "image_desc_reuse_hits", "image_desc_reuse_misses",
 	"image_find_hint_hits", "image_find_hint_misses", "image_find_hint_too_large",
 	"indirect_mesh_gpu_draws", "indirect_mesh_gpu_fallbacks", "indirect_mesh_range_fallbacks",
-	"overlap_interval_commits", "overlap_interval_ranges"
+	"overlap_interval_commits", "overlap_interval_ranges",
+	"walker_control_plans", "walker_control_learned_sites", "walker_control_fallback_plans",
+	"walker_control_retries", "walker_control_recoveries",
+	"indirect_index_samples", "indirect_index_requested", "indirect_index_available", "indirect_index_valid",
+	"indirect_index_issued", "indirect_index_instances", "indirect_index_zero_instances",
+	"indirect_mesh_groups", "mesh_groups", "indirect_index_profile_dropped",
+	"indirect_mesh_snapshots", "indirect_mesh_empty", "indirect_mesh_nonempty",
+	"indirect_mesh_zero_instances", "indirect_mesh_zero_indices",
+	"gpu_indirect_mesh_converts", "gpu_indirect_mesh_convert_ns",
+	"gpu_indirect_mesh_prepares", "gpu_indirect_mesh_prepare_ns",
+	"gpu_indirect_mesh_emits", "gpu_indirect_mesh_emit_ns",
+	"gpu_indirect_prechecks", "gpu_indirect_precheck_ns", "gpu_indirect_discoveries", "gpu_indirect_discovery_ns",
+	"gpu_timestamps_recorded", "gpu_timestamps_published", "gpu_timestamps_late", "gpu_timestamps_conflict",
+	"gpu_timestamps_fallback", "gpu_timestamps_failed", "gpu_timestamp_batches",
+	"gpu_timestamp_buffer_invalidations", "gpu_timestamp_buffers_absent",
+	"host_imports", "host_reimports", "host_import_bytes_avoided", "host_import_fallback_unsupported",
+	"host_import_fallback_backing", "host_import_fallback_alignment", "host_import_fallback_type",
+	"host_import_fallback_allocation", "host_import_fallback_probe", "host_import_fallback_gpu", "host_import_fallback_image",
+	"host_import_fallback_resource", "host_import_fallback_merge", "host_import_fallback_limit",
+	"host_import_retire_mapping", "host_import_retire_gate", "host_import_guard_waits", "host_import_guard_ns",
+	"host_candidate_owner_small", "host_candidate_request_small", "host_candidate_clean", "host_candidate_warmup",
+	"host_candidate_cooldown", "host_candidate_unsupported", "host_candidate_limit_count", "host_candidate_limit_size",
+	"host_candidate_limit_total", "host_candidate_downloads", "host_candidate_gpu_dirty", "host_candidate_gpu_history",
+	"host_candidate_image_live", "host_candidate_image_history", "host_candidate_resource", "host_candidate_backing_busy",
+	"host_candidate_backing_unmapped", "host_candidate_backing_discontiguous", "host_candidate_backing_alias",
+	"host_candidate_alignment", "host_candidate_type", "host_candidate_allocation", "host_candidate_imported",
+	"host_import_retirements", "host_import_retire_ns", "host_import_restore_bytes", "host_import_read_snapshot_bytes",
+	"host_import_create_attempts", "host_import_create_ns", "host_import_descriptor_reads",
+	"host_import_exclusion_calls", "host_import_exclusion_samples", "host_import_exclusion_ns",
+	"host_import_exclusion_cache_hits", "host_import_retire_waits", "host_import_retire_wait_ns", "host_import_retire_flushes",
+	"host_import_activations", "host_import_activation_ns",
+	"host_import_candidate_calls", "host_import_candidate_samples", "host_import_candidate_ns",
+	"host_import_guard_range_waits", "host_import_guard_unknown_waits", "host_import_guard_bypassed",
+	"host_import_guard_disjoint", "host_import_guard_completed", "host_import_unknown_bda_draws",
+	"host_import_guard_lane_calls", "host_import_guard_lane_ns",
+	"host_import_dma_bytes", "host_import_staging_bytes", "host_import_copy_fallback_bytes",
+	"host_import_copy_fallback_no_import", "host_import_copy_fallback_profile",
+	"hot_promotions", "hot_reprotected", "hot_faults_observed", "hot_faults_avoided_estimated",
+	"hot_resync_bytes", "hot_resync_uses", "hot_bda_bytes", "hot_retire_gate", "hot_retire_gpu",
+	"hot_retire_image", "hot_retire_readback", "hot_retire_budget", "hot_retire_age", "hot_retire_merge",
+	"hot_retire_mapping", "hot_reject_gpu", "hot_reject_image", "hot_reject_readback", "hot_frames", "hot_owner_frames",
+	"hot_reject_excluded", "hot_reject_mapping", "hot_reject_bda_budget",
+	"hot_completed_frames", "hot_frame_resync_bytes", "hot_frame_resync_uses", "hot_bda_calls",
+	"hot_exclusion_calls", "hot_exclusion_visits", "hot_exclusion_samples", "hot_exclusion_ns",
+	"hot_history_pages", "hot_maintenance_ns",
+	"fc_faults", "fc_unique_page_frames", "fc_repeat_page_frames", "fc_refault_after_upload",
+	"fc_expanded", "fc_dirty_bytes", "fc_new_dirty_bytes", "fc_extra_dirty_upper_bytes",
+	"fc_upload_bytes", "fc_extra_upload_upper_bytes", "fc_reject_gpu", "fc_reject_import",
+	"fc_reject_watcher", "fc_reject_readback", "fc_promotions", "fc_retired", "fc_frames", "fc_owner_frames", "fc_stream_bytes"
 };
 static_assert(ExtraNames.size() == static_cast<size_t>(Extra::Count));
+inline std::atomic<uint64_t> hot_owner_count {0}, hot_owner_bytes {0};
 
 inline constexpr uint32_t QueueKinds = 2; // 0 = graphics, 1 = async compute.
 inline constexpr std::array QueueKindNames {"gfx", "compute"};
@@ -256,7 +356,11 @@ inline void TakeTag(ThreadTag& tag, uint32_t& tid, bool& multi) {
 	return Detail::Armed() && Detail::recording.load(std::memory_order_relaxed);
 }
 // Candidate under A/B (see SubmitProfileRuntime); off unless the experiment gate is open.
-enum class Experiment : uint32_t { None = 0, ReleaseMem = 1, IndirectCountGpu = 2 };
+enum class Experiment : uint32_t {
+	None = 0, ReleaseMem = 1, IndirectCountGpu = 2,
+	LegacyIndexClamp = 4, NoIndirectMeshGpu = 8, NoWalkerControlGpu = 16, NoGpuTimestamps = 32,
+	GuestHostImport = 64, HotUnprotected = 128, FaultCoarsening = 256, VkRecorder = 512
+};
 inline Experiment ParseExperiment(std::string_view names) {
 	uint32_t mask = 0;
 	while (!names.empty()) {
@@ -267,6 +371,16 @@ inline Experiment ParseExperiment(std::string_view names) {
 			name = name.substr(first, name.find_last_not_of(" \t\r\n") - first + 1);
 			if (name == "release-mem") mask |= static_cast<uint32_t>(Experiment::ReleaseMem);
 			if (name == "indirect-count-gpu") mask |= static_cast<uint32_t>(Experiment::IndirectCountGpu);
+			if (name == "legacy-index-clamp") mask |= static_cast<uint32_t>(Experiment::LegacyIndexClamp);
+			if (name == "no-indirect-mesh-gpu") mask |= static_cast<uint32_t>(Experiment::NoIndirectMeshGpu);
+			if (name == "no-walker-control-gpu") mask |= static_cast<uint32_t>(Experiment::NoWalkerControlGpu);
+			if (name == "no-gpu-timestamps") mask |= static_cast<uint32_t>(Experiment::NoGpuTimestamps);
+			if (name == "guest-host-import") mask |= static_cast<uint32_t>(Experiment::GuestHostImport);
+			if (name == "hot-unprotected") mask |= static_cast<uint32_t>(Experiment::HotUnprotected);
+			if (name == "fault-coarsening") mask |= static_cast<uint32_t>(Experiment::FaultCoarsening);
+			if (name == "vk-recorder") mask |= static_cast<uint32_t>(Experiment::VkRecorder);
+			// gpu-timestamps is retired: native clocks are now the default.
+			// Like other promoted experiment names, old helpers may keep it as a no-op.
 		}
 		if (comma == std::string_view::npos) break;
 		names.remove_prefix(comma + 1);
@@ -282,9 +396,18 @@ inline Experiment SelectedExperiment() {
 }
 inline const char* ExperimentName() {
 	// Canonical names only: no environment text is interpolated into the JSON log.
-	static constexpr std::array names {"none", "release-mem", "indirect-count-gpu",
-	    "release-mem,indirect-count-gpu"};
-	return names[static_cast<uint32_t>(SelectedExperiment())];
+	static const auto name = [] {
+		std::string result;
+		constexpr std::array names {"release-mem", "indirect-count-gpu", "legacy-index-clamp",
+		    "no-indirect-mesh-gpu", "no-walker-control-gpu", "no-gpu-timestamps", "guest-host-import", "hot-unprotected", "fault-coarsening", "vk-recorder"};
+		for (uint32_t bit = 0; bit < names.size(); ++bit) {
+			if (!(static_cast<uint32_t>(SelectedExperiment()) & (1u << bit))) continue;
+			if (!result.empty()) result += ',';
+			result += names[bit];
+		}
+		return result.empty() ? std::string("none") : result;
+	}();
+	return name.c_str();
 }
 [[nodiscard]] inline bool ExperimentSelected(Experiment selected) {
 	const auto mask = static_cast<uint32_t>(selected);
@@ -295,6 +418,9 @@ inline const char* ExperimentName() {
 }
 [[nodiscard]] inline bool ExperimentActive(Experiment selected) {
 	return ExperimentSelected(selected) && ExperimentActive();
+}
+[[nodiscard]] inline bool GpuTimestampsEnabled() {
+	return !ExperimentActive(Experiment::NoGpuTimestamps);
 }
 inline void SetExperiment(bool active) {
 	Detail::experiment.store(active, std::memory_order_relaxed);
@@ -623,7 +749,8 @@ private:
 };
 class LockTimer {
 public:
-	explicit LockTimer(Metric metric): m_metric(metric) {
+	explicit LockTimer(Metric metric): m_write_stage(metric == Metric::TrackingLock ? GuestCpuProfile::Part::TrackingLock :
+	    metric == Metric::TextureLock ? GuestCpuProfile::Part::TextureLock : GuestCpuProfile::Part::ImageHeapLock), m_metric(metric) {
 		if (!Recording()) return;
 		m_row = GetRow();
 		// Fault-side lock timings are conditional on the same sampled faults;
@@ -633,8 +760,9 @@ public:
 		m_generation = Detail::generation.load(std::memory_order_relaxed);
 		if (m_sampled) m_start = NowNs();
 	}
-	void Acquired() { Record(m_row, m_metric, m_sampled, m_start, m_generation); }
+	void Acquired() { m_write_stage.End(); Record(m_row, m_metric, m_sampled, m_start, m_generation); }
 private:
+	GuestCpuProfile::Stage m_write_stage;
 	Row* m_row = nullptr;
 	Metric m_metric;
 	uint64_t m_start = 0, m_generation = 0;
@@ -773,6 +901,22 @@ private:
 
 inline void AddExtra(Extra extra, uint64_t value = 1) {
 	if (Recording()) Detail::Add(Detail::window.extra[static_cast<size_t>(extra)], value);
+}
+
+// Per record, not multiplied by instances. Available is the remaining hardware
+// bound; valid is the portion actually requested inside it. Zero-instance records
+// are reported too, but do not imply vertex work.
+inline void RecordIndirectIndices(uint32_t requested, uint32_t first, uint32_t limit,
+                                  uint32_t instances, uint32_t issued) {
+	if (!Recording()) return;
+	const uint32_t available = first < limit ? limit - first : 0;
+	AddExtra(Extra::IndirectIndexSamples);
+	AddExtra(Extra::IndirectIndexRequested, requested);
+	AddExtra(Extra::IndirectIndexAvailable, available);
+	AddExtra(Extra::IndirectIndexValid, std::min(requested, available));
+	AddExtra(Extra::IndirectIndexIssued, issued);
+	AddExtra(Extra::IndirectIndexInstances, instances);
+	if (!instances) AddExtra(Extra::IndirectIndexZeroInstances);
 }
 
 // Called once per guest flip; frames delimit the materialization repetition sets.
@@ -1071,10 +1215,21 @@ inline void WriteReport(std::FILE* out, double interval_ms, bool timer_1ms,
 	const auto reeval_ns     = Detail::Take(w.reevaluation_ns);
 	const auto reeval_max    = Detail::Take(w.reevaluation_max_ns);
 	std::fprintf(out, "]},\"extra\":{");
+	uint64_t host_guard_ns = 0;
 	for (size_t i = 0; i < ExtraNames.size(); ++i) {
+		const auto value = Detail::Take(w.extra[i]);
+		if (i == static_cast<size_t>(Extra::HostImportGuardNs)) host_guard_ns = value;
 		std::fprintf(out, "%s\"%s\":%llu", i == 0 ? "" : ",", ExtraNames[i],
-		             static_cast<unsigned long long>(Detail::Take(w.extra[i])));
+		             static_cast<unsigned long long>(value));
 	}
+	std::fprintf(out, ",\"host_import_guard_ms\":%.3f,\"host_import_retained_bytes\":%llu",
+	    host_guard_ns / 1e6, static_cast<unsigned long long>(Common::GuestHostImport::retained_bytes.load()));
+	std::fprintf(out, ",\"host_import_pending_read_bytes\":%llu,\"host_import_pending_known_bytes\":%llu,\"host_import_pending_unknown_bytes\":%llu",
+	    static_cast<unsigned long long>(Common::GuestHostImport::pending_read_bytes.load()),
+	    static_cast<unsigned long long>(Common::GuestHostImport::pending_known_bytes.load()),
+	    static_cast<unsigned long long>(Common::GuestHostImport::pending_unknown_bytes.load()));
+	std::fprintf(out, ",\"hot_owners\":%llu,\"hot_owner_bytes\":%llu",
+	    static_cast<unsigned long long>(hot_owner_count.load()), static_cast<unsigned long long>(hot_owner_bytes.load()));
 	std::fprintf(out,
 	             "},\"reevaluation\":{\"count\":%llu,\"ms\":%.3f,\"max_ms\":%.3f},"
 	             "\"dropped_cross_window\":{\"waits\":%llu,\"idle_waits\":%llu,"

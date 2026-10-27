@@ -154,6 +154,11 @@ public:
 	}
 
 	[[nodiscard]] constexpr bool Any() const { return !None(); }
+	[[nodiscard]] constexpr size_t Count() const {
+		size_t n = 0;
+		for (const auto word: m_data) n += std::popcount(word);
+		return n;
+	}
 
 	[[nodiscard]] constexpr Range FirstRangeFrom(size_t start) const {
 		if (start >= N) {
@@ -230,6 +235,15 @@ public:
 	[[nodiscard]] const_iterator begin() const { return Iterator(*this, 0); }
 	[[nodiscard]] const_iterator end() const { return Iterator(*this, N); }
 
+	constexpr BitArray& operator|=(const BitArray& other) {
+		for (size_t i = 0; i < WORD_COUNT; ++i) m_data[i] |= other.m_data[i];
+		return *this;
+	}
+	[[nodiscard]] constexpr BitArray operator&(const BitArray& other) const {
+		auto result = *this;
+		for (size_t i = 0; i < WORD_COUNT; ++i) result.m_data[i] &= other.m_data[i];
+		return result;
+	}
 	constexpr BitArray& operator^=(const BitArray& other) {
 		for (size_t word = 0; word < WORD_COUNT; word++) {
 			m_data[word] ^= other.m_data[word];

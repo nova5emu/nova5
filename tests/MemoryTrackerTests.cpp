@@ -274,6 +274,35 @@ void Release(uint8_t *memory) {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestPendingRangeReads() {
+  Libs::Graphics::PendingRangeReads reads;
+  reads.Add(10, 0x10000, 0x1000);
+  reads.Add(10, 0x10080, 96); // Contained repeated descriptor, not extra bytes.
+  reads.Add(11, 0x12000, 0x1000);
+  Check(reads.Find(0x11000, 0x1000).tick == 0, "disjoint ring segment has no reader");
+  const auto first = reads.Find(0x10000, 0x1000);
+  Check(first.tick == 10 && first.known && !first.unknown, "wait only the referenced older tick");
+  Check(reads.PendingBytes().total == 0x2000, "deduplicate pending range bytes");
+  reads.Complete(10);
+  Check(reads.Find(0x10000, 0x1000).tick == 0 && reads.Find(0x12000, 1).tick == 11,
+      "completion frees only completed tick references");
+  reads.Add(12, 0x10000, 0x4000, true);
+  const auto mixed = reads.Find(0x12000, 0x1000);
+  const auto unknown = reads.Find(0x11000, 0x1000);
+  Check(mixed.tick == 12 && mixed.known && mixed.unknown && unknown.unknown && !unknown.known,
+      "unknown BDA cause remains distinct from bounded reads");
+  const auto bytes = reads.PendingBytes();
+  Check(bytes.known == 0x1000 && bytes.unknown == 0x4000 && bytes.total == 0x4000,
+      "pending byte union excludes overlap across causes and ticks");
+  reads.Complete(12);
+  Check(reads.PendingBytes().total == 0 && reads.Find(0x10000, 0x4000).tick == 0,
+      "all completed references are released");
+  // A later reuse of the same page must not be released with the old reader.
+  reads.Add(13, 0x10000, 0x1000); reads.Add(14, 0x10000, 0x1000);
+  reads.Complete(13);
+  Check(reads.Find(0x10000, 4).tick == 14, "same page keeps its newer reader");
+}
+
 void TestRangeSet() {
   RangeSet ranges;
   ranges.Add(0x1000, 0x80);
@@ -302,6 +331,45 @@ void TestRangeSet() {
             intersections[0].second == 0x1040 &&
             intersections[1].first == 0x1220 && intersections[1].second == 0x1240,
         "range set subtraction did not preserve both exact tails");
+}
+
+void TestExclusionRanges() {
+  Libs::Graphics::ExclusionRanges images, writers;
+  constexpr uint64_t base = 0x50e430000;
+  Check(!images.ContainsCached(0, 1) && !images.ContainsCached(base, 96), "empty exclusion cache hit");
+  images.Add(base, 96);
+  Check(images.ContainsCached(base, 96) && images.ContainsCached(base, 32), "recorded exclusion not cached");
+  Check(!images.ContainsCached(base, 97) && !images.Contains(base, 97) &&
+        !images.Contains(base + 96, 1), "cache skipped an extension or adjacent alias");
+  Check(!writers.Contains(base, 96), "image history leaked into GPU-writer history");
+  images.Add(base + 128, 32);
+  Check(!images.Contains(base + 64, 96), "exclusion bridged an unrecorded hole");
+  images.Add(base + 96, 32);
+  Check(images.Contains(base, 160) && images.ContainsCached(base, 160), "merged exclusion lost coverage");
+  images.Clear();
+  Check(images.Empty() && !images.ContainsCached(base, 96) && !images.Intersects(base, 160),
+        "B->A left a stale positive proof");
+
+  // Force eviction in the bounded cache and compare full coverage against an
+  // uncached interval oracle. Collisions must never suppress a new exclusion.
+  RangeSet reference;
+  for (uint64_t i = 0; i < 4096; ++i) {
+    images.Add(base + i * 65536, 96);
+    reference.Add(base + i * 65536, 96);
+  }
+  for (uint64_t i = 0; i < 4096; ++i) {
+    for (const uint64_t offset : {uint64_t{0}, uint64_t{32}, uint64_t{96}}) {
+      for (const uint64_t bytes : {uint64_t{1}, uint64_t{64}, uint64_t{97}}) {
+        const auto address = base + i * 65536 + offset;
+        const bool expected = reference.Contains(address, bytes);
+        Check(!images.ContainsCached(address, bytes) || expected, "cache collision fabricated coverage");
+        Check(images.Contains(address, bytes) == expected, "cached exclusion differs from exact interval oracle");
+      }
+    }
+  }
+  images.Clear();
+  for (uint64_t i = 0; i < 4096; ++i)
+    Check(!images.ContainsCached(base + i * 65536, 1), "clear retained an evicted/repopulated proof");
 }
 
 void TestGuestRange() {
@@ -375,6 +443,191 @@ void TestConcurrentRegionPublication() {
         "concurrent region publication lost initial CPU ownership");
 }
 
+void TestFaultCoarsening() {
+  using namespace Libs::Graphics;
+  using Cause = Common::BufferUploadProfile::Cause;
+  Common::SubmitProfile::SetExperiment(true);
+  for (uint64_t block : {64ull * 1024, 256ull * 1024, 1024ull * 1024}) {
+    TrackerHarness harness;
+    auto& tracker = harness.tracker;
+    auto& pages = harness.page_manager;
+    const auto page = TRACKER_PAGE_SIZE;
+    auto* memory = AllocateFixedGuestRange(2 * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE);
+    const auto base = reinterpret_cast<uint64_t>(memory);
+    const auto upload = [&](uint64_t address, uint64_t size, bool written = false) {
+      uint64_t n = 0;
+      tracker.ForEachUploadRange(address, size, written,
+          [&](uint64_t, uint64_t bytes) noexcept { n += bytes; }, []() noexcept {});
+      return n;
+    };
+    upload(base, 2 * TRACKER_REGION_SIZE);
+    tracker.ConfigureFaultCoarsening(base, 2 * TRACKER_REGION_SIZE, block, true);
+    tracker.TakeHotFaults(base, 2 * TRACKER_REGION_SIZE, true);
+    uint64_t published = 0, published_size = 0;
+    const auto fault = [&](uint64_t address, bool allow = true) {
+      published = published_size = 0;
+      tracker.InvalidateRegion(address, 1, [] { Check(false, "unexpected GPU flush"); }, Cause::CpuWriteFault, nullptr,
+          [&](uint64_t start, uint64_t size) {
+            // Callback runs after unlocking: queries must not recurse on a lock.
+            Check(tracker.IsRegionCpuModified(start, size), "BDA published before dirty state");
+            published = start; published_size = size;
+          }, allow);
+    };
+    fault(base + 9);
+    Check(published == base && published_size == block && IsWritable(memory + block - 1) &&
+        Protection(memory + block) == PAGE_READONLY, "fault expansion crossed its block or failed to unprotect");
+    memory[block - 1] = 0x5a; // No second fault needed to write another page.
+    Check(upload(base, block) == block && upload(base, block) == 0 && Protection(memory) == PAGE_READONLY,
+        "expanded dirty upload did not consume and reprotect");
+    fault(base + 9); // Same page, after an upload, within the diagnostic frame.
+    Check(upload(base, block) == block, "refault did not resynchronize");
+    const auto stats = tracker.TakeCoarsenStats(base, 2 * TRACKER_REGION_SIZE);
+    Check(stats.faults == 2 && stats.unique == 1 && stats.repeat == 1 && stats.refault_upload == 1 &&
+        stats.expanded == 2 && stats.dirty_bytes == 2 * block && stats.new_dirty_bytes == 2 * block &&
+        stats.extra_upload_upper == 2 * (block - page), "coarsening counters or repeat attribution incorrect");
+    fault(base + 9);
+    fault(base + 9); // Already writable: model two trapped writers reaching the handler.
+    Check(upload(base, page) == page && IsWritable(memory + page), "partial upload reprotected unrelated pages");
+    fault(base + 9); // Only this page was consumed; the rest of the block is still dirty.
+    Check(upload(base, block) == block, "partial consumption lost remaining dirty pages");
+    const auto partial = tracker.TakeCoarsenStats(base, 2 * TRACKER_REGION_SIZE);
+    Check(partial.faults == 3 && partial.unique == 1 && partial.repeat == 2 && partial.refault_upload == 1 &&
+        partial.new_dirty_bytes == block + page && partial.extra_upload_upper == block - page,
+        "reprotection was confused with duplicate faults or repeated dirty bytes");
+
+    // A newly written GPU neighbor must never be marked CPU dirty by expansion.
+    upload(base + page, page, true);
+    fault(base + 9);
+    Check(published_size == 0 && !tracker.IsRegionCpuModified(base + 2 * page, page) &&
+        tracker.IsRegionGpuModified(base + page, page), "coarse fault overwrote a GPU-owned neighbor");
+    tracker.UnmarkRegionAsGpuModified(base + page, page);
+    upload(base, block);
+    tracker.SetHostImport(base + page, page, true);
+    fault(base + 9);
+    Check(published_size == 0, "coarse fault bypassed a direct import guard");
+    tracker.SetHostImport(base + page, page, false);
+    upload(base, block);
+    pages.UpdatePageWatchers<true>(base + page, page);
+    fault(base + 9);
+    Check(published_size == 0 && Protection(memory + page) == PAGE_READONLY,
+        "coarse fault interfered with a foreign watcher");
+    pages.UpdatePageWatchers<false>(base + page, page);
+    upload(base, block);
+    fault(base + 9, false);
+    Check(published_size == 0, "pending readback allowed expansion");
+    upload(base, block);
+    const auto rejected = tracker.TakeCoarsenStats(base, 2 * TRACKER_REGION_SIZE);
+    Check(rejected.reject_gpu == 1 && rejected.reject_import == 1 && rejected.reject_watcher == 1 &&
+        rejected.reject_readback == 1 && rejected.expanded == 0, "fallback reason counters incorrect");
+
+    // Owner begins one page into a block: the edge stays at 4 KiB; a full
+    // interior block still expands. Also exercise the 4 MiB region boundary.
+    tracker.ConfigureFaultCoarsening(base, 2 * TRACKER_REGION_SIZE, block, false);
+    tracker.ConfigureFaultCoarsening(base + page, 2 * block - page, block, true);
+    fault(base + page + 9);
+    Check(published_size == 0 && Protection(memory + 2 * page) == PAGE_READONLY, "owner edge crossed into a neighbor");
+    fault(base + block + 9);
+    Check(published == base + block && published_size == block, "whole interior block not eligible");
+    upload(base, 2 * block);
+    tracker.ConfigureFaultCoarsening(base, 2 * TRACKER_REGION_SIZE, block, true);
+    fault(base + TRACKER_REGION_SIZE - 1);
+    Check(published == base + TRACKER_REGION_SIZE - block && published_size == block &&
+        Protection(memory + TRACKER_REGION_SIZE) == PAGE_READONLY, "expansion crossed tracker region");
+    upload(base, 2 * TRACKER_REGION_SIZE);
+
+    Common::SubmitProfile::SetExperiment(false); // Immediate gate, before GPU frame cleanup.
+    fault(base + 9);
+    Check(published_size == 0 && Protection(memory + page) == PAGE_READONLY, "A2 still coarsened faults");
+    tracker.ConfigureFaultCoarsening(base, 2 * TRACKER_REGION_SIZE, block, false);
+    tracker.TakeHotFaults(base, 2 * TRACKER_REGION_SIZE, false);
+    Check(upload(base, block) == page, "A2 lost dirty bytes or widened upload");
+    tracker.UntrackMemory(base, 2 * TRACKER_REGION_SIZE);
+    Release(memory);
+    Common::SubmitProfile::SetExperiment(true);
+  }
+  Common::SubmitProfile::SetExperiment(false);
+}
+
+void TestHotUnprotected() {
+  using Libs::Graphics::HotBufferHistory;
+  HotBufferHistory ring, burst;
+  for (unsigned frame = 0; frame < 12; ++frame) {
+    ring.Observe(frame % 3 == 0 ? 1024 : 0);
+    burst.Observe(frame == 0 ? 100000 : 0);
+  }
+  Check(ring.Ready() && !burst.Ready() && ring.Mean() == 4096 / 12, "hot history promoted a single burst or lost a rotating ring");
+  for (unsigned frame = 0; frame < 12; ++frame) ring.Observe(0);
+  Check(!ring.Ready() && ring.Total() == 0, "hot history did not age out");
+
+  TrackerHarness harness;
+  auto& tracker = harness.tracker;
+  auto& pages = harness.page_manager;
+  const auto page = pages.GetPageSize();
+  auto* memory = Allocate(pages, 2);
+  const auto base = reinterpret_cast<uint64_t>(memory);
+  const auto upload = [&](uint64_t address, uint64_t size, bool written = false) {
+    uint64_t bytes = 0;
+    tracker.ForEachUploadRange(address, size, written,
+        [&](uint64_t, uint64_t n) noexcept { bytes += n; }, []() noexcept {});
+    return bytes;
+  };
+  upload(base, 2 * page);
+  Check(tracker.TakeHotFaults(base, page, true) == 0, "fault history was not empty");
+  for (unsigned i = 0; i < 2; ++i) {
+    tracker.InvalidateRegion(base + 9, 1, [] {}, Common::BufferUploadProfile::Cause::CpuWriteFault);
+    upload(base, page);
+  }
+  tracker.InvalidateRegion(base + page, 1, [] {}, Common::BufferUploadProfile::Cause::CpuWriteFault);
+  tracker.InvalidateRegion(base, 1, [] {}); // Explicit invalidation is not a write fault.
+  Check(tracker.TakeHotFaults(base, page, true) == 2, "hot history counted wrong pages or invalidations");
+  upload(base, 2 * page);
+  Check(tracker.CanUseHot(base, page), "ordinary buffer's own watcher excluded promotion");
+  tracker.SetHot(base, page, true);
+  Check(IsWritable(memory) && Protection(memory + page) == PAGE_READONLY, "hot mode changed adjacent protections");
+  Check(upload(base, 2 * page) == page && upload(base, 2 * page) == page &&
+        tracker.IsRegionCpuModified(base, page) && IsWritable(memory), "hot reads were not always dirty and writable");
+
+  pages.UpdatePageWatchers<true>(base, page); // Texture or image-heap watcher.
+  Check(!tracker.CanUseHot(base, page) && Protection(memory) == PAGE_READONLY, "foreign watcher was suppressed");
+  upload(base, page);
+  Check(Protection(memory) == PAGE_READONLY, "hot upload removed a foreign watcher");
+  tracker.SetHot(base, page, false);
+  pages.UpdatePageWatchers<false>(base, page);
+  Check(Protection(memory) == PAGE_READONLY && tracker.IsRegionCpuModified(base, page), "retirement must protect AND retain a forced upload");
+  Check(upload(base, page) == page && upload(base, page) == 0, "A2 lost the forced upload or stayed always dirty");
+  tracker.SetHot(base, page, true);
+  tracker.SetHot(base, page, false);
+  tracker.InvalidateRegion(base, 1, [] {}, Common::BufferUploadProfile::Cause::CpuWriteFault);
+  Check(IsWritable(memory), "post-retirement fault did not release protection");
+  upload(base, page, true);
+  Check(!tracker.CanUseHot(base, page) && Protection(memory) == PAGE_NOACCESS, "GPU ownership was eligible for hot mode");
+  tracker.UnmarkRegionAsGpuModified(base, page);
+  tracker.SetHostImport(base, page, true);
+  Check(!tracker.CanUseHot(base, page), "direct host import was eligible for hot mode");
+  tracker.SetHostImport(base, page, false);
+  tracker.TakeHotFaults(base, page, false);
+  tracker.InvalidateRegion(base, 1, [] {}, Common::BufferUploadProfile::Cause::CpuWriteFault);
+  Check(tracker.TakeHotFaults(base, page, false) == 0, "disabled history kept counting faults");
+  tracker.UntrackMemory(base, 2 * page);
+  Release(memory);
+
+  constexpr auto region = Libs::Graphics::TRACKER_REGION_SIZE;
+  auto* allocation = AllocateFixedGuestRange(2 * region, 0x10000);
+  const auto boundary = (reinterpret_cast<uint64_t>(allocation) + region - 1) & ~(region - 1);
+  const auto cross = boundary - page;
+  auto* crossing = reinterpret_cast<uint8_t*>(cross);
+  upload(cross, 2 * page);
+  tracker.SetHot(cross, 2 * page, true);
+  Check(upload(cross, 2 * page) == 2 * page && IsWritable(crossing) && IsWritable(crossing + page),
+        "cross-region hot upload lost a page");
+  tracker.SetHot(cross, 2 * page, false);
+  Check(Protection(crossing) == PAGE_READONLY && Protection(crossing + page) == PAGE_READONLY &&
+        upload(cross, 2 * page) == 2 * page && upload(cross, 2 * page) == 0,
+        "cross-region retirement lost protection or the final upload");
+  tracker.UntrackMemory(cross, 2 * page);
+  Release(allocation);
+}
+
 void TestCpuDirtyUpload() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -404,6 +657,51 @@ void TestCpuDirtyUpload() {
   Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
         "explicit CPU dirtiness did not release write protection");
   tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
+void TestUploadProvenance() {
+  using namespace Common::BufferUploadProfile;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  TrackerHarness harness;
+  auto& tracker = harness.tracker;
+  auto* memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto collect = [&](uint64_t requested, uint64_t size, bool written = false) {
+    Causes result {};
+    uint64_t copied = 0;
+    tracker.ForEachUploadRange(requested, size, written,
+        [&](uint64_t, uint64_t bytes, const Causes& causes) noexcept {
+          copied += bytes;
+          for (size_t i = 0; i < causes.size(); ++i) result[i] += causes[i];
+        }, []() noexcept {});
+    uint64_t attributed = 0;
+    for (auto bytes: result) attributed += bytes;
+    Check(copied == attributed, "upload provenance does not partition actual copied bytes");
+    return result;
+  };
+  Check(collect(address, 2 * page_size)[static_cast<size_t>(Cause::Initial)] == 2 * page_size,
+        "cold pages must be initial, not CPU write faults");
+  tracker.InvalidateRegion(address + 16, 1, [] { Check(false, "unexpected GPU flush"); }, Cause::CpuWriteFault);
+  tracker.InvalidateRegion(address + page_size + 16, 4, [] { Check(false, "unexpected GPU flush"); });
+  const auto mixed = collect(address, 2 * page_size);
+  Check(mixed[static_cast<size_t>(Cause::CpuWriteFault)] == page_size &&
+            mixed[static_cast<size_t>(Cause::Invalidate)] == page_size,
+        "merged upload lost per-page reasons or treated fault byte as written extent");
+  Check(collect(address, page_size) == Causes{}, "clean reuse fabricated uploads");
+  collect(address, page_size, true);
+  bool flushed = false;
+  tracker.InvalidateRegion(address + 16, 1, [&] {
+    flushed = true;
+    tracker.UnmarkRegionAsGpuModified(address, page_size);
+    tracker.MarkRegionAsCpuModified(address + 16, 1, AfterDownload(Cause::CpuWriteFault));
+  }, Cause::CpuWriteFault);
+  Check(flushed && collect(address, page_size)[static_cast<size_t>(Cause::CpuWriteFaultAfterGpuDownload)] == page_size,
+        "GPU ownership flush lost subsequent CPU dirty provenance");
+  tracker.UntrackMemory(address, 2 * page_size);
+  Check(collect(address, 2 * page_size)[static_cast<size_t>(Cause::Untrack)] == 2 * page_size,
+        "untrack must be distinct from a guest CPU write");
+  tracker.UntrackMemory(address, 2 * page_size);
   Release(memory);
 }
 
@@ -499,6 +797,40 @@ void BenchmarkCleanUploads() {
   }
   tracker.UntrackMemory(address, size);
   Release(memory);
+}
+
+void TestImportedWriteGuard() {
+  TrackerHarness harness;
+  auto& tracker = harness.tracker;
+  const auto page = harness.page_manager.GetPageSize();
+  auto* memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto protect = [&] {
+    tracker.ForEachUploadRange(address, 2 * page, false,
+        [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  };
+  unsigned guards = 0, flushes = 0;
+  const auto invalidate = [&](uint64_t target) {
+    tracker.InvalidateRegion(target, 1, [&] { ++flushes; },
+        Common::BufferUploadProfile::Cause::CpuWriteFault,
+        [&](uint64_t start, uint64_t bytes) {
+          ++guards;
+          Check(!IsWritable(reinterpret_cast<void*>(start)), "guard released the CPU page before waiting");
+          // This acquires the same region lock: callback MUST run outside it.
+          tracker.MarkRegionAsCpuModified(start, bytes);
+        });
+  };
+  protect(); invalidate(address);
+  Check(guards == 0 && flushes == 0 && IsWritable(memory), "A entered import guard");
+  protect(); tracker.SetHostImport(address, page, true);
+  invalidate(address + page);
+  Check(guards == 0 && !IsWritable(memory), "disjoint page entered import guard");
+  invalidate(address);
+  Check(guards == 1 && flushes == 0 && IsWritable(memory), "B bypassed imported write guard");
+  protect(); tracker.SetHostImport(address, page, false);
+  invalidate(address);
+  Check(guards == 1 && flushes == 0 && IsWritable(memory), "A2 retained import guard");
+  tracker.UntrackMemory(address, 2 * page); Release(memory);
 }
 
 void TestRangeInvalidation() {
@@ -1190,6 +1522,26 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 } // namespace Libs::LibKernel::Memory
 
 int main(int argc, char **argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--fault-coarsening") == 0) {
+    TestFaultCoarsening();
+    std::puts("MemoryTrackerTests: fault-coarsening passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--hot-unprotected") == 0) {
+    TestHotUnprotected();
+    std::puts("MemoryTrackerTests: hot-unprotected history/protections passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--upload-provenance") == 0) {
+#if defined(_WIN32)
+    _putenv_s("KYTY_BUFFER_UPLOAD_PROFILE", "1");
+#else
+    setenv("KYTY_BUFFER_UPLOAD_PROFILE", "1", 1);
+#endif
+    TestUploadProvenance();
+    std::puts("MemoryTrackerTests: upload provenance passed");
+    return 0;
+  }
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
@@ -1199,11 +1551,14 @@ int main(int argc, char **argv) {
   }
   TestGuestRange();
   TestRangeSet();
+  TestExclusionRanges();
+  TestPendingRangeReads();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
+  TestImportedWriteGuard();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
   TestExactDirtyIntervalsSharingTrackerPage();

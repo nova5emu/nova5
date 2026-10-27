@@ -1,3 +1,4 @@
+#include "common/gpuThreadSampler.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 
 #include "common/assert.h"
@@ -116,19 +117,24 @@ void FaultManager::ProcessFaultBuffer() {
 	}
 
 	m_scheduler.EndRendering();
-	auto command = m_scheduler.Current().Handle();
+	auto command = m_scheduler.Current().Commands();
 	vk::DependencyInfo dependency {};
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;
 	dependency.pBufferMemoryBarriers    = &pre_barrier;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier2(dependency);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0, writes);
 	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
 	const auto num_workgroups = (num_threads + 63) / 64;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier2(dependency);
 
 	const auto area = m_current_area;

@@ -1,9 +1,11 @@
 #include "libs/audio.h"
 
 #include "common/assert.h"
+#include "common/audioSignal.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/stallDump.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "libs/audio_internal.h"
@@ -15,6 +17,7 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <magic_enum.hpp>
 #include <vector>
@@ -148,6 +151,7 @@ private:
 
 	Common::Mutex m_mutex;
 	PortOut       m_out_ports[OUT_PORTS_MAX];
+	std::atomic<uint64_t> m_signal_next_us[OUT_PORTS_MAX] {};
 	PortIn        m_in_ports[IN_PORTS_MAX];
 
 	static bool            FormatIsFloat(Format format);
@@ -162,8 +166,8 @@ private:
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
 	                                           std::vector<uint8_t>* buffer, float gain,
 	                                           const float* gains);
-	static bool QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain,
-	                          const float* gains);
+	static bool            QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain,
+	                                     const float* gains, std::atomic<uint64_t>& signal_next_us);
 };
 
 static Audio* g_audio = nullptr;
@@ -371,10 +375,12 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 }
 
 bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain,
-                          const float* gains) {
+                          const float* gains, std::atomic<uint64_t>& signal_next_us) {
 	EXIT_IF(port == nullptr);
 
 	if (port->stream == nullptr || data == nullptr) {
+		Common::StallDump::Observe("Audio.sdl_skipped", reinterpret_cast<uintptr_t>(port),
+		                           port->stream == nullptr, data == nullptr, port->type);
 		return false;
 	}
 
@@ -383,6 +389,41 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	const auto           output_channels = OutputChannels(*port);
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
+	if (Common::StallDump::Enabled()) {
+		const auto now  = LibKernel::KernelGetProcessTime();
+		auto       next = signal_next_us.load(std::memory_order_relaxed);
+		if (now >= next && signal_next_us.compare_exchange_strong(next, now + 2000000,
+		                                                          std::memory_order_relaxed)) {
+			const auto input_count  = size_t(port->samples_num) * port->channels_num;
+			const auto output_count = size_t(port->samples_num) * output_channels;
+			const auto input =
+			    Common::MeasureAudioSignal(data, input_count, FormatIsFloat(port->format));
+			const auto output    = Common::MeasureAudioSignal(prepared_data, output_count,
+			                                                  FormatIsFloat(port->format));
+			double     min_scale = 1e300, max_scale = -1e300;
+			for (int ch = 0; ch < port->channels_num; ++ch) {
+				const double scale =
+				    (port->volume[ch] / 32768.0) * gain * (gains ? gains[ch] : 1.0f);
+				min_scale = std::min(min_scale, scale);
+				max_scale = std::max(max_scale, scale);
+			}
+			std::fprintf(
+			    stderr,
+			    "[AUDIO_SIGNAL] t_us=%llu port=%p type=%d format=%d float=%d rate=%u in_ch=%d "
+			    "out_ch=%u "
+			    "in_scanned=%zu/%zu in_nonzero=%zu in_nonfinite=%zu in_peak=%.9g in_rms=%.9g "
+			    "out_scanned=%zu/%zu out_nonzero=%zu out_nonfinite=%zu out_peak=%.9g out_rms=%.9g "
+			    "scale_min=%.9g scale_max=%.9g queued_bytes=%d device_paused=%d\n",
+			    static_cast<unsigned long long>(now), static_cast<void*>(port), port->type,
+			    static_cast<int>(port->format), int(FormatIsFloat(port->format)), port->freq,
+			    port->channels_num, output_channels, input.scanned, input_count, input.nonzero,
+			    input.nonfinite, input.peak, input.rms, output.scanned, output_count,
+			    output.nonzero, output.nonfinite, output.peak, output.rms, min_scale, max_scale,
+			    SDL_GetAudioStreamQueued(port->stream),
+			    int(SDL_AudioDevicePaused(SDL_GetAudioStreamDevice(port->stream))));
+			std::fflush(stderr);
+		}
+	}
 
 	uint32_t min_queued_size = 0;
 	if (blocking) {
@@ -412,11 +453,14 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	}
 
 	if (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
+		Common::StallDump::Observe("Audio.sdl_error", reinterpret_cast<uintptr_t>(port));
 		LOGF("AudioOut: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
 		port->queue_primed = false;
 		return false;
 	}
 	// Unpaced priming must not advance the playback deadline into the future.
+	Common::StallDump::Observe("Audio.sdl_queued", reinterpret_cast<uintptr_t>(port), prepared_size,
+	                           port->freq, output_channels);
 	if (!port->queue_primed) {
 		port->clock = {};
 	}
@@ -545,6 +589,8 @@ bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 }
 
 uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking) {
+	Common::StallDump::Scope stall_audio("Audio.output");
+	Common::StallDump::Observe("Audio.output", 0, num, blocking);
 	EXIT_NOT_IMPLEMENTED(num == 0 || num > OUT_PORTS_MAX);
 	EXIT_NOT_IMPLEMENTED(!AudioOutValid(params[0].handle));
 
@@ -577,7 +623,8 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		if (controller_queued_us == 0) {
 			// No DualSense took it (e.g. it was unplugged); a pad speaker port plays on the main
 			// output instead, and a vibration port has none.
-			if (QueueSdlAudio(&port, params[i].data, blocking, gain, params[i].gains)) {
+			if (QueueSdlAudio(&port, params[i].data, blocking, gain, params[i].gains,
+			                  m_signal_next_us[params[i].handle.GetId()])) {
 				any_device = true;
 				paced[i]   = port.queue_primed;
 			}

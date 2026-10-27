@@ -11,6 +11,16 @@
 #include <thread>
 #include <vector>
 
+// This test links eventQueue.cpp without the pthread runtime; the frame timeline only names threads.
+namespace Libs::LibKernel {
+PthreadPrivate* PthreadSelfOrNull() {
+	return nullptr;
+}
+int KYTY_SYSV_ABI PthreadGetname(PthreadPrivate* /*thread*/, char* /*name*/) {
+	return -1;
+}
+} // namespace Libs::LibKernel
+
 namespace {
 
 namespace EventQueue = Libs::LibKernel::EventQueue;

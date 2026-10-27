@@ -1,3 +1,4 @@
+#include "common/gpuThreadSampler.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 
 #include "common/assert.h"
@@ -390,7 +391,7 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
-	const auto command = scheduler.Current().Handle();
+	const auto command = scheduler.Current().Commands();
 	const ImageSubresourceRange range {read_desc.view_info.base_level, 1,
 	                                  read_desc.view_info.base_layer,
 	                                  read_desc.view_info.layer_count};
@@ -411,6 +412,7 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 		region.dstSubresource = region.srcSubresource;
 		region.extent = write_desc.info.extent;
 	}
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                  count, regions.data());

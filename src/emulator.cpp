@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/gpuThreadSampler.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
@@ -146,6 +147,7 @@ static void Execute(const std::filesystem::path& game_patch) {
 	    },
 	    &patch_path);
 	Libs::Graphics::WindowRun();
+	Common::GpuThreadSampler::StopAndFlush();
 	std::quick_exit(0);
 }
 

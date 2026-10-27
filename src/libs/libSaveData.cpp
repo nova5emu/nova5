@@ -1,3 +1,5 @@
+#define KYTY_STALL_HLE
+#include "common/hostPath.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -332,7 +334,8 @@ static bool valid_memory_range(const SaveDataMemoryData& data, size_t size) {
 // Replacing a flushed temporary file protects the
 // previous save if writing fails or the emulator exits partway through an update.
 static int write_save_file(const std::filesystem::path& path, const void* data, uint32_t size) {
-	const auto   temporary = std::filesystem::path(path.string() + ".tmp");
+	auto temporary = path;
+	temporary += ".tmp";
 	Common::File file;
 	if (!file.Create(temporary)) {
 		return SAVE_DATA_ERROR_INTERNAL;
@@ -343,13 +346,15 @@ static int write_save_file(const std::filesystem::path& path, const void* data, 
 	file.Close();
 	std::error_code error;
 	if (written == size && flushed) {
-		// Common::File::RenameFile deliberately refuses to replace an existing file.
-		std::filesystem::rename(temporary, path, error);
+		// Common::File::RenameFile removes the destination first; use atomic replacement here.
+		std::filesystem::rename(Common::NativeHostPath(temporary), Common::NativeHostPath(path), error);
+		Common::ReportHostFileError("SaveData.rename", path, error);
 		if (!error) {
 			return OK;
 		}
 	}
-	std::filesystem::remove(temporary, error);
+	std::filesystem::remove(Common::NativeHostPath(temporary), error);
+	Common::ReportHostFileError("SaveData.remove_temporary", temporary, error);
 	return SAVE_DATA_ERROR_INTERNAL;
 }
 
@@ -370,7 +375,8 @@ static int read_save_blocks(const std::filesystem::path& directory, uint64_t* bl
 
 static int read_save_param(const std::filesystem::path& path, SaveDataParam* param) {
 	std::error_code error;
-	const bool exists = std::filesystem::exists(path, error);
+	const bool exists = std::filesystem::exists(Common::NativeHostPath(path), error);
+	Common::ReportHostFileError("SaveData.exists", path, error);
 	if (error) {
 		return SAVE_DATA_ERROR_INTERNAL;
 	}
@@ -397,7 +403,7 @@ static int64_t newest_save_time(const std::filesystem::path& directory) {
 	int64_t mtime = 0;
 	std::error_code error;
 	for (std::filesystem::recursive_directory_iterator it(
-	         directory, std::filesystem::directory_options::skip_permission_denied, error),
+	         Common::NativeHostPath(directory), std::filesystem::directory_options::skip_permission_denied, error),
 	     end;
 	     it != end; it.increment(error)) {
 		if (error) {
@@ -426,7 +432,8 @@ static int load_save_param(const std::filesystem::path& directory, SaveDataParam
 
 static int save_memory(const std::filesystem::path& directory, const SaveDataMemory& memory) {
 	std::error_code error;
-	std::filesystem::create_directories(directory, error);
+	std::filesystem::create_directories(Common::NativeHostPath(directory), error);
+	Common::ReportHostFileError("SaveData.create_directories", directory, error);
 	if (error) {
 		return SAVE_DATA_ERROR_INTERNAL;
 	}
@@ -442,7 +449,8 @@ static int save_memory(const std::filesystem::path& directory, const SaveDataMem
 static int load_memory(const std::filesystem::path& directory, SaveDataMemory* memory,
                        size_t* existed_size) {
 	std::error_code error;
-	const bool      exists = std::filesystem::exists(directory / "memory.dat", error);
+	const bool      exists = std::filesystem::exists(Common::NativeHostPath(directory / "memory.dat"), error);
+	Common::ReportHostFileError("SaveData.exists", directory / "memory.dat", error);
 	if (error) {
 		return SAVE_DATA_ERROR_INTERNAL;
 	}
@@ -714,21 +722,22 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		}
 		const auto metadata = mount_dir / "sce_sys";
 		std::error_code error;
-		std::filesystem::create_directories(metadata, error);
+		std::filesystem::create_directories(Common::NativeHostPath(metadata), error);
+		Common::ReportHostFileError("SaveData.create_directories", metadata, error);
 		if (error) {
 			return SAVE_DATA_ERROR_INTERNAL;
 		}
 		const int status = write_save_file(metadata / "blocks.bin", &mount->blocks,
 		                                   sizeof(mount->blocks));
 		if (status != OK) {
-			std::filesystem::remove_all(mount_dir, error);
+			std::filesystem::remove_all(Common::NativeHostPath(mount_dir), error);
 			return status;
 		}
 		const SaveDataParam initial {};
 		const int param_status = write_save_file(save_param_path(mount_dir), &initial,
 		                                         sizeof(initial));
 		if (param_status != OK) {
-			std::filesystem::remove_all(mount_dir, error);
+			std::filesystem::remove_all(Common::NativeHostPath(mount_dir), error);
 			return param_status;
 		}
 		created = true;
@@ -1025,7 +1034,8 @@ int KYTY_SYSV_ABI SaveDataDelete(const SaveDataDelete* del) {
 		return SAVE_DATA_ERROR_BUSY;
 	}
 	std::error_code error;
-	std::filesystem::remove_all(dir, error);
+	std::filesystem::remove_all(Common::NativeHostPath(dir), error);
+	Common::ReportHostFileError("SaveData.remove_all", dir, error);
 
 	return error ? SAVE_DATA_ERROR_INTERNAL : OK;
 }
@@ -1163,10 +1173,12 @@ int KYTY_SYSV_ABI SaveDataGetEventResult(const void* event_param, SaveDataEvent*
 
 	Common::LockGuard lock(g_mount_mutex);
 	if (g_save_data_events.empty()) {
+		Common::StallDump::Note("SaveData.no_event");
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
 
 	*event = g_save_data_events.front();
+	Common::StallDump::Note("SaveData.event", event->type, static_cast<uint32_t>(event->error_code));
 	g_save_data_events.pop_front();
 
 	LOGF("\t type       = %" PRIu32 "\n"

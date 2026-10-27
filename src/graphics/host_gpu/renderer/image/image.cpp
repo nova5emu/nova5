@@ -1,10 +1,13 @@
+#include "common/gpuThreadSampler.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include "common/assert.h"
+#include "common/frameTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/gpuTimeProfile.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -224,7 +227,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+                    std::optional<ImageSubresourceRange> range, NativeCommands command_buffer) {
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};
@@ -241,16 +244,20 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (barriers.empty()) {
 		return;
 	}
+	RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op::Transition, info,
+	    static_cast<uint32_t>(destination_layout));
 	m_scheduler.EndRendering();
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
 	dependency.pImageMemoryBarriers    = barriers.data();
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command_buffer.pipelineBarrier2(dependency);
 }
 
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+	RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op::Upload, info, 0, size);
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
@@ -271,8 +278,10 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.pBufferMemoryBarriers    = &buffer_barrier;
 	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
 	dependency.pImageMemoryBarriers     = image_barriers.data();
-	auto command                        = m_scheduler.Current().Handle();
+	auto command                        = m_scheduler.Current().Commands();
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier2(dependency);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 	command.copyBufferToImage(buffer, backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
@@ -282,6 +291,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 	dependency.imageMemoryBarrierCount = 0;
 	dependency.pImageMemoryBarriers    = nullptr;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier2(dependency);
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
@@ -289,7 +299,9 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 
 void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
                      uint64_t offset, uint64_t size) {
+	Common::GpuThreadSampler::ImmediateScope boundary_immediate {Common::GpuThreadSampler::Boundary::Readback};
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+	RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op::Download, info, 0, size);
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
@@ -311,8 +323,10 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	dependency.pBufferMemoryBarriers    = &buffer_barrier;
 	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
 	dependency.pImageMemoryBarriers     = image_barriers.data();
-	auto command                        = m_scheduler.Current().Handle();
+	auto command                        = m_scheduler.Current().Commands();
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier2(dependency);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 	command.copyImageToBuffer(backing.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
@@ -322,6 +336,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 	dependency.imageMemoryBarrierCount = 0;
 	dependency.pImageMemoryBarriers    = nullptr;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier2(dependency);
 }
 
@@ -349,6 +364,7 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 
 void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
+	RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op::Copy, info);
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
 	const uint32_t base_depth = source.backing.image_type == backing.image_type
@@ -390,14 +406,20 @@ void Image::CopyImage(Image& source) {
 			copy.extent                    = {width, height, destination_layers};
 		}
 		copies.push_back(copy);
+		Common::FrameTrace::Print(Common::FrameTrace::ActiveId(),
+		    "image_copy src=0x%llx dst=0x%llx src_extent=%ux%u dst_extent=%ux%u mip=%u region=(0,0,%u,%u) layers=%u",
+		    static_cast<unsigned long long>(source.info.data.address), static_cast<unsigned long long>(info.data.address),
+		    source.backing.extent.width, source.backing.extent.height, backing.extent.width, backing.extent.height,
+		    level, copy.extent.width, copy.extent.height, copy.srcSubresource.layerCount);
 	}
 	if (copies.empty()) {
 		return;
 	}
-	auto command = m_scheduler.Current().Handle();
+	auto command = m_scheduler.Current().Commands();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, static_cast<uint32_t>(copies.size()),
 	                  copies.data());
@@ -425,6 +447,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	const auto destination_height =
 	    std::max(backing.extent.height >> destination_range.base_level, 1u);
 	const bool copy = source.backing.samples == 1;
+	RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op::Resolve, info, uint32_t(copy));
 	EXIT_IF(layers == 0 || info.extent.width > source_width || info.extent.height > source_height ||
 	        info.extent.width > destination_width || info.extent.height > destination_height ||
 	        (copy ? !ImageViewOps::FormatsCompatible(source.backing.format, backing.format)
@@ -434,9 +457,14 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	resolved_source_range.layer_count      = layers;
 	resolved_destination_range.layer_count = layers;
 	const vk::Extent3D resolve_extent {info.extent.width, info.extent.height, 1};
+	Common::FrameTrace::Print(Common::FrameTrace::ActiveId(),
+	    "image_resolve copy=%u src=0x%llx dst=0x%llx src_extent=%ux%u dst_extent=%ux%u src_mip=%u dst_mip=%u src_layer=%u dst_layer=%u region=(0,0,%u,%u) layers=%u",
+	    copy, static_cast<unsigned long long>(source.info.data.address), static_cast<unsigned long long>(info.data.address),
+	    source_width, source_height, destination_width, destination_height, source_range.base_level, destination_range.base_level,
+	    source_range.base_layer, destination_range.base_layer, resolve_extent.width, resolve_extent.height, layers);
 
 	m_scheduler.EndRendering();
-	auto command = m_scheduler.Current().Handle();
+	auto command = m_scheduler.Current().Commands();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	               resolved_source_range, command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
@@ -449,6 +477,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
+		Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 		                  vk::ImageLayout::eTransferDstOptimal, region);
 	} else {
@@ -459,6 +488,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
+		Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 		command.resolveImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     backing.image, vk::ImageLayout::eTransferDstOptimal, region);
 	}
@@ -472,6 +502,7 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 }
 
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler) {
+	RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op::Copy, info, 1);
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
@@ -505,7 +536,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;
 	dependency.pBufferMemoryBarriers    = &barrier;
-	auto command                        = m_scheduler.Current().Handle();
+	auto command                        = m_scheduler.Current().Commands();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
@@ -548,7 +579,9 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 				barrier.size          = copy_size;
 				barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
 				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+				Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 				command.pipelineBarrier2(dependency);
+				Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 				command.copyImageToBuffer(source.backing.image,
 				                          vk::ImageLayout::eTransferSrcOptimal, buffer.Handle(),
 				                          source_copy);
@@ -563,8 +596,10 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 				} else {
 					barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
 					barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+					Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 					command.pipelineBarrier2(dependency);
 				}
+				Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 				command.copyBufferToImage(buffer.Handle(), backing.image,
 				                          vk::ImageLayout::eTransferDstOptimal, destination_copy);
 			}
@@ -575,6 +610,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 }
 
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
+	RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op::Copy, info, 2);
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);
 	m_scheduler.EndRendering();
@@ -597,10 +633,11 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 		copy.dstSubresource = {aspect, mip, layer, destination_layers};
 		copy.extent         = {width, height, depth};
 	}
-	auto command = m_scheduler.Current().Handle();
+	auto command = m_scheduler.Current().Commands();
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
 	Transit(vk::ImageLayout::eGeneral,

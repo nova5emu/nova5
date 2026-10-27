@@ -1,3 +1,4 @@
+#include "common/hostPath.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -689,7 +690,7 @@ static const char* fallback_font_file_name(bool bold, bool italic) {
 }
 
 static std::vector<uint8_t> read_file_bytes(const std::filesystem::path& path) {
-	std::ifstream file(path, std::ios::binary | std::ios::ate);
+	std::ifstream file(Common::NativeHostPath(path), std::ios::binary | std::ios::ate);
 	if (!file) {
 		return {};
 	}

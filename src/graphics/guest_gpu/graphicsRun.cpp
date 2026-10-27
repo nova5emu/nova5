@@ -4,10 +4,13 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/frameTimeline.h"
+#include "common/gpuThreadSampler.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/submitProfile.h"
+#include "common/threadDelay.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -21,6 +24,7 @@
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#include "kernel/pthread.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
 
@@ -102,6 +106,14 @@ void GuestGpu::Wake() {
 	m_work_available.Signal();
 }
 
+void GuestGpu::WakeClockCompletions() {
+	Common::LockGuard lock(m_queue_mutex);
+	if (m_stopping) return; // The shutdown lane's Finish harvests everything.
+	m_clock_completions = true;
+	m_wake_pending = true; // Retry a blocked WAIT_REG_MEM after harvesting, without the stall timeout.
+	m_work_available.Signal();
+}
+
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
@@ -165,9 +177,19 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 
 void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
+	using namespace Common::FrameTimeline;
+	const auto frame = Enabled() ? m_timeline_frame.load() : 0;
+	if (Recording()) {
+		if (NeedsName()) {
+			char name[32] {};
+			if (LibKernel::PthreadGetname(LibKernel::PthreadSelfOrNull(), name) == OK) Name(name);
+		}
+		Event(Kind::SuspendEnter, frame, 0, 0, frame - 1);
+	}
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
 	// finish the preceding graphics frame. The first point returns immediately.
 	m_suspend_point_ready->acquire();
+	Event(Kind::SuspendReturn, frame, 0, 0, frame ? frame - 1 : 0);
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
@@ -278,7 +300,10 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	const T value = *addr;
-	if (!TestWaitRegMemValue(value, ref, mask, func)) {
+	const bool passed = TestWaitRegMemValue(value, ref, mask, func);
+	Common::FrameTimeline::Current(passed ? Common::FrameTimeline::Kind::WaitRegMemPassed : Common::FrameTimeline::Kind::WaitRegMemBlocked,
+	    0, reinterpret_cast<uint64_t>(addr), value, ref, mask);
+	if (!passed) {
 		Common::SubmitProfile::NoteWaitRegMem(IsAsyncComputeQueue() ? 1u : 0u, addr, value, ref,
 		                                      mask, func, static_cast<uint32_t>(sizeof(T) * 8));
 		SuspendPm4();
@@ -308,6 +333,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	}
 
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
+	m_renderer.GetGuestClock().Cancel(reinterpret_cast<uint64_t>(dst),
+	                                 write_one_address ? sizeof(uint32_t) : uint64_t{dw_num} * sizeof(uint32_t));
 	auto* output = static_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
 		*output = src[i];
@@ -315,14 +342,26 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	}
 }
 
-void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
+void CommandProcessor::ObserveReferenceClock(uint64_t address, uint64_t value, uint32_t bytes,
+                                             bool release, uint32_t control, uint32_t event) {
+	if (!GpuTimeProfile::GuestClockRecording()) return;
+	m_renderer.GetGpuTimeProfile().ObserveGuestClock(GetScheduler(),
+	    {.address = address, .cpu_reference = value, .submit = m_submit_id,
+	     .frame = m_renderer.HasGpu() ? static_cast<uint32_t>(m_renderer.GetGpu().GetFrameNum()) : 0u,
+	     .bytes = bytes, .control = control, .event = event,
+	     .queue = m_interrupt_event_id, .release = release});
+}
+
+void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes, uint32_t control) {
 	if (dst_address == 0 || (num_bytes != sizeof(uint32_t) && num_bytes != sizeof(uint64_t)) ||
 	    (dst_address & (num_bytes - 1u)) != 0) {
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
+	m_renderer.GetGuestClock().Cancel(dst_address, num_bytes);
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	ObserveReferenceClock(dst_address, value, num_bytes, false, control, 0);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -390,6 +429,17 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	if (Common::FrameTimeline::Enabled()) {
+		using namespace Common::FrameTimeline;
+		submission.timeline_frame = m_timeline_frame.load();
+		submission.timeline_submission = ++m_timeline_submission;
+		Event(Kind::Enqueue, submission.timeline_frame, submission.timeline_submission, 0,
+		      submission.queue_id, static_cast<uint64_t>(submission.type), submission.commands.size(), submission.flip_request_id);
+		if (submission.type == SubmissionType::SuspendPoint) {
+			Event(Kind::FrameBoundary, submission.timeline_frame, submission.timeline_submission);
+			m_timeline_frame.fetch_add(1);
+		}
+	}
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -410,6 +460,8 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
+	Common::GpuThreadSampler::Session gpu_sampler(Config::ProfilerEnabled());
+	Common::FrameTimeline::Session frame_timeline;
 
 	for (;;) {
 		SubmitProfileRuntime::Tick();
@@ -419,7 +471,8 @@ void GuestGpu::ThreadRun(void* data) {
 		bool                         should_stop    = false;
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
-			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping &&
+			       !gpu->m_clock_completions) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
@@ -428,6 +481,10 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = false;
 				gpu->m_idle.SignalAll();
 				should_stop = true;
+			} else if (gpu->m_clock_completions) {
+				gpu->m_clock_completions = false;
+				command = [gpu] { gpu->m_renderer.GetCommandScheduler().PopPendingOperations(); };
+				gpu->m_processing = true;
 			} else if (!gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
 				gpu->m_commands.pop_front();
@@ -474,6 +531,7 @@ void GuestGpu::ThreadRun(void* data) {
 		if (should_stop) {
 			SubmitProfileRuntime::Shutdown();
 			gpu->m_gfx_cp->BufferWait();
+			gpu->m_renderer.GetCommandScheduler().StopRecorder();
 			g_gpu_state  = nullptr;
 			g_gpu_thread = false;
 			return;
@@ -525,6 +583,10 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
+	using namespace Common::FrameTimeline;
+	ContextScope timeline_context(submission.timeline_frame, submission.timeline_submission);
+	Name("GPU command");
+	Current(Kind::SliceBegin, m_renderer.GetCommandScheduler().CurrentTick(), submission.queue_id, static_cast<uint64_t>(submission.type));
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
 
@@ -575,16 +637,21 @@ bool GuestGpu::Process(Submission& submission) {
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
+			    [ready = m_suspend_point_ready] {
+				    Common::FrameTimeline::Current(Common::FrameTimeline::Kind::SuspendRelease);
+				    ready->release();
+			    });
 			{
 				Common::SubmitProfile::ReasonScope reason(
 				    Common::SubmitProfile::Reason::SuspendPoint);
 				cp.BufferFlush();
 			}
 			cp.Reset();
+			Current(Kind::CpuFrameEnd);
 			break;
 	}
 
+	Current(Kind::SliceEnd, m_renderer.GetCommandScheduler().CurrentTick(), complete, submission.queue_id);
 	return complete;
 }
 
@@ -1014,7 +1081,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		const auto& args = *reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(addr);
 		PatchIndirectDrawOffsets(*this, registers, static_cast<uint32_t>(args.vertexOffset),
 		                         args.firstInstance, args.firstIndex);
-		const DrawIndexArgs draw {.index_count         = args.indexCount,
+		const uint32_t issued = Common::SubmitProfile::ExperimentActive(Common::SubmitProfile::Experiment::LegacyIndexClamp)
+		    ? std::min(args.indexCount, max_indices) : args.indexCount;
+		Common::SubmitProfile::RecordIndirectIndices(args.indexCount, args.firstIndex, max_indices, args.instanceCount, issued);
+		const DrawIndexArgs draw {.index_count         = issued,
 		                          .index_addr          = IndexAddress(std::min(args.firstIndex, max_indices)),
 		                          .instance_count      = args.instanceCount,
 		                          .index_type_and_size = m_index_type_and_size,
@@ -1097,15 +1167,19 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	// Stall only this command processor, not the host command lane or other queues.
-	if (!m_renderer.GetVideoOut().IsSafeForRendering(static_cast<int>(video_out_handle),
-	                                                 static_cast<int>(display_buffer_index))) {
+	const bool safe = m_renderer.GetVideoOut().IsSafeForRendering(static_cast<int>(video_out_handle),
+	                                                 static_cast<int>(display_buffer_index));
+	Common::FrameTimeline::Current(safe ? Common::FrameTimeline::Kind::WaitFlipPassed : Common::FrameTimeline::Kind::WaitFlipBlocked,
+	    0, video_out_handle, display_buffer_index);
+	if (!safe) {
 		Common::SubmitProfile::NoteBlock(Common::SubmitProfile::Block::WaitFlip);
 		SuspendPm4();
 	}
 }
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
-                                  uint64_t data, uint32_t interrupt_context_id) {
+                                  uint64_t data, uint32_t interrupt_context_id,
+                                  uint32_t event_control, uint32_t data_control) {
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::ReleaseMem()\n"
 		     "\t data_sel           = %" PRIu32 "\n"
@@ -1137,11 +1211,27 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		case 0: break;
 		case 1: {
 			const auto value = static_cast<uint32_t>(data);
+			m_renderer.GetGuestClock().Cancel(reinterpret_cast<uint64_t>(address), sizeof(value));
 			std::memcpy(address, &value, sizeof(value));
+			Common::FrameTimeline::Current(Common::FrameTimeline::Kind::LabelWrite, GetScheduler().CurrentTick(),
+			    reinterpret_cast<uint64_t>(address), value, sizeof(value), data_sel);
 			break;
 		}
-		case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
-		case 2: std::memcpy(address, &data, sizeof(data)); break;
+		case 3: {
+			if (m_renderer.GetGuestClock().Record(reinterpret_cast<uint64_t>(address))) break;
+			data = Sync::ReadReferenceClock();
+			m_renderer.GetGuestClock().Cancel(reinterpret_cast<uint64_t>(address), sizeof(data));
+			std::memcpy(address, &data, sizeof(data));
+			ObserveReferenceClock(reinterpret_cast<uint64_t>(address), data, sizeof(data),
+			                      true, data_control, event_control);
+			break;
+		}
+		case 2:
+			m_renderer.GetGuestClock().Cancel(reinterpret_cast<uint64_t>(address), sizeof(data));
+			std::memcpy(address, &data, sizeof(data));
+			Common::FrameTimeline::Current(Common::FrameTimeline::Kind::LabelWrite, GetScheduler().CurrentTick(),
+			    reinterpret_cast<uint64_t>(address), data, sizeof(data), data_sel);
+			break;
 		case 5: {
 			GetScheduler().Finish();
 			const auto gds = static_cast<uint32_t>(data);
@@ -1254,12 +1344,19 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
-	(void)command.Handle();
+	Common::FrameTimeline::Current(Common::FrameTimeline::Kind::FlipLink, GetScheduler().CurrentTick(), request, handle, index, flip_arg);
+	EXIT_IF(command.IsInvalid());
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
 	Common::SubmitProfile::ReasonScope reason(Common::SubmitProfile::Reason::Flip);
 	Common::SubmitProfile::NoteFlip();
+	Common::GpuThreadSampler::FrameBoundary();
+	GetScheduler().RecorderFrame();
+	m_renderer.GetBufferCache().BufferUploadProfileFrame();
 	GetScheduler().Flush();
+	// Once per flip, after submitting this frame: stall the GPU command worker
+	// before it processes subsequent packets, while native GPU work can run.
+	Common::ThreadDelay::Apply<Common::ThreadDelay::Site::Gpu>("gpu_flip_after_flush", "GPU command");
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
@@ -1274,11 +1371,16 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	ProcessorScope processor_scope(*this);
 
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
+	Common::FrameTimeline::Current(Common::FrameTimeline::Kind::FlipLink, GetScheduler().CurrentTick(), request_id);
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
 	Common::SubmitProfile::ReasonScope reason(Common::SubmitProfile::Reason::Flip);
 	Common::SubmitProfile::NoteFlip();
+	Common::GpuThreadSampler::FrameBoundary();
+	GetScheduler().RecorderFrame();
+	m_renderer.GetBufferCache().BufferUploadProfileFrame();
 	GetScheduler().Flush();
+	Common::ThreadDelay::Apply<Common::ThreadDelay::Site::Gpu>("cpu_flip_after_flush", "GPU command");
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

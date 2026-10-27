@@ -82,11 +82,11 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
-void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
+void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size, Common::BufferUploadProfile::Cause cause) {
 	CheckNotInUploadCallback();
-	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	Iterate<true>(vaddr, size, [cause](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
-		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes, cause);
 	});
 }
 
@@ -126,7 +126,8 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 		EXIT("cannot untrack GPU-dirty memory\n");
 	}
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes,
+		    Common::BufferUploadProfile::Cause::Untrack);
 	});
 }
 

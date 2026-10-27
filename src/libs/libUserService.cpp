@@ -1,3 +1,4 @@
+#define KYTY_STALL_HLE
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -68,6 +69,7 @@ static KYTY_SYSV_ABI int UserServiceGetInitialUser(int* user_id) {
 	EXIT_NOT_IMPLEMENTED(user_id == nullptr);
 
 	*user_id = Config::GetUserId();
+	Common::StallDump::Observe("UserService.initial_user", *user_id);
 
 	return OK;
 }
@@ -85,10 +87,13 @@ static KYTY_SYSV_ABI int UserServiceGetEvent(SceUserServiceEvent* event) {
 			logged_in[player] = connected;
 			event->event_type = connected ? UserServiceEventTypeLogin : UserServiceEventTypeLogout;
 			event->user_id    = Config::GetPlayerUserId(player);
+			Common::StallDump::Observe("UserService.event", event->user_id, event->event_type);
 			return OK;
 		}
 	}
 
+	Common::StallDump::Note("UserService.no_event");
+	Common::StallDump::Observe("UserService.no_event");
 	return USER_SERVICE_ERROR_NO_EVENT;
 }
 

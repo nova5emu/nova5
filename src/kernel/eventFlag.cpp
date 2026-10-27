@@ -1,3 +1,4 @@
+#include "common/stallDump.h"
 #include "kernel/eventFlag.h"
 
 #include "common/assert.h"
@@ -286,6 +287,7 @@ int KYTY_SYSV_ABI KernelDeleteEventFlag(KernelEventFlag ef) {
 
 int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, uint32_t wait_mode,
                                       uint64_t* result_pat, KernelUseconds* timeout) {
+	Common::StallDump::Scope stall_wait(__func__, reinterpret_cast<uintptr_t>(ef), true);
 	PRINT_NAME();
 
 	if (ef == nullptr) {
@@ -341,6 +343,7 @@ int KYTY_SYSV_ABI KernelPollEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 }
 
 int KYTY_SYSV_ABI KernelSetEventFlag(KernelEventFlag ef, uint64_t bit_pattern) {
+	Common::StallDump::Scope stall_signal(__func__, reinterpret_cast<uintptr_t>(ef));
 	PRINT_NAME();
 
 	if (ef == nullptr) {
@@ -353,6 +356,7 @@ int KYTY_SYSV_ABI KernelSetEventFlag(KernelEventFlag ef, uint64_t bit_pattern) {
 }
 
 int KYTY_SYSV_ABI KernelClearEventFlag(KernelEventFlag ef, uint64_t bit_pattern) {
+	Common::StallDump::Scope stall_signal(__func__, reinterpret_cast<uintptr_t>(ef));
 	PRINT_NAME();
 
 	if (ef == nullptr) {
@@ -366,6 +370,7 @@ int KYTY_SYSV_ABI KernelClearEventFlag(KernelEventFlag ef, uint64_t bit_pattern)
 
 int KYTY_SYSV_ABI KernelCancelEventFlag(KernelEventFlag ef, uint64_t set_pattern,
                                         int* num_wait_threads) {
+	Common::StallDump::Scope stall_signal(__func__, reinterpret_cast<uintptr_t>(ef));
 	PRINT_NAME();
 
 	if (ef == nullptr) {

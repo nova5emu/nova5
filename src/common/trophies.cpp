@@ -1,6 +1,7 @@
 #include "common/trophies.h"
 
 #include "common/file.h"
+#include "common/hostPath.h"
 #include "common/localization.h"
 
 #include <algorithm>
@@ -301,12 +302,13 @@ bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks
 	file.Close();
 	std::error_code error;
 	if (complete) {
-		std::filesystem::rename(temporary, path, error);
+		std::filesystem::rename(NativeHostPath(temporary), NativeHostPath(path), error);
+		ReportHostFileError("Trophies.rename", path, error);
 		if (!error) {
 			return true;
 		}
 	}
-	std::filesystem::remove(temporary, error);
+	std::filesystem::remove(NativeHostPath(temporary), error);
 	return false;
 }
 

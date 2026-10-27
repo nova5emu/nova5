@@ -1,3 +1,4 @@
+#include "common/gpuThreadSampler.h"
 #include "common/renderStageProfile.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -249,6 +250,8 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
+	Common::GpuThreadSampler::PhaseScope boundary_prepare {Common::GpuThreadSampler::Phase::Prepare};
+	if (Common::GpuThreadSampler::boundary_state) Common::GpuThreadSampler::NameCaller("RenderExecutor::DispatchDirect");
 	Common::RenderStageProfile::Scope stage_profile {Common::RenderStageProfile::Stage::Compute};
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -360,6 +363,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
+	if (program.has_address_writes)
+		m_context.GetBufferCache().ExcludeHotRange(0, UINT64_MAX, Common::SubmitProfile::Extra::HotRetireGpu);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
@@ -369,10 +374,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
+	Common::GpuThreadSampler::PhaseScope boundary_emit {Common::GpuThreadSampler::Phase::DispatchEmit};
 
-	auto              vk_buffer        = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+	const auto& vk_buffer = buffer;
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
@@ -449,7 +455,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+
+	vk_buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
@@ -464,12 +471,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 					if ((x | y | z) != 0u) {
 						ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 					}
-					vk_buffer.dispatchBase(x, y, z, 1, 1, 1);
+					vk_buffer.DispatchBase(x, y, z, 1, 1, 1);
 				}
 			}
 		}
 	} else {
-		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		vk_buffer.Dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	Common::SubmitProfile::NoteDispatch();
@@ -481,6 +488,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
+	Common::GpuThreadSampler::PhaseScope boundary_prepare {Common::GpuThreadSampler::Phase::Prepare};
+	if (Common::GpuThreadSampler::boundary_state) Common::GpuThreadSampler::NameCaller("RenderExecutor::DispatchIndirect");
 	Common::RenderStageProfile::Scope stage_profile {Common::RenderStageProfile::Stage::Compute};
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
@@ -511,6 +520,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = input_info.stage.module->info;
+	if (program.has_address_writes)
+		m_context.GetBufferCache().ExcludeHotRange(0, UINT64_MAX, Common::SubmitProfile::Extra::HotRetireGpu);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
@@ -521,12 +532,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
-	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
+	    args_addr, sizeof(vk::DispatchIndirectCommand), false, false, {}, Common::BufferUploadProfile::Use::Indirect);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	Common::GpuThreadSampler::PhaseScope boundary_emit {Common::GpuThreadSampler::Phase::DispatchEmit};
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	const auto vk_buffer = buffer.Handle();
+	const auto& vk_buffer = buffer;
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage) ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
@@ -539,13 +551,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+	vk_buffer.EmitMemoryBarrier(vk::PipelineStageFlagBits::eAllGraphics |
 	                              vk::PipelineStageFlagBits::eComputeShader |
 	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	                          vk::PipelineStageFlagBits::eDrawIndirect, barrier);
+	vk_buffer.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	vk_buffer.DispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	Common::SubmitProfile::NoteDispatch();
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

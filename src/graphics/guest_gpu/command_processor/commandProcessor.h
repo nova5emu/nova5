@@ -84,7 +84,7 @@ public:
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
 	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed);
 	void ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address, uint64_t data,
-	                uint32_t interrupt_context_id);
+	                uint32_t interrupt_context_id, uint32_t event_control = 0, uint32_t data_control = 0);
 	void Flip(int handle, int index, int flip_mode, int64_t flip_arg);
 	void PrepareCpuFlip(uint64_t request_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
@@ -98,7 +98,7 @@ public:
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
-	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
+	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes, uint32_t control = 0);
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
 	             uint64_t dst_address_or_offset, uint8_t src_sel, uint8_t src_cache_policy,
 	             uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
@@ -118,6 +118,8 @@ private:
 	void ProcessPm4(Pm4Execution& execution);
 	friend struct CommandProcessorTestAccess;
 	void SuspendPm4();
+	void ObserveReferenceClock(uint64_t address, uint64_t value, uint32_t bytes,
+	                           bool release, uint32_t control, uint32_t event);
 	uint32_t            NumInstances();
 	const void*         IndexAddress(uint32_t first_index) const;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }

@@ -251,9 +251,15 @@ uint64_t SysFileSize(sys_file_t& f) {
 }
 
 bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
+	return SysFileGetInfo(name, is_file, size, nullptr);
+}
+
+bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size, std::error_code* error) {
+	if (error) { error->clear(); }
 	const auto path = get_internal_name(name);
 	struct stat info {};
 	if (stat(path.c_str(), &info) != 0) {
+		if (error) { *error = std::error_code(errno, std::generic_category()); }
 		return false;
 	}
 	*is_file = !S_ISDIR(info.st_mode);

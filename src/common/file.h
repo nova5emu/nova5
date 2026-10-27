@@ -78,6 +78,7 @@ public:
 
 	static uint64_t Size(const std::filesystem::path& name);
 	static std::optional<Info> GetInfo(const std::filesystem::path& name);
+	static std::optional<Info> GetInfo(const std::filesystem::path& name, std::error_code* error);
 
 	static bool IsDirectoryExisting(const std::filesystem::path& path);
 	static bool IsFileExisting(const std::filesystem::path& name);

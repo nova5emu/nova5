@@ -1,3 +1,4 @@
+#include "common/gpuThreadSampler.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include "common/alignment.h"
@@ -262,7 +263,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	                     target_capacity % 4 != 0);
 
 	m_scheduler.EndRendering();
-	auto                    command = m_scheduler.Current().Handle();
+	auto                    command = m_scheduler.Current().Commands();
 	vk::BufferMemoryBarrier barriers[3] {};
 	barriers[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite;
 	barriers[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
@@ -284,15 +285,18 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	barriers[2].buffer        = m_stream_buffer.Handle();
 	barriers[2].offset        = tiling.params_offset;
 	barriers[2].size          = tiling.params_size;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer, {}, 0,
 	    nullptr, 3, barriers, 0, nullptr);
 	if (clear_target) {
+		Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 		command.fillBuffer(target, target_offset, target_capacity, 0);
 		barriers[1].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		barriers[1].dstAccessMask =
 		    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+		Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 		                        vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 1,
 		                        &barriers[1], 0, nullptr);
@@ -311,18 +315,22 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 		    index == 2 ? vk::DescriptorType::eUniformBuffer : vk::DescriptorType::eStorageBuffer;
 		writes[index].pBufferInfo = &infos[index];
 	}
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(tiling.pipeline_slot));
 	const uint64_t groups   = (uint64_t {tiling.num_texels} + 63u) / 64u;
 	const uint32_t groups_y = static_cast<uint32_t>(
 	    (groups + limits.maxComputeWorkGroupCount[0] - 1u) / limits.maxComputeWorkGroupCount[0]);
 	const uint32_t groups_x = static_cast<uint32_t>((groups + groups_y - 1u) / groups_y);
 	EXIT_NOT_IMPLEMENTED(groups_y > limits.maxComputeWorkGroupCount[1]);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.dispatch(groups_x, groups_y, 1);
 
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
 	                        &barriers[1], 0, nullptr);
@@ -464,7 +472,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	EXIT_IF(source.size < source_barrier_size || target.size < target_barrier_size);
 
 	m_scheduler.EndRendering();
-	auto                    command = m_scheduler.Current().Handle();
+	auto                    command = m_scheduler.Current().Commands();
 	vk::BufferMemoryBarrier barriers[2] {};
 	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -485,9 +493,11 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	                            vk::AccessFlagBits::eTransferWrite |
 	                            vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
 	const auto& limits              = m_graphics.GetPhysicalDeviceProperties().limits;
 	const auto descriptor_alignment = std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -533,6 +543,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 				writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
 				writes[index].pBufferInfo     = &infos[index];
 			}
+			Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 			command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 			                             static_cast<uint32_t>(writes.size()), writes.data());
 			Conversion push {};
@@ -542,14 +553,17 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			push.height      = rows;
 			push.source_pitch = static_cast<uint32_t>(layout.source_row_stride);
 			push.target_pitch = static_cast<uint32_t>(layout.target_row_stride);
+			Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 			command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 			                      sizeof(push), &push);
+			Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 			command.dispatch(static_cast<uint32_t>(groups_x), rows, 1);
 			row += rows;
 		}
 	}
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
 	                        &barriers[1], 0, nullptr);
@@ -598,11 +612,14 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eMemoryRead;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderWrite;
 	m_scheduler.EndRendering();
-	auto command = m_scheduler.Current().Handle();
+	auto command = m_scheduler.Current().Commands();
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_color_transform);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
 	Conversion push {};
@@ -611,11 +628,14 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	push.width           = pixels;
 	push.color_transform = static_cast<uint32_t>(transform);
 	push.to_host         = to_host;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.dispatch((pixels + 63u) / 64u, 1, 1);
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &barriers[1],
 	                        0, nullptr);
@@ -664,20 +684,26 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint32_t slices, uint32
 	    .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
 	    .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite};
 	m_scheduler.EndRendering();
-	auto command = m_scheduler.Current().Handle();
+	auto command = m_scheduler.Current().Commands();
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &barrier, 0, nullptr,
 	                        0, nullptr);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_color_clear);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
 	const Check push {source.base, static_cast<uint32_t>(metadata.size / 4 / slices), keys,
 	                  expand};
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.dispatch(slices, 1, 1);
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0, nullptr,
 	                        0, nullptr);

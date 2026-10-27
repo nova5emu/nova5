@@ -96,6 +96,7 @@ inline bool EvaluateSrtValue(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan 
   auto read_sites = std::move(plan.walker_read_sites);
   auto controls = std::move(plan.walker_control_disabled);
   const auto rejected = plan.walker_control_rejected;
+  const auto history = plan.walker_control_history;
   auto scratch = std::move(plan.srt_scratch);
   const auto user_data = plan.srt_user_data;
   const auto captures = plan.srt_captures;
@@ -106,6 +107,7 @@ inline bool EvaluateSrtValue(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan 
   plan.walker_read_sites = std::move(read_sites);
   plan.walker_control_disabled = std::move(controls);
   plan.walker_control_rejected = rejected;
+  plan.walker_control_history = history;
   plan.srt_scratch = std::move(scratch);
   plan.srt_user_data = user_data;
   plan.srt_captures = captures;

@@ -28,6 +28,11 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               guest_host_import_enabled             = false;
+	uint64_t                           host_import_alignment                 = 0;
+	uint32_t                           host_import_type_bits                 = 0;
+	uint32_t                           host_import_accepted_type_bits        = 0;
+	uint32_t                           host_import_memory_type               = UINT32_MAX;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
@@ -48,6 +53,7 @@ struct GraphicContext {
 	uint32_t                           max_subgroup_size                     = 0;
 	uint32_t                           max_push_descriptors                  = 0;
 	uint32_t                           device_clock_period_ps                = 0;
+	bool                               calibrated_timestamps_enabled         = false;
 	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;

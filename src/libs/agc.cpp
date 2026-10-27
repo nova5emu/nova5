@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "common/threadDelay.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -1524,6 +1525,19 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
 
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().SuspendPoint();
+	// SuspendPoint advances the emulator's frame number. Delay AFTER its
+	// semaphore wait/enqueue, so that wait cannot absorb the requested dose.
+	// This is the guest frame-submission caller, not necessarily MainThread.
+	if (Common::ThreadDelay::Enabled(Common::ThreadDelay::Site::GuestMain)) {
+		static thread_local const auto caller_name = [] {
+			std::array<char, 32> name {};
+			if (LibKernel::PthreadGetname(LibKernel::PthreadSelfOrNull(), name.data()) != OK) {
+				return std::string("unregistered guest caller");
+			}
+			return std::string(name.data());
+		}();
+		Common::ThreadDelay::Apply<Common::ThreadDelay::Site::GuestMain>("agc_suspend_point_return", caller_name.c_str());
+	}
 
 	return OK;
 }

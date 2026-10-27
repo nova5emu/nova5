@@ -112,6 +112,92 @@ void KYTY_SYSV_ABI Deallocate(void* object, void* data) {
 	::operator delete(data, std::align_val_t(0x100));
 }
 
+struct Completion {
+	Source*                  source  = nullptr;
+	std::unique_ptr<Source>* owner   = nullptr;
+	unsigned                 stops   = 0;
+	bool                     reenter = false;
+};
+void KYTY_SYSV_ABI OnCompletion(void* object, int32_t event, int32_t, void*) {
+	auto& c = *static_cast<Completion*>(object);
+	if (event != AVPLAYER_EVENT_STATE_STOP) {
+		return;
+	}
+	++c.stops;
+	if (c.reenter) {
+		Check(!c.source->Active(), "callback observes inactive player without deadlock");
+		Check(c.source->Stop() == 0, "reentrant Stop does not repeat completion");
+	}
+	if (c.owner) {
+		c.owner->reset(); // Models a close from the completion callback.
+	}
+}
+
+void CheckNaturalCompletion() {
+	for (int close_in_callback = 0; close_in_callback < 2; ++close_in_callback) {
+		VideoMemory                memory;
+		Completion                 completed;
+		const AvPlayerMemAllocator allocator {&memory, Allocate, Deallocate, Allocate, Deallocate};
+		auto source       = std::make_unique<Source>(allocator, AvPlayerFileReplacement {},
+		                                             AvPlayerEventReplacement {&completed, OnCompletion},
+		                                             6, false, 0);
+		completed.source  = source.get();
+		completed.reenter = true;
+		completed.owner   = close_in_callback ? &source : nullptr;
+		Check(source->Init("/app0/movie.m4v", AvPlayerSourceFileMp4) == 0,
+		      "open completion fixture");
+		source->SetSync(1);
+		Check(source->Start() == 0, "start completion fixture");
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		Check(source->Active() && completed.stops == 0,
+		      "unconsumed queued frames do not signal EOF");
+		unsigned   frames   = 0;
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+		while (source->Active()) {
+			AvPlayerFrameInfoEx frame {};
+			frames += source->Video(&frame);
+			Check(std::chrono::steady_clock::now() < deadline,
+			      "natural completion finishes after drain");
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		Check(frames == 24 && completed.stops == 1,
+		      "all frames delivered and exactly one natural STOP");
+		if (source) {
+			Check(!source->Active() && source->Stop() == 0,
+			      "repeated query and Stop after completion");
+			source.reset();
+		}
+		Check(completed.stops == 1 && memory.allocations == memory.deallocations,
+		      "close does not duplicate STOP and releases buffers");
+	}
+	VideoMemory                memory;
+	Completion                 completed;
+	const AvPlayerMemAllocator allocator {&memory, Allocate, Deallocate, Allocate, Deallocate};
+	Source                     source(allocator, {}, {&completed, OnCompletion}, 6, false, 0);
+	completed.source = &source;
+	Check(source.Init("/app0/movie.m4v", AvPlayerSourceFileMp4) == 0, "open loop fixture");
+	source.SetSync(1);
+	source.SetLoop(true);
+	Check(source.Start() == 0, "start looping fixture");
+	unsigned   frames   = 0;
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+	while (frames < 50) {
+		AvPlayerFrameInfoEx frame {};
+		Check(source.Active(), "loop remains active across EOF boundaries");
+		frames += source.Video(&frame);
+		Check(std::chrono::steady_clock::now() < deadline, "loop decodes more than two passes");
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	Check(source.Pause() == 0, "pause loop with pending frames");
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	AvPlayerFrameInfoEx frame {};
+	Check(source.Active() && !source.Video(&frame) && completed.stops == 0,
+	      "paused loop and lack of consumption do not manufacture completion");
+	source.Resume();
+	Check(source.Stop() == 0 && source.Stop() == 0 && completed.stops == 1,
+	      "explicit stop releases blocked looping decoder exactly once");
+}
+
 void CheckVideoReadAhead(const std::filesystem::path& root) {
 	// A 16x16 red MPEG-4 intra frame at 30 Hz; repeat it with increasing VOP times.
 	std::array<uint8_t, 50> frame {
@@ -210,6 +296,7 @@ int main() {
 	}
 	content_root = root;
 	CheckVideoReadAhead(root);
+	CheckNaturalCompletion();
 	std::error_code error;
 	std::filesystem::remove_all(root, error);
 	Check(!error, "release all archive handles");

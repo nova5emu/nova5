@@ -1,7 +1,10 @@
+#include "graphics/host_gpu/renderer/nativeCommands.h"
+#include "common/gpuThreadSampler.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/frameTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/submitProfile.h"
@@ -40,7 +43,7 @@ struct Presenter::Frame {
 	bool          blank        = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
-	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
+	void Transit(NativeCommands command, vk::ImageLayout layout, vk::AccessFlags2 access);
 	void CopyFrom(CommandBuffer& command, Image& source);
 	void Clear(CommandBuffer& command, const vk::ClearColorValue& color);
 };
@@ -203,7 +206,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	}
 }
 
-void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout,
+void Presenter::Frame::Transit(NativeCommands command, vk::ImageLayout layout,
                                vk::AccessFlags2 access) {
 	const auto     stage  = access == vk::AccessFlagBits2::eTransferRead ||
 	                                access == vk::AccessFlagBits2::eTransferWrite
@@ -233,6 +236,7 @@ void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = 1;
 	dependency.pImageMemoryBarriers    = &barrier;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	command.pipelineBarrier2(dependency);
 	image.state = {stage, access, layout};
 	image.subresource_states.clear();
@@ -240,7 +244,7 @@ void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout
 
 void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	command_buffer.EndRendering();
-	auto command = command_buffer.Handle();
+	auto command = command_buffer.Commands();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
@@ -250,15 +254,21 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	copy.extent         = {std::min(source.backing.extent.width, image.extent.width),
 	                       std::min(source.backing.extent.height, image.extent.height), 1};
 	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
+	Common::FrameTrace::Print(Common::FrameTrace::ActiveId(),
+	    "present_copy addr=0x%llx source=%ux%u prepared=%ux%u region=(0,0,%u,%u) mip=0 layers=%u",
+	    static_cast<unsigned long long>(source.info.data.address), source.backing.extent.width, source.backing.extent.height,
+	    image.extent.width, image.extent.height, copy.extent.width, copy.extent.height, copy.srcSubresource.layerCount);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
 }
 
 void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
 	command_buffer.EndRendering();
-	auto command = command_buffer.Handle();
+	auto command = command_buffer.Commands();
 	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
 	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 	command.clearColorImage(image.image, vk::ImageLayout::eTransferDstOptimal, &color, 1, &range);
 }
 
@@ -294,7 +304,7 @@ public:
 private:
 	vk::SurfaceFormatKHR SelectFormat();
 	void Destroy();
-	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer);
+	void DrawOverlay(NativeCommands command, const Presenter::Layer& layer);
 
 	WindowContext&   m_window;
 	vk::SwapchainKHR m_handle = nullptr;
@@ -352,6 +362,11 @@ struct Presenter::Impl {
 		auto&      cache      = renderer.GetTextureCache();
 		const auto image_id   = cache.FindImage(desc);
 		auto&      image      = cache.GetImage(image_id);
+		Common::FrameTrace::Print(Common::FrameTrace::ActiveId(),
+		    "resolve_surface requested_addr=0x%llx requested=%ux%u host_addr=0x%llx host=%ux%u mapped_mip=%u mapped_layer=%u",
+		    static_cast<unsigned long long>(info.data.address), info.extent.width, info.extent.height,
+		    static_cast<unsigned long long>(image.info.data.address), image.backing.extent.width, image.backing.extent.height,
+		    desc.view_info.base_level, desc.view_info.base_layer);
 		image.usage.video_out = true;
 		cache.UpdateImage(image_id);
 		return image;
@@ -644,7 +659,7 @@ bool Swapchain::PrepareSystemOverlay() {
 	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount());
 }
 
-void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer) {
+void Swapchain::DrawOverlay(NativeCommands command, const Presenter::Layer& layer) {
 	auto device = m_window.graphic_ctx.device;
 	if (m_overlay_pipeline == nullptr) {
 		vk::SamplerCreateInfo sampler {};
@@ -745,12 +760,15 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	write.descriptorCount = 1;
 	write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
 	write.pImageInfo      = &image;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_overlay_layout, 0, 1, &write);
 	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) |
 	                       (m_hdr_active ? 2u : 0u) | (frame.hdr ? 4u : 0u) |
 	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0,
 	                      sizeof(flags), &flags);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline);
 	vk::RenderingAttachmentInfo attachment {};
 	attachment.imageView   = m_image_views[m_image_index];
@@ -762,21 +780,26 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	rendering.layerCount           = 1;
 	rendering.colorAttachmentCount = 1;
 	rendering.pColorAttachments    = &attachment;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.beginRendering(&rendering);
 	const vk::Viewport viewport {
 	    0.0f, 0.0f, static_cast<float>(m_extent.width), static_cast<float>(m_extent.height),
 	    0.0f, 1.0f};
 	const vk::Rect2D scissor {{0, 0}, m_extent};
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.setViewport(0, 1, &viewport);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.setScissor(0, 1, &scissor);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.draw(3, 1, 0, 0);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.endRendering();
 }
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
 	EXIT_IF(m_image_index >= m_images.size());
-	auto       vk_command      = command.Handle();
+	auto       vk_command      = command.Commands();
 	const bool draw_overlay    = overlay.frame != nullptr;
 	const bool draw_attachment = draw_overlay || draw_system_overlay;
 	if (source != nullptr) {
@@ -802,6 +825,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	to_transfer.subresourceRange.baseArrayLayer = 0;
 	to_transfer.subresourceRange.layerCount     = 1;
 	// Match the acquire wait stage so the layout transition cannot precede acquisition.
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
 	                           nullptr, 0, nullptr, 1, &to_transfer);
@@ -822,11 +846,16 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		region.dstOffsets[1].x               = static_cast<int>(m_extent.width);
 		region.dstOffsets[1].y               = static_cast<int>(m_extent.height);
 		region.dstOffsets[1].z               = 1;
+		Common::FrameTrace::Print(Common::FrameTrace::ActiveId(),
+		    "present_blit source=(0,0,%u,%u) destination=(0,0,%u,%u) filter=linear",
+		    source->image.extent.width, source->image.extent.height, m_extent.width, m_extent.height);
+		Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
 	} else {
 		const vk::ClearColorValue black {};
+		Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
 		                           &black, 1, &to_transfer.subresourceRange);
 	}
@@ -848,6 +877,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	to_present.subresourceRange.levelCount     = 1;
 	to_present.subresourceRange.baseArrayLayer = 0;
 	to_present.subresourceRange.layerCount     = 1;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                           draw_attachment ? vk::PipelineStageFlagBits::eColorAttachmentOutput
 	                                           : vk::PipelineStageFlagBits::eAllCommands,
@@ -859,6 +889,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 			if (draw_system_overlay) {
 				to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
 				to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
+				Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 				vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
 				                           vk::PipelineStageFlagBits::eColorAttachmentOutput,
 				                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0,
@@ -866,12 +897,13 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 			}
 		}
 		if (draw_system_overlay) {
-			m_system_overlay->Record(vk_command, m_image_views[m_image_index]);
+			vk_command.Synchronous([&](vk::CommandBuffer native) { m_system_overlay->Record(native, m_image_views[m_image_index]); });
 		}
 		to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
 		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
 		to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
 		to_present.newLayout     = vk::ImageLayout::ePresentSrcKHR;
+		Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
 		vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
 		                           vk::PipelineStageFlagBits::eAllCommands,
 		                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
@@ -950,7 +982,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->CopyFrom(buffer, image);
 	if (headset) {
 		// The frame holds the raw display-encoded pixels the headset needs.
-		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
+		frame->Transit(buffer.Commands(), vk::ImageLayout::eTransferSrcOptimal,
 		               vk::AccessFlagBits2::eTransferRead);
 		Vr::OpenXrQueueEyeSource(buffer, frame->image);
 	}

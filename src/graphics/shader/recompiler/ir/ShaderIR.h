@@ -697,7 +697,17 @@ struct ResourcePlan {
 	std::vector<WalkerReadSite> walker_read_sites;
 	// GPU-thread adaptive control state, derived with the JIT, never serialized.
 	mutable std::vector<uint8_t> walker_control_disabled;
+	// Temporary original-pruning mode; retries are driven by materialization calls.
 	mutable bool walker_control_rejected = false;
+	struct WalkerControlHistory {
+		static constexpr uint32_t RetryInterval = 64; // Original materializations between probes.
+		uint32_t learned_sites = 0, retry_remaining = 0;
+		// Distinct observed plans/sites per submit-profile window (not serialized).
+		uint64_t profile_generation = 0;
+		uint32_t profile_learned = 0;
+		uint8_t profile_flags = 0;
+	};
+	mutable WalkerControlHistory walker_control_history;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
 	// GPU-thread scratch for walker results and material keys.

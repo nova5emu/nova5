@@ -851,6 +851,10 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	if (Common::GuestHostImport::retained_bytes.load(std::memory_order_relaxed)) {
+		std::lock_guard lock(Common::GuestHostImport::mutex);
+		EXIT_IF(Common::GuestHostImport::IntersectsLocked(vaddr, size)); // Scheduling must exclude this destination.
+	}
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
@@ -858,6 +862,21 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
+}
+
+std::shared_ptr<Common::GuestHostImport::Lease> AcquireHostImport(uint64_t vaddr, uint64_t size, Common::GuestHostImport::Reject* reason) {
+	return Common::GuestHostImport::Acquire(vaddr, size, [](Common::GuestHostImport::Span& span) {
+		return g_guest_address_space && g_guest_address_space->QueryImport(span);
+	}, reason);
+}
+
+bool TryCompareExchangeBacking64(uint64_t vaddr, uint64_t expected, uint64_t value) {
+	if (Common::GuestHostImport::retained_bytes.load(std::memory_order_relaxed)) {
+		std::lock_guard lock(Common::GuestHostImport::mutex);
+		EXIT_IF(Common::GuestHostImport::IntersectsLocked(vaddr, 8));
+	}
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryCompareExchangeBacking64(vaddr, expected, value);
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {

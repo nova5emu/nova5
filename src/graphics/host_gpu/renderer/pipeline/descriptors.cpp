@@ -139,7 +139,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	auto [buffer, offset] = [&] {
 		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::RebindObtain};
 		return context.GetBufferCache().ObtainBuffer<Profile>(address, size, resource.written,
-		    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+		    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id,
+		    resource.written ? Common::BufferUploadProfile::Use::ShaderWrite :
+		    resource.scalar ? Common::BufferUploadProfile::Use::ShaderScalarRead :
+		    resource.formatted ? Common::BufferUploadProfile::Use::ShaderFormattedRead : Common::BufferUploadProfile::Use::ShaderRead);
 	}();
 	const auto result = [&] {
 		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::RebindDescriptors};
@@ -1012,6 +1015,8 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	bool uses_image_heap = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
+		if (stage->runtime->module->info.has_address_writes)
+			m_context.GetBufferCache().ExcludeHotRange(0, UINT64_MAX, Common::SubmitProfile::Extra::HotRetireGpu);
 		uses_dma |= stage->runtime->module->info.info.uses_dma;
 		uses_image_heap |= stage->runtime->module->info.info.uses_image_heap;
 	}
@@ -1114,15 +1119,43 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	Common::RenderStageProfile::Scope stage_profile {Common::RenderStageProfile::Stage::CommitBindings};
+	const auto emission = PrepareBindingEmission(buffer, pipeline_bind_point, pipeline, prepared_bindings);
+	Common::RenderStageProfile::Scope emit_profile {Common::RenderStageProfile::Stage::BindingsEmit};
+	if (emission.state.heap_set)
+		Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
+	// Preparation may have submitted and rotated the command buffer. No native
+	// handle from before it may be used for any part of this binding emission.
+	buffer.EmitBindings(emission);
+}
+
+VkRecording::BindingEmission RenderExecutor::PrepareBindingEmission(
+    CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
+    const PipelineCache::Pipeline& pipeline, std::span<PreparedBindings* const> prepared_bindings) {
+	VkRecording::BindingEmission emission {};
+	emission.state.layout = pipeline.pipeline_layout;
+	emission.state.point = pipeline_bind_point;
+	emission.state.push_descriptors = pipeline.uses_push_descriptors;
+	bool unknown_import_bda = false;
+	if (m_context.GetBufferCache().HasHostImports()) {
+		for (auto* prepared: prepared_bindings) {
+			unknown_import_bda |= prepared->runtime->module->info.info.uses_dma;
+			for (const auto& resource: prepared->runtime->module->info.info.buffers) {
+				const auto index = resource.descriptor_index;
+				if (index == UINT32_MAX || resource.written) continue;
+				const auto& source = prepared->buffer_sources[index];
+				m_context.GetBufferCache().ResolveHostImportRead(source.address, source.size, prepared->buffers[index]);
+			}
+		}
+	}
 	using Stage = Common::RenderStageProfile::Stage;
 	using Extra = Common::SubmitProfile::Extra;
 	const bool count_ranges = Common::SubmitProfile::Recording();
 	uint64_t read_ranges = 0, write_ranges = 0, image_comparisons = 0, buffer_comparisons = 0;
 	KYTY_PROFILER_FUNCTION();
-	auto   vk_buffer        = buffer.Handle();
 	size_t image_descriptor_count = 0;
 	size_t write_count      = 0;
-	ShaderRecompiler::IR::PushData push_data;
+	m_binding_push_data = {};
+	auto& push_data = m_binding_push_data;
 	bool                           has_push_data = false;
 	constexpr auto                 GraphicsStages =
 	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eMeshEXT |
@@ -1211,7 +1244,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 	if (pipeline.uses_image_heap) {
 		Common::RenderStageProfile::Scope profile {Stage::BindingsImageHeap};
-		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
+		emission.state.heap_set = m_context.GetImageHeap().PrepareBinding(buffer);
+		emission.state.heap_index = ShaderRecompiler::IR::ImageHeapSet;
 	}
 	{
 		Common::RenderStageProfile::Scope profile {Stage::BindingsBuild};
@@ -1220,7 +1254,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		m_descriptor_writes.reserve(write_count);
 	}
 	size_t image_cursor = 0;
-	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
+	auto& address_buffers = m_address_descriptors;
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = prepared->runtime->module->info;
@@ -1232,7 +1266,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			if (descriptors.gds.buffer != nullptr) {
 				buffer.EndRendering();
 				const auto barrier = MakeGdsDependency(descriptors.gds.buffer);
-				vk_buffer.pipelineBarrier(
+				buffer.Commands().pipelineBarrier(
 				    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
 				        vk::PipelineStageFlagBits::eAllGraphics |
 				        vk::PipelineStageFlagBits::eComputeShader,
@@ -1263,19 +1297,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					              image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
 					                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
 					                                              : vk::AccessFlags2 {}),
-					              {}, vk_buffer);
+					              {}, buffer.Commands());
 				} else if (image.binding.force_general && !image.info.IsDepth()) {
 					const vk::AccessFlags2 storage_access = image.binding.shader_write
 					                                            ? vk::AccessFlagBits2::eShaderWrite
 					                                            : vk::AccessFlags2 {};
 					image.Transit(vk::ImageLayout::eGeneral,
-					              vk::AccessFlagBits2::eShaderRead | storage_access, {}, vk_buffer);
+					              vk::AccessFlagBits2::eShaderRead | storage_access, {}, buffer.Commands());
 				} else if (storage) {
 					image.Transit(vk::ImageLayout::eGeneral,
 					              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-					              range, vk_buffer);
+					              range, buffer.Commands());
 				} else {
-					image.Transit(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
+					image.Transit(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, buffer.Commands());
 				}
 				binding.layout = image.backing.state.layout;
 			}
@@ -1368,30 +1402,23 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
-	Common::RenderStageProfile::Scope emit_profile {Stage::BindingsEmit};
 	if (has_push_data) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
-		                        push_data.dwords.data());
+		emission.state.stages = push_stages;
+		emission.state.constant_bytes = sizeof(push_data);
+		emission.constants = std::as_bytes(std::span(push_data.dwords));
 	}
 
 	if (!m_descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		if (pipeline.uses_push_descriptors) {
 			Common::SubmitProfile::AddExtra(Extra::PushDescriptorCalls);
-			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
-			                               static_cast<uint32_t>(m_descriptor_writes.size()),
-			                               m_descriptor_writes.data());
 		} else {
 			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
+			emission.state.set = set;
 			Common::SubmitProfile::AddExtra(Extra::DescriptorSetCalls);
 			for (auto& write: m_descriptor_writes) {
 				write.dstSet = set;
 			}
-			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-			    nullptr);
-			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
-			                             0, nullptr);
 		}
 	}
 	if (Common::ReadbackProfile::Enabled()) {
@@ -1410,6 +1437,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 	}
+	// ImageHeap::PrepareBinding may rotate the command buffer when its stream wraps.
+	// Publish references to the FINAL tick, immediately before draw/dispatch;
+	// descriptor binding itself does not execute a read. No submit occurs here.
+	m_context.GetBufferCache().PrepareHostImportReads(unknown_import_bda);
+	emission.writes = m_descriptor_writes;
+	return emission;
 }
 
 } // namespace Libs::Graphics

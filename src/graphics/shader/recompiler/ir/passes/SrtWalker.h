@@ -92,6 +92,8 @@ bool WalkedActive(const ResourcePlan& plan, uint32_t source);
 uint32_t SrtWalkerLoadLength(uint64_t rip);
 bool DescribeSrtWalkerRead(uint64_t rip, Common::ReadbackProfile::Origin& origin);
 // Called only after a real tracked read fault was handled, never for a clean-read bypass.
+// Remains enabled during fallback. Call on the originating walker thread AFTER
+// synchronous fault recovery returns, including recovery delegated to GuestGpu.
 bool NoteSrtControlReadback(uint64_t rip);
 // Called only for a recognized walker load (by its generated slow path or the
 // exception handler). Remembers a page hint, never values or alias pointers.

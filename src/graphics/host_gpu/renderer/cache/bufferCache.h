@@ -16,6 +16,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
@@ -54,10 +55,12 @@ public:
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
-	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	void                   InvalidateMemory(uint64_t vaddr, uint64_t size,
+	    Common::BufferUploadProfile::Cause cause = Common::BufferUploadProfile::Cause::Invalidate);
 	// site attributes the synchronous wait in SubmitProfile; it is carried into the GPU thread.
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
-	                                  Common::SubmitProfile::WaitSite site = Common::SubmitProfile::WaitSite::BufferReadback);
+	                                  Common::SubmitProfile::WaitSite site = Common::SubmitProfile::WaitSite::BufferReadback,
+	                                  Common::BufferUploadProfile::Cause cause = Common::BufferUploadProfile::Cause::Invalidate);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	// GPU-thread only. Full contiguous coverage, not IsRegionRegistered's intersection.
@@ -68,7 +71,8 @@ public:
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
-	                                                        BufferId id              = {});
+	                                                        BufferId id              = {},
+	                                                        Common::BufferUploadProfile::Use use = Common::BufferUploadProfile::Use::Unknown);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -103,6 +107,36 @@ public:
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] RangeSet TakeBdaSync();
 	void               RunGarbageCollector();
+	void               BufferUploadProfileFrame();
+	// GPU lane, before publishing a GPU writer/image or removing a guest mapping.
+	void ExcludeHotRange(uint64_t address, uint64_t size, Common::SubmitProfile::Extra reason);
+	void StopHotBuffers();
+	void StopFaultCoarsening();
+	void ForgetCoarsening(uint64_t address, uint64_t size);
+	void SynchronizeHotRange(uint64_t address, uint64_t size);
+	// Direct mode only: known guest BDA ranges and resolved descriptors are staged
+	// on the GPU lane, then protected/published at final emission for CurrentTick().
+	// Copy mode never exposes imported buffers to shaders.
+	void AddHostImportRead(uint64_t address, uint64_t size);
+	void PrepareHostImportReads(bool unknown_bda = true);
+	[[nodiscard]] bool HasHostImports() const { return !m_import_copy_mode && !m_host_imports.empty(); }
+	// Final descriptor emission only: preparation keeps ordinary handles so a
+	// fallback/merge cannot leave a dangling imported VkBuffer in prepared state.
+	bool ResolveHostImportRead(uint64_t address, uint64_t size, vk::DescriptorBufferInfo& descriptor);
+	void DrainHostImports(); // May be called by a guest mapping transaction, with no mapping locks held.
+	void StopHostImports();
+	void ExcludeHostImport(uint64_t address, uint64_t size, Common::SubmitProfile::Extra reason,
+	    Common::BufferUploadProfile::Use use = Common::BufferUploadProfile::Use::Unknown) {
+		using Extra = Common::SubmitProfile::Extra;
+		if (m_hot_gate && (reason == Extra::HostImportFallbackGpu || reason == Extra::HostImportFallbackImage))
+			ExcludeHotRange(address, size, reason == Extra::HostImportFallbackGpu ? Extra::HotRetireGpu : Extra::HotRetireImage);
+		if (!m_import_gate || !size || m_import_retiring || reason == Extra::HostImportFallbackResource) return;
+		EXIT_IF(reason != Extra::HostImportFallbackGpu && reason != Extra::HostImportFallbackImage);
+		++m_import_exclusion_calls; // GPU-local; flushed once per frame, no per-lookup atomic/QPC.
+		auto& excluded = reason == Extra::HostImportFallbackGpu ? m_import_gpu_excluded : m_import_image_excluded;
+		if (excluded.ContainsCached(address, size)) { ++m_import_exclusion_hits; return; }
+		ExcludeHostImportSlow(address, size, reason, use);
+	}
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -134,14 +168,81 @@ private:
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                     bool is_written, bool is_texel_buffer);
+	                                     bool is_written, bool is_texel_buffer,
+	                                     Common::BufferUploadProfile::Use use = Common::BufferUploadProfile::Use::Unknown);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-	                                      uint64_t total_size);
+	                                      uint64_t total_size,
+	                                      const Common::BufferUploadProfile::Request* request = nullptr,
+	                                      std::span<const Common::BufferUploadProfile::Causes> causes = {},
+	                                      bool* imported_copy = nullptr);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+	std::unique_ptr<Common::BufferUploadProfile::State> m_buffer_upload_profile;
+	struct CoarsenOwner {
+		uint64_t size = 0, promoted_frame = 0;
+		bool active = false;
+		HotBufferHistory history;
+	};
+	std::map<uint64_t, CoarsenOwner> m_coarsen_owners;
+	bool m_coarsen_selected = false, m_coarsen_gate = false, m_coarsen_stopping = false;
+	bool m_coarsen_profile = false, m_coarsen_counters = false;
+	uint64_t m_coarsen_frame = 0, m_coarsen_block = 64 * 1024;
+	void CoarsenFrame();
+	void ReportCoarsening(const FaultCoarsenStats& stats);
+	struct HotOwner {
+		uint64_t size = 0, promoted_frame = 0, last_use = 0, retry_frame = 0, estimate = 0;
+		bool hot = false, observing = true;
+		HotBufferHistory history;
+	};
+	std::map<uint64_t, HotOwner> m_hot_owners;
+	RangeSet m_hot_excluded;
+	bool m_hot_selected = false, m_hot_gate = false, m_hot_stopping = false;
+	uint64_t m_hot_frame = 0, m_hot_frame_bytes = 0, m_hot_budget = 256 * 1024 * 1024;
+	uint64_t m_hot_active = 0, m_hot_active_bytes = 0;
+	uint64_t m_hot_frame_uses = 0, m_hot_bda_calls = 0, m_hot_bda_peak = 0;
+	uint64_t m_hot_exclusion_calls = 0, m_hot_exclusion_visits = 0;
+	bool m_hot_frame_profile = false;
+	void CheckHotGate(bool allow_activation = false);
+	void ReportHotFrame(bool complete);
+	void HotFrame();
+	void RetireHot(uint64_t base, HotOwner& owner, Common::SubmitProfile::Extra reason);
+	bool HotUse(uint64_t address, uint64_t size);
+	struct HostImportEntry {
+		std::shared_ptr<Common::GuestHostImport::Lease> lease;
+		std::unique_ptr<Buffer> imported; // Destroy Vulkan memory before releasing its backing lease.
+		BufferId ordinary;
+		RangeSet stale; // CPU upload ranges consumed without updating the VRAM mirror.
+	};
+	std::map<uint64_t, HostImportEntry> m_host_imports;
+	ExclusionRanges m_import_gpu_excluded, m_import_image_excluded;
+	bool m_import_selected = false, m_import_armed = false, m_import_gate = false;
+	bool m_import_retiring = false, m_import_stopping = false;
+	bool m_import_probed = false;
+	struct ImportExclusion { uint64_t address = 0, size = 0; Common::SubmitProfile::Extra reason {}; Common::BufferUploadProfile::Use use {}; };
+	std::array<ImportExclusion, 256> m_import_exclusion_examples {};
+	uint64_t m_import_exclusion_count = 0, m_import_epoch = 0;
+	unsigned m_import_trace_rows = 0;
+	uint64_t m_import_exclusion_calls = 0, m_import_candidate_calls = 0;
+	uint64_t m_import_exclusion_reported = 0, m_import_candidate_reported = 0;
+	uint64_t m_import_exclusion_hits = 0, m_import_exclusion_hits_reported = 0, m_import_exclusion_slow_samples = 0;
+	void ExcludeHostImportSlow(uint64_t address, uint64_t size, Common::SubmitProfile::Extra reason,
+	                          Common::BufferUploadProfile::Use use);
+	void NoteImportCandidate(Buffer& buffer, uint64_t address, uint64_t size, Common::SubmitProfile::Extra reason);
+	PendingRangeReads m_import_readers; // registry mutex, including CPU faults
+	std::vector<std::pair<uint64_t, uint64_t>> m_import_prepared_reads; // GPU lane only
+	bool m_import_cpu_dirty = false; // registry mutex
+	bool m_import_guard_enabled = true; // startup diagnostic policy, never disables retirement waits
+	bool m_import_copy_mode = true; // DMA source only; descriptors/BDA and CPU dirty tracking stay ordinary
+	uint64_t m_import_frame = 0;
+	void CheckHostImportGate(bool allow_activation = false);
+	void RetireHostImports(uint64_t address, uint64_t size, Common::SubmitProfile::Extra reason);
+	PendingRangeReads::Conflict WaitHostImportReads(uint64_t address, uint64_t size, bool retirement = false);
+	void InvalidateHostImport(uint64_t address, uint64_t size, Common::BufferUploadProfile::Cause cause);
+	void SetHostImportBda(const Buffer& ordinary, vk::DeviceAddress base);
+	bool TryHostImport(Buffer& buffer, uint64_t address, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

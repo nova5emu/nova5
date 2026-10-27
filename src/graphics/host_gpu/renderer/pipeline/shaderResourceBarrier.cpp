@@ -1,6 +1,8 @@
+#include "common/gpuThreadSampler.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
@@ -111,29 +113,32 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	return has_writes;
 }
 
-void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
-	EXIT_IF(vk_buffer == nullptr || !source_stages);
+void ShaderAccessBarrier(const CommandBuffer& vk_buffer, vk::PipelineStageFlags source_stages) {
+	EXIT_IF(vk_buffer.IsInvalid() || !source_stages);
 	const auto barrier = MakeShaderAccessDependency();
-	vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
-	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
+	vk_buffer.EmitMemoryBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
+	                          barrier);
 }
 
-void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
+void ShaderWriteHazardBarrier(const CommandBuffer&   vk_buffer,
                               vk::PipelineStageFlags destination_stages) {
-	EXIT_IF(vk_buffer == nullptr || !destination_stages);
+	EXIT_IF(vk_buffer.IsInvalid() || !destination_stages);
 	const auto barrier = MakeShaderWriteHazardDependency();
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, destination_stages,
-	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
+	vk_buffer.EmitMemoryBarrier(vk::PipelineStageFlagBits::eAllCommands, destination_stages,
+	                          barrier);
 }
 
-void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
-	EXIT_IF(vk_buffer == nullptr || !source_stages);
+void ShaderWriteBarrier(const CommandBuffer& vk_buffer, vk::PipelineStageFlags source_stages) {
+	EXIT_IF(vk_buffer.IsInvalid() || !source_stages);
 	const auto barrier = MakeShaderWriteDependency();
-	vk_buffer.pipelineBarrier(source_stages,
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
+	vk_buffer.EmitMemoryBarrier(source_stages,
 	                          vk::PipelineStageFlagBits::eComputeShader |
 	                              vk::PipelineStageFlagBits::eAllGraphics |
 	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	                          barrier);
 }
 
 } // namespace Libs::Graphics

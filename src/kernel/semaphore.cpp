@@ -1,3 +1,4 @@
+#include "common/stallDump.h"
 #include "kernel/semaphore.h"
 
 #include "common/assert.h"
@@ -287,6 +288,7 @@ int KYTY_SYSV_ABI KernelDeleteSema(KernelSema sem) {
 }
 
 int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time) {
+	Common::StallDump::Scope stall_wait(__func__, reinterpret_cast<uintptr_t>(sem), true);
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
@@ -329,6 +331,7 @@ int KYTY_SYSV_ABI KernelPollSema(KernelSema sem, int need) {
 }
 
 int KYTY_SYSV_ABI KernelSignalSema(KernelSema sem, int count) {
+	Common::StallDump::Scope stall_signal(__func__, reinterpret_cast<uintptr_t>(sem));
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
@@ -349,6 +352,7 @@ int KYTY_SYSV_ABI KernelSignalSema(KernelSema sem, int count) {
 }
 
 int KYTY_SYSV_ABI KernelCancelSema(KernelSema sem, int count, int* threads) {
+	Common::StallDump::Scope stall_signal(__func__, reinterpret_cast<uintptr_t>(sem));
 	PRINT_NAME();
 
 	if (sem == nullptr) {
@@ -573,6 +577,7 @@ static int SemDestroyImpl(void* sem) {
 }
 
 static int SemTimedwaitImpl(void* sem, uint32_t* micros) {
+	Common::StallDump::Scope stall_wait(__func__, reinterpret_cast<uintptr_t>(sem), true);
 	auto* obj = GetSem(sem);
 	if (obj == nullptr) {
 		return POSIX_EINVAL;

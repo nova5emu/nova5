@@ -1,3 +1,4 @@
+#include "common/stallDump.h"
 //
 // Original algorithm is from:
 // 	https://github.com/mpaland/printf
@@ -782,6 +783,7 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 		EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= sn_n);
 	} else {
 		// Keep guest warnings available without enabling the high-volume HLE log.
+		if (buffer[0] != '\0') { Common::StallDump::Progress(Common::StallDump::Milestone::GuestPrintf); }
 		// Opt-in and bounded per process; snprintf never writes to this channel.
 		static const bool guest_log = [] {
 			const auto* value = std::getenv("KYTY_GUEST_LOG");

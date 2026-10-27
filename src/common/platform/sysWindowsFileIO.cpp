@@ -12,6 +12,7 @@
 #include "common/platform/sysFileIO.h"
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
+#include "common/hostPath.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -52,6 +53,15 @@ struct sys_file_t {
 constexpr DWORD FILE_SHARE_POSIX = static_cast<DWORD>(FILE_SHARE_READ) |
                                    static_cast<DWORD>(FILE_SHARE_WRITE) |
                                    static_cast<DWORD>(FILE_SHARE_DELETE);
+
+static bool FileResult(bool ok, const char* operation, const std::filesystem::path& path) {
+	if (!ok) {
+		const DWORD error = GetLastError();
+		Common::ReportHostFileError(operation, path, std::error_code(error, std::system_category()));
+		SetLastError(error);
+	}
+	return ok;
+}
 
 static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 	if (t == SYS_FILE_CACHE_RANDOM_ACCESS) {
@@ -177,13 +187,14 @@ void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* byte
 sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = Common::NativeHostPath(file_name).wstring();
 	HANDLE h_file = nullptr;
 	h_file = CreateFileW(wide.c_str(),
 	                     static_cast<DWORD>(GENERIC_READ) | static_cast<DWORD>(GENERIC_WRITE) |
 	                         static_cast<DWORD>(DELETE),
 	                     FILE_SHARE_POSIX, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 
+	FileResult(h_file != INVALID_HANDLE_VALUE, "CreateFileW", file_name);
 	ret->handle = h_file;
 	ret->type   = SYS_FILE_FILE;
 
@@ -193,7 +204,7 @@ sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 sys_file_t* SysFileOpenR(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = Common::NativeHostPath(file_name).wstring();
 	HANDLE h_file = nullptr;
 	h_file = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_POSIX, nullptr, OPEN_EXISTING,
 	                     GetCacheAccessType(cache_type), nullptr);
@@ -204,6 +215,7 @@ sys_file_t* SysFileOpenR(const std::filesystem::path& file_name, sys_file_cache_
 		ret->type = SYS_FILE_FILE;
 	}
 
+	FileResult(h_file != INVALID_HANDLE_VALUE, "CreateFileW", file_name);
 	ret->handle = h_file;
 
 	return ret;
@@ -236,7 +248,7 @@ sys_file_t* SysFileCreate() {
 sys_file_t* SysFileOpenW(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = Common::NativeHostPath(file_name).wstring();
 	HANDLE h_file = nullptr;
 	h_file        = CreateFileW(
 	    wide.c_str(), static_cast<DWORD>(GENERIC_WRITE) | static_cast<DWORD>(DELETE),
@@ -248,6 +260,7 @@ sys_file_t* SysFileOpenW(const std::filesystem::path& file_name, sys_file_cache_
 		ret->type = SYS_FILE_FILE;
 	}
 
+	FileResult(h_file != INVALID_HANDLE_VALUE, "CreateFileW", file_name);
 	ret->handle = h_file;
 
 	return ret;
@@ -257,7 +270,7 @@ sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
                           sys_file_cache_type_t        cache_type) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = Common::NativeHostPath(file_name).wstring();
 	HANDLE h_file = nullptr;
 	h_file = CreateFileW(wide.c_str(),
 	                     static_cast<DWORD>(GENERIC_READ) | static_cast<DWORD>(GENERIC_WRITE) |
@@ -271,6 +284,7 @@ sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
 		ret->type = SYS_FILE_FILE;
 	}
 
+	FileResult(h_file != INVALID_HANDLE_VALUE, "CreateFileW", file_name);
 	ret->handle = h_file;
 
 	return ret;
@@ -305,14 +319,31 @@ uint64_t SysFileSize(sys_file_t& f) {
 }
 
 bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
+	return SysFileGetInfo(name, is_file, size, nullptr);
+}
+
+bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size, std::error_code* error) {
+	if (error) { error->clear(); }
 	const bool directory_path = !name.empty() && !name.has_filename() && name != name.root_path();
 	WIN32_FILE_ATTRIBUTE_DATA info {};
-	if (GetFileAttributesExW(directory_path ? name.parent_path().c_str() : name.c_str(),
+	std::error_code normalization_error;
+	const auto native = Common::NativeHostPath(directory_path ? name.parent_path() : name, &normalization_error);
+	if (normalization_error) {
+		if (error) { *error = normalization_error; }
+		return false;
+	}
+	if (GetFileAttributesExW(native.c_str(),
 	                         GetFileExInfoStandard, &info) == 0) {
+		const DWORD failure = GetLastError();
+		const std::error_code code(failure, std::system_category());
+		if (error) { *error = code; }
+		Common::ReportHostFileError("GetFileAttributesExW", name, code);
+		SetLastError(failure);
 		return false;
 	}
 	const bool file = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 	if (directory_path && file) {
+		if (error) { *error = std::make_error_code(std::errc::not_a_directory); }
 		return false;
 	}
 	*is_file = file;
@@ -404,18 +435,18 @@ bool SysFileIsFileExisting(const std::filesystem::path& name) {
 }
 
 bool SysFileCreateDirectory(const std::filesystem::path& path) {
-	auto wide = path.wstring();
-	return CreateDirectoryW(wide.c_str(), nullptr) != 0;
+	auto wide = Common::NativeHostPath(path).wstring();
+	return FileResult(CreateDirectoryW(wide.c_str(), nullptr) != 0, "CreateDirectoryW", path);
 }
 
 bool SysFileDeleteDirectory(const std::filesystem::path& path) {
-	auto wide = path.wstring();
-	return RemoveDirectoryW(wide.c_str()) != 0;
+	auto wide = Common::NativeHostPath(path).wstring();
+	return FileResult(RemoveDirectoryW(wide.c_str()) != 0, "RemoveDirectoryW", path);
 }
 
 bool SysFileDeleteFile(const std::filesystem::path& name) {
-	auto wide = name.wstring();
-	return DeleteFileW(wide.c_str()) != 0;
+	auto wide = Common::NativeHostPath(name).wstring();
+	return FileResult(DeleteFileW(wide.c_str()) != 0, "DeleteFileW", name);
 }
 
 bool SysFileFlush(sys_file_t& f) {
@@ -521,12 +552,13 @@ bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
 }
 
 void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
-	const auto pattern = path / L"*";
+	const auto pattern = Common::NativeHostPath(path / L"*");
 
 	WIN32_FIND_DATAW data {};
 	HANDLE h = FindFirstFileW(pattern.c_str(), &data);
 
 	if (h == INVALID_HANDLE_VALUE) {
+		FileResult(false, "FindFirstFileW", path);
 		return;
 	}
 
@@ -542,25 +574,31 @@ void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entr
 
 	} while (FindNextFileW(h, &data) != 0);
 
+	const DWORD error = GetLastError();
+	if (error != ERROR_NO_MORE_FILES) {
+		Common::ReportHostFileError("FindNextFileW", path, std::error_code(error, std::system_category()));
+	}
 	FindClose(h);
 }
 
 bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
-	auto src_wide = src.wstring();
-	auto dst_wide = dst.wstring();
-	return CopyFileW(src_wide.c_str(), dst_wide.c_str(), FALSE) != 0;
+	auto src_wide = Common::NativeHostPath(src).wstring();
+	auto dst_wide = Common::NativeHostPath(dst).wstring();
+	return FileResult(CopyFileW(src_wide.c_str(), dst_wide.c_str(), FALSE) != 0, "CopyFileW", dst);
 }
 
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
-	auto src_wide = src.wstring();
-	auto dst_wide = dst.wstring();
-	return MoveFileW(src_wide.c_str(), dst_wide.c_str()) != 0;
+	auto src_wide = Common::NativeHostPath(src).wstring();
+	auto dst_wide = Common::NativeHostPath(dst).wstring();
+	return FileResult(MoveFileW(src_wide.c_str(), dst_wide.c_str()) != 0, "MoveFileW", dst);
 }
 
 void SysFileRemoveReadonly(const std::filesystem::path& name) {
-	auto wide = name.wstring();
-	SetFileAttributesW(wide.c_str(), GetFileAttributesW(wide.c_str()) &
-	                                     (~static_cast<DWORD>(FILE_ATTRIBUTE_READONLY)));
+	auto wide = Common::NativeHostPath(name).wstring();
+	const auto attributes = GetFileAttributesW(wide.c_str());
+	if (!FileResult(attributes != INVALID_FILE_ATTRIBUTES, "GetFileAttributesW", name)) { return; }
+	FileResult(SetFileAttributesW(wide.c_str(), attributes & ~static_cast<DWORD>(FILE_ATTRIBUTE_READONLY)) != 0,
+	           "SetFileAttributesW", name);
 }
 
 #endif

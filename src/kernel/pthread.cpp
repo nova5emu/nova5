@@ -1,3 +1,4 @@
+#include "common/stallDump.h"
 #include "kernel/pthread.h"
 
 #include "common/assert.h"
@@ -1035,6 +1036,8 @@ void PthreadInitSelfForMainThread() {
 #endif
 	g_pthread_self->host_thread_id = os_thread_id;
 	g_pthread_main                 = g_pthread_self;
+	Common::StallDump::RegisterThread(reinterpret_cast<uintptr_t>(g_pthread_self), os_thread_id,
+	                                  g_pthread_self->name.c_str(), true);
 
 	LOGF("\tPthread main self: id = %d, os_thread_id = %" PRIu64 ", stack_addr = 0x%016" PRIx64
 	     ", stack_size = %" PRIu64 "\n",
@@ -1048,6 +1051,8 @@ void* PthreadCreateMainGuestStack() {
 	EXIT_IF(g_pthread_self->attr == nullptr);
 
 	if (g_pthread_self->attr->stack_map_addr != 0) {
+		Common::GuestCpuProfile::Register(g_pthread_self->name.c_str(),
+		    reinterpret_cast<uint64_t>(g_pthread_self->attr->stack_addr), g_pthread_self->attr->stack_size);
 		return reinterpret_cast<void*>(
 		    (reinterpret_cast<uintptr_t>(g_pthread_self->attr->stack_addr) +
 		     g_pthread_self->attr->stack_size) &
@@ -1062,6 +1067,8 @@ void* PthreadCreateMainGuestStack() {
 
 	const auto result = CreateGuestStack(g_pthread_self->attr);
 	EXIT_NOT_IMPLEMENTED(result != OK);
+	Common::GuestCpuProfile::Register(g_pthread_self->name.c_str(),
+	    reinterpret_cast<uint64_t>(g_pthread_self->attr->stack_addr), g_pthread_self->attr->stack_size);
 
 	auto* stack_top =
 	    reinterpret_cast<void*>((reinterpret_cast<uintptr_t>(g_pthread_self->attr->stack_addr) +
@@ -1268,6 +1275,7 @@ static void NativeMutexRemoveWaiter(PthreadMutexPrivate* mutex,
 }
 
 static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_us) {
+	Common::StallDump::Scope stall_wait(__func__, reinterpret_cast<uintptr_t>(mutex), true);
 	EXIT_IF(mutex == nullptr);
 
 	auto* self = g_pthread_self;
@@ -2364,6 +2372,7 @@ static bool RwlockRemoveReader(PthreadRwlock rwlock, Pthread thread) {
 }
 
 static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUseconds* timeout_us) {
+	Common::StallDump::Scope stall_wait(__func__, reinterpret_cast<uintptr_t>(rwlock), true);
 	EXIT_IF(rwlock == nullptr);
 
 	auto* self = g_pthread_self;
@@ -2735,6 +2744,7 @@ int KYTY_SYSV_ABI PthreadCondattrSetclock(PthreadCondattr* attr, KernelClockid c
 }
 
 int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
+	Common::StallDump::Scope stall_signal(__func__, reinterpret_cast<uintptr_t>(cond));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2825,6 +2835,7 @@ int KYTY_SYSV_ABI PthreadCondInit(PthreadCond* cond, const PthreadCondattr* attr
 }
 
 int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
+	Common::StallDump::Scope stall_signal(__func__, reinterpret_cast<uintptr_t>(cond));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2844,6 +2855,7 @@ int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 }
 
 int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
+	Common::StallDump::Scope stall_signal(__func__, reinterpret_cast<uintptr_t>(cond));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2864,6 +2876,7 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
+	Common::StallDump::Scope stall_wait(__func__, reinterpret_cast<uintptr_t>(cond), true);
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2948,6 +2961,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 
 int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex,
                                           const KernelTimespec* abstime) {
+	Common::StallDump::Scope stall_wait(__func__, reinterpret_cast<uintptr_t>(cond), true);
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3029,6 +3043,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 }
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
+	Common::StallDump::Scope stall_wait(__func__, reinterpret_cast<uintptr_t>(cond), true);
 	PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3206,6 +3221,8 @@ static void CleanupThread(void* arg) {
 	rt->DeleteTlss(thread->unique_id);
 
 	thread->almost_done = true;
+	Common::StallDump::UnregisterThread();
+	Common::GuestCpuProfile::Unregister();
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -3287,6 +3304,8 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+	Common::StallDump::RegisterThread(reinterpret_cast<uintptr_t>(thread), os_thread_id,
+	                                  thread->name.c_str());
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!thread->name.empty()) {
 #if defined(__APPLE__)
@@ -3314,6 +3333,8 @@ static void* RunThread(void* arg) {
 	auto* stack_top = reinterpret_cast<void*>(
 	    (reinterpret_cast<uintptr_t>(thread->attr->stack_addr) + thread->attr->stack_size) &
 	    ~static_cast<uintptr_t>(0x0f));
+	Common::GuestCpuProfile::Register(thread->name.c_str(),
+	    reinterpret_cast<uint64_t>(thread->attr->stack_addr), thread->attr->stack_size);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	GuestThreadStart start {thread, initial_cancel_state};
 	ret = RunOnGuestStack(&start, RunGuestThreadEntry, stack_top);
@@ -3449,6 +3470,7 @@ int KYTY_SYSV_ABI PthreadDetach(Pthread thread) {
 }
 
 int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
+	Common::StallDump::Scope stall_wait(__func__, reinterpret_cast<uintptr_t>(thread), true);
 	PRINT_NAME();
 
 	if (thread == nullptr) {
@@ -3736,6 +3758,9 @@ void KYTY_SYSV_ABI PthreadExit(void* value) {
 	}
 #endif
 
+	// Main-thread/native fallback has no RunThread cleanup boundary.
+	Common::StallDump::UnregisterThread();
+	Common::GuestCpuProfile::Unregister();
 	pthread_exit(value);
 }
 
@@ -3782,6 +3807,7 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 	}
 
 	thread->name = std::string(name);
+	Common::StallDump::RenameThread(reinterpret_cast<uintptr_t>(thread), name);
 
 	return OK;
 }
@@ -4018,16 +4044,19 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	Common::StallDump::Scope stall_wait(__func__, 0, true);
 	SleepMicroWithSignalPoll(microseconds);
 	return OK;
 }
 
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
+	Common::StallDump::Scope stall_wait(__func__, 0, true);
 	SleepMicroWithSignalPoll(static_cast<uint64_t>(seconds) * 1000000ull);
 	return OK;
 }
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
+	Common::StallDump::Scope stall_wait(__func__, 0, true);
 	if (rqtp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}

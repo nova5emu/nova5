@@ -56,23 +56,43 @@ bool TimerGated() {
 	return gated;
 }
 
+bool ExperimentGated() {
+	static const bool gated = [] {
+		const auto* path = std::getenv("KYTY_EXPERIMENT_GATE");
+		return path != nullptr && path[0] != '\0';
+	}();
+	return gated;
+}
+
 bool FileExists(const std::string& path) {
 	std::error_code error;
 	return std::filesystem::exists(path, error) && !error;
 }
 
+// KYTY_SUBMIT_PROFILE_FILE: append reports to this file instead of stderr, for runs whose
+// console is not captured (a game opened from the Nova5 launcher).
+std::FILE* Output() {
+	static std::FILE* const output = [] {
+		const auto* path = std::getenv("KYTY_SUBMIT_PROFILE_FILE");
+		auto*       file = path != nullptr ? std::fopen(path, "ab") : nullptr;
+		return file != nullptr ? file : stderr;
+	}();
+	return output;
+}
+
 void Event(const char* text) {
-	std::fprintf(stderr, "[SUBMIT_PROFILE_EVENT] %s\n", text);
-	std::fflush(stderr);
+	std::fprintf(Output(), "[SUBMIT_PROFILE_EVENT] %s\n", text);
+	std::fflush(Output());
 }
 
 void Report(State& state, uint64_t now) {
 	if (state.window_start_ns != 0 && now > state.window_start_ns && state.reports < MaxReports) {
 		++state.reports;
-		Common::SubmitProfile::WriteReport(stderr, (now - state.window_start_ns) / 1e6,
+		Common::SubmitProfile::WriteReport(Output(), (now - state.window_start_ns) / 1e6,
 		                                   state.timer_active, now,
 		                                   false, // The occlusion bound gate is retired.
 		                                   g_experiment.load(std::memory_order_relaxed));
+		std::fflush(Output());
 	} else {
 		Common::SubmitProfile::Reset(now);
 	}
@@ -135,7 +155,7 @@ uint32_t ThreadId() {
 }
 
 void Tick() {
-	if (!Common::SubmitProfile::Armed() && !TimerGated()) return;
+	if (!Common::SubmitProfile::Armed() && !TimerGated() && !ExperimentGated()) return;
 	auto&      state = GetState();
 	const auto now   = Common::SubmitProfile::NowNs();
 	if (now >= state.next_poll_ns) {
@@ -170,7 +190,7 @@ void Tick() {
 }
 
 void Shutdown() {
-	if (!Common::SubmitProfile::Armed() && !TimerGated()) return;
+	if (!Common::SubmitProfile::Armed() && !TimerGated() && !ExperimentGated()) return;
 	auto&      state = GetState();
 	const auto now   = Common::SubmitProfile::NowNs();
 	if (Common::SubmitProfile::Recording()) {

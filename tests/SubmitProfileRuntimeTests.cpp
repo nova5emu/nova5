@@ -32,7 +32,8 @@ void Poll() {
 	Runtime::Tick();
 }
 
-int main() {
+int main(int argc, char** argv) {
+	const bool experiment_only = argc == 2 && std::string(argv[1]) == "--experiment-only";
 	const auto dir = std::filesystem::temp_directory_path() /
 	                 ("kyty-submit-profile-" + std::to_string(Profile::NowNs()));
 	std::filesystem::create_directories(dir);
@@ -41,12 +42,45 @@ int main() {
 	const auto experiment_gate = dir / "experiment.trigger";
 	const auto log          = dir / "stderr.log";
 	// Configure before the first call: the runtime caches the environment.
-	SetEnv("KYTY_SUBMIT_PROFILE", "1");
+	SetEnv("KYTY_SUBMIT_PROFILE", experiment_only ? "0" : "1");
 	SetEnv("KYTY_SUBMIT_PROFILE_GATE", profile_gate.string());
-	SetEnv("KYTY_TIMER_PERIOD_GATE", timer_gate.string());
+	SetEnv("KYTY_SUBMIT_PROFILE_FILE", ""); // Ignore a profiling log inherited from the shell.
+	if (experiment_only) {
+#if defined(_WIN32)
+		_putenv_s("KYTY_TIMER_PERIOD_GATE", "");
+#else
+		unsetenv("KYTY_TIMER_PERIOD_GATE");
+#endif
+	} else SetEnv("KYTY_TIMER_PERIOD_GATE", timer_gate.string());
 	SetEnv("KYTY_EXPERIMENT_GATE", experiment_gate.string());
-	SetEnv("KYTY_EXPERIMENT", ""); // An open trigger alone must not change RELEASE_MEM.
+	SetEnv("KYTY_EXPERIMENT", experiment_only ? "indirect-count-gpu" : "");
 	Check(std::freopen(log.string().c_str(), "w", stderr) != nullptr);
+	if (experiment_only) {
+		Check(!Profile::Armed());
+		Runtime::Tick();
+		Check(!Profile::ExperimentActive(Profile::Experiment::IndirectCountGpu));
+		Touch(experiment_gate);
+		Poll();
+		Check(Profile::ExperimentActive(Profile::Experiment::IndirectCountGpu));
+		Check(!Profile::ExperimentActive(Profile::Experiment::NoGpuTimestamps));
+		Check(std::string(Profile::ExperimentName()) == "indirect-count-gpu");
+		Check(!Profile::Recording());
+		std::filesystem::remove(experiment_gate);
+		Poll();
+		Check(!Profile::ExperimentActive());
+		Runtime::Shutdown();
+		std::fflush(stderr);
+		std::ifstream input(log);
+		std::stringstream contents;
+		contents << input.rdbuf();
+		Check(contents.str() == "[SUBMIT_PROFILE_EVENT] experiment on\n"
+		                        "[SUBMIT_PROFILE_EVENT] experiment off\n");
+		input.close();
+		std::error_code ignored;
+		std::filesystem::remove_all(dir, ignored);
+		std::printf("SubmitProfileRuntimeTests: unprofiled experiment gate passed\n");
+		return 0;
+	}
 
 	Runtime::Tick();
 	Check(!Profile::Recording()); // Gate closed: nothing recorded yet.

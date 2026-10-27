@@ -12,7 +12,7 @@
 namespace Libs::Graphics {
 
 RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::path& shader_store)
-    : m_graphics(graphics), m_gpu_time_profile(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
+    : m_graphics(graphics), m_gpu_time_profile(graphics), m_guest_clock(*this), m_render_executor(*this), m_command_scheduler(*this, graphics),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_pipeline_cache(graphics, &m_image_heap, shader_store), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
@@ -34,6 +34,9 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 }
 
 void RenderContext::ShutdownGpu() {
+	m_buffer_cache.StopFaultCoarsening();
+	m_buffer_cache.StopHotBuffers();
+	m_buffer_cache.StopHostImports();
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
 		m_gpu.reset();
@@ -65,8 +68,13 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		Common::GuestCpuProfile::Stage buffer_stage(Common::GuestCpuProfile::Part::Buffer);
+		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size, Common::BufferUploadProfile::Cause::CpuWriteFault);
+		buffer_stage.End();
+		Common::GuestCpuProfile::Stage texture_stage(Common::GuestCpuProfile::Part::Texture);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		texture_stage.End();
+		Common::GuestCpuProfile::Stage heap_stage(Common::GuestCpuProfile::Part::ImageHeap);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		const auto read = [this, fault_vaddr] {
@@ -97,10 +105,13 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
+	Common::GuestCpuProfile::Stage lookup(Common::GuestCpuProfile::Part::MappedLookup);
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;
 	}
+	Common::GuestCpuProfile::Stage acquire(Common::GuestCpuProfile::Part::MapLock);
 	std::shared_lock lock(m_mapped_ranges_mutex);
+	acquire.End();
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
@@ -131,12 +142,15 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		m_buffer_cache.ForgetCoarsening(vaddr, size);
+		m_buffer_cache.ExcludeHotRange(vaddr, size, Common::SubmitProfile::Extra::HotRetireMapping);
+		m_buffer_cache.DrainHostImports();
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
 		if (m_command_scheduler.Active() &&
 		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
 		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
+		     m_command_scheduler.HasPendingPriorityOperations() || m_guest_clock.HasPending())) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);

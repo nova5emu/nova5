@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/SrtDescriptorProbe.h"
 #include "SrtWalkerTestMemory.h"
 #include "common/readbackProfile.h"
 
@@ -100,6 +101,61 @@ Libs::Graphics::ShaderRecompiler::IR::Program SrtProgram(uint64_t address) {
   source.dword_count = 2;
   program.descriptor_sources.push_back(source);
   return program;
+}
+
+void TestSrtDescriptorProbe() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using namespace SrtDescriptorProbe;
+  Budget budget;
+  Check(!budget.Claim(Targets[0], 0, false, true) &&
+            !budget.Claim(Targets[0], 0, true, false) &&
+            !budget.Claim(123, 0, true, true),
+        "descriptor probe consumed a disabled/non-target sample");
+  Check(budget.Claim(Targets[0], 0, true, true) == 1 &&
+            !budget.Claim(Targets[0], 0, true, true) &&
+            budget.Claim(Targets[1], 0, true, true) == 1,
+        "descriptor probe did not separate targets or coalesce a profile window");
+  for (uint32_t i = 1; i < MaxSamples; ++i)
+    Check(budget.Claim(Targets[0], i, true, true) == i + 1,
+          "descriptor probe lost a later window");
+  Check(!budget.Claim(Targets[0], 99, true, true), "descriptor probe exceeded its process budget");
+
+  // Address 1 must remain opaque metadata. Reporting cannot evaluate even one
+  // guest load; this plan deliberately points to inaccessible guest memory.
+  auto program = SrtProgram(1);
+  program.shader_hash = Targets[0];
+  auto plan = Extract(program);
+  ResourceSnapshot snapshot;
+  snapshot.flattened_srt = {0x12345678};
+  const auto before = SaveResourcePlan(plan);
+  const auto report = Report(plan, snapshot, 7, 1);
+  Check(report.find("\"hash\":\"0xfbb1e69b2c2c0abd\"") != std::string::npos &&
+            report.find("LoadAddressU32") != std::string::npos &&
+            report.find("\"planning_only\":true") != std::string::npos &&
+            report.find("305419896") != std::string::npos &&
+            report.find("\"truncated\":false") != std::string::npos &&
+            SaveResourcePlan(plan) == before && snapshot.flattened_srt[0] == 0x12345678,
+        "descriptor probe changed its inputs or lost the mandatory read graph");
+
+  // Cyclic SSA and omitted nodes must not cause recursive traversal, mutation,
+  // or an apparently complete dependency graph.
+  ResourcePlan cycle;
+  auto& phi = cycle.value_storage.emplace_back(ValueOpcode::Phi);
+  phi.SetFlags(Type::U32);
+  phi.AddPhiOperand(nullptr, Value(&phi));
+  const auto cyclic_report = Report(cycle, {}, 1, 1);
+  Check(cyclic_report.find("\"node\":0") != std::string::npos &&
+            cyclic_report.find("\"truncated\":false") != std::string::npos,
+        "descriptor probe failed to retain a cyclic reference");
+  while (cycle.value_storage.size() <= MaxNodes) cycle.value_storage.emplace_back(ValueOpcode::UndefU32);
+  cycle.srt_reads.push_back({Value(&cycle.value_storage.back()), 0});
+  snapshot.flattened_srt.resize(MaxEntries + 1);
+  const auto capped_report = Report(cycle, snapshot, 2, 2);
+  Check(capped_report.find("\"node\":null,\"unlisted\":true") != std::string::npos &&
+            capped_report.find("\"truncated\":true") != std::string::npos &&
+            capped_report.size() < 512 * 1024,
+        "descriptor probe hid truncation or exceeded bounded output");
+  std::puts("SrtDescriptorProbe: all cases passed");
 }
 
 Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UnbasedFlatPlan() {
@@ -463,8 +519,8 @@ void TestUniformVectorDescriptorRead() {
   auto &next = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&count), Value(1u)});
   auto &second = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&next), Value(true)});
   auto &sum = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&first), Value(&second)});
-  auto &small = block.AppendNewInst(ValueOpcode::ULessThanEqual32, {Value(&count), Value(72u)});
-  auto &selected = block.AppendNewInst(ValueOpcode::SelectU32, {Value(&small), Value(&sum), Value(&count)});
+  auto &is_small = block.AppendNewInst(ValueOpcode::ULessThanEqual32, {Value(&count), Value(72u)});
+  auto &selected = block.AppendNewInst(ValueOpcode::SelectU32, {Value(&is_small), Value(&sum), Value(&count)});
   auto &masked = block.AppendNewInst(ValueOpcode::SelectU32, {Value(&active), Value(&selected), Value(0u)});
   auto &records = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&masked), Value(&active)});
   DescriptorSource source;
@@ -763,7 +819,7 @@ void TestWritableBufferControlProjection(bool adaptive = true) {
           read_state.word = word;
           read_state.calls = 0;
           Check(MaterializeResources(plan, {}, snapshot, specialization), "adaptive refresh failed");
-          const bool suppressed = !written && !descriptor_dependency;
+          const bool suppressed = !written && !descriptor_dependency && !ExperimentActive(Experiment::NoWalkerControlGpu);
           Check(WalkedActive(plan, 1) == (written || suppressed || word != 0) && WalkedActive(plan, 2),
                 "adaptive control pruned a dynamic GPU branch or depended on the experiment gate");
           const bool required_read = !suppressed && (!written || descriptor_dependency);
@@ -786,21 +842,103 @@ void TestWritableBufferControlProjection(bool adaptive = true) {
       const auto saved = SaveResourcePlan(plan);
       ResourcePlan reloaded;
       Check(LoadResourcePlan(saved, reloaded) &&
-                std::ranges::all_of(reloaded.walker_control_disabled, [](uint8_t v) { return v == 0; }),
+                std::ranges::all_of(reloaded.walker_control_disabled, [](uint8_t v) { return v == 0; }) &&
+                !reloaded.walker_control_rejected && reloaded.walker_control_history.learned_sites == 0 &&
+                reloaded.walker_control_history.retry_remaining == 0,
             "adaptive history persisted in the shader cache");
       if (!written && !descriptor_dependency) {
-        // The pruned arm contains an unsupported descriptor. Expanding control
-        // must fall back to the old materialization, not turn success into EXIT.
-        plan.descriptor_sources[1].dwords[0] = Value(&plan.value_storage.emplace_back(ValueOpcode::UndefU32));
+        // The pruned arm has a descriptor that is initially unknown, but becomes
+        // materializable when runtime user data changes. Do NOT recompile or
+        // reload the plan when repairing it: that would mask a permanent blacklist.
+        auto& available = plan.value_storage.emplace_back(ValueOpcode::GetUserData);
+        available.SetArg(0, Value(ScalarReg(0)));
+        auto& condition = plan.value_storage.emplace_back(ValueOpcode::INotEqual32);
+        condition.SetArg(0, Value(&available)); condition.SetArg(1, Value(0u));
+        auto& missing = plan.value_storage.emplace_back(ValueOpcode::UndefU32);
+        auto& selected = plan.value_storage.emplace_back(ValueOpcode::SelectU32);
+        selected.SetArg(0, Value(&condition)); selected.SetArg(1, Value(0x2000u));
+        selected.SetArg(2, Value(&missing));
+        plan.descriptor_sources[1].dwords[0] = Value(&selected);
+        plan.user_data_count = 1;
         CompileSrtWalker(plan);
+        const auto* jit = plan.srt_code.get();
+        std::array<uint32_t, 1> data {0};
+        const SrtRuntime runtime {.user_data = data};
         read_state.word = 0;
         SetExperiment(false);
         read_state.train = true;
-        Check(MaterializeResources(plan, {}, snapshot, specialization), "fallback training failed");
-        read_state.train = false;
-        Check(MaterializeResources(plan, {}, snapshot, specialization) && plan.walker_control_rejected &&
+        const bool was_recording = Recording();
+        SetRecording(false); // Simulate learning during load, before measurements.
+        Check(MaterializeResources(plan, runtime, snapshot, specialization), "fallback training failed");
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) && plan.walker_control_rejected &&
                   !WalkedActive(plan, 1) && !snapshot.specialization_reads.empty(),
               "unsupported newly active descriptor did not fall back to original pruning");
+        Check(plan.walker_control_history.learned_sites == 1,
+              "fallback forgot the learned site or counted it twice");
+        const auto count = [](Extra extra) {
+          return Common::SubmitProfile::Detail::window.extra[static_cast<size_t>(extra)].load();
+        };
+        Reset(); SetRecording(true);
+        data[0] = 1; // Same JIT and addresses; now the expanded descriptor is valid.
+        constexpr auto interval = ResourcePlan::WalkerControlHistory::RetryInterval;
+        for (uint32_t call = 0; call < interval; ++call) {
+          // The fake readback observer continues to learn during fallback.
+          Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                    plan.walker_control_rejected && !WalkedActive(plan, 1) &&
+                    plan.walker_control_history.learned_sites == 1,
+                "cooldown stopped using original pruning or lost readback learning");
+        }
+        if (Recording()) {
+          Check(count(Extra::WalkerControlPlans) == 1 && count(Extra::WalkerControlLearnedSites) == 1 &&
+                    count(Extra::WalkerControlFallbackPlans) == 1 && count(Extra::WalkerControlPromotions) == 0 &&
+                    count(Extra::WalkerControlRetries) == 0 && count(Extra::WalkerControlWalks) == 0,
+                "fallback state learned before profiling was missing or counted per call");
+        }
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  !plan.walker_control_rejected && WalkedActive(plan, 1) && WalkedActive(plan, 2) &&
+                  snapshot.buffers[1].dwords[0] == 0x2000u && snapshot.specialization_reads.empty() &&
+                  plan.srt_code.get() == jit,
+              "transient descriptor failure permanently disabled GPU control");
+        if (Recording()) Check(count(Extra::WalkerControlRetries) == 1 &&
+                                  count(Extra::WalkerControlRecoveries) == 1 &&
+                                  count(Extra::WalkerControlWalks) == 1,
+                              "successful control retry not reported");
+        // State appears again in the next window without another learning event.
+        Reset();
+        Check(MaterializeResources(plan, runtime, snapshot, specialization), "next window failed");
+        if (Recording()) Check(count(Extra::WalkerControlPlans) == 1 &&
+                                  count(Extra::WalkerControlLearnedSites) == 1 &&
+                                  count(Extra::WalkerControlFallbackPlans) == 0,
+                              "learned state disappeared after the profile window reset");
+        // A still-invalid descriptor must keep its safe fallback through retries.
+        data[0] = 0;
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) && plan.walker_control_rejected,
+              "second transient failure did not fall back");
+        for (uint32_t call = 0; call <= interval; ++call)
+          Check(MaterializeResources(plan, runtime, snapshot, specialization) && plan.walker_control_rejected &&
+                    !WalkedActive(plan, 1) && !snapshot.specialization_reads.empty(),
+                "failed retry exposed an invalid resource or suppressed original reads");
+        Check(plan.walker_control_history.retry_remaining == interval,
+              "failed retry did not rearm its bounded cooldown");
+        data[0] = 1;
+        for (uint32_t call = 0; call <= interval; ++call)
+          Check(MaterializeResources(plan, runtime, snapshot, specialization), "second recovery failed");
+        Check(!plan.walker_control_rejected && plan.srt_code.get() == jit, "second recovery stayed blacklisted");
+        auto cpu_reference = Extract(program);
+        for (auto word : {0u, 1u, 0u}) {
+          read_state.word = word;
+          read_state.train = false;
+          ResourceSnapshot expected;
+          ResourceSpecialization expected_specialization;
+          Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                    MaterializeResources(cpu_reference, {}, expected, expected_specialization),
+                "recovered dynamic branch failed");
+          const auto branch = word ? 1u : 2u;
+          Check(WalkedActive(plan, 1) && WalkedActive(plan, 2) &&
+                    snapshot.buffers[branch] == expected.buffers[branch],
+                "recovered promotion changed the descriptor used by a changing GPU branch");
+        }
+        SetRecording(was_recording);
         SetExperiment(false);
       }
     }
@@ -1627,10 +1765,15 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--srt-descriptor-probe-only") {
+    TestSrtDescriptorProbe();
+    return 0;
+  }
   if (argc == 2 && (std::string_view(argv[1]) == "--walker-control-only" ||
-                    std::string_view(argv[1]) == "--walker-control-combined-only")) {
+                    std::string_view(argv[1]) == "--walker-control-combined-only" ||
+                    std::string_view(argv[1]) == "--walker-control-disabled-only")) {
     const auto* experiment = std::string_view(argv[1]) == "--walker-control-combined-only"
-        ? "indirect-count-gpu" : "";
+        ? "indirect-count-gpu" : std::string_view(argv[1]) == "--walker-control-disabled-only" ? "no-walker-control-gpu" : "";
 #if defined(_WIN32)
     _putenv_s("KYTY_EXPERIMENT", experiment);
 #else
@@ -1763,6 +1906,7 @@ int main(int argc, char** argv) {
     std::puts("ReadbackOrigins: all cases passed");
     return 0;
   }
+  TestSrtDescriptorProbe();
   TestWalkerLoadsBypassSpecializationReader();
   TestIdentityResolutionPreservesTerminalValue();
   TestNativeNestedSrtRefresh();

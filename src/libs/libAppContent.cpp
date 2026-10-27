@@ -1,3 +1,5 @@
+#include "common/hostPath.h"
+#define KYTY_STALL_HLE
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -118,7 +120,7 @@ int KYTY_SYSV_ABI AppContentInitialize(const AppContentInitParam* init_param,
 	}
 
 	SystemService::NotifyEntitlementUpdate();
-	return OK;
+	return Common::StallDump::Result(__func__, OK);
 }
 
 int KYTY_SYSV_ABI AppContentAppParamGetInt(uint32_t param_id, int32_t* value) {
@@ -144,8 +146,9 @@ int KYTY_SYSV_ABI AppContentAppParamGetInt(uint32_t param_id, int32_t* value) {
 	}
 
 	LOGF("\t value    = %d [%s]\n", *value, found ? "found" : "not found");
+	Common::StallDump::Observe("AppContent.param", param_id, static_cast<uint32_t>(*value), found);
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK);
 }
 
 static int GetAvailableSpaceKb(const AppContentMountPoint* mount_point,
@@ -159,7 +162,7 @@ static int GetAvailableSpaceKb(const AppContentMountPoint* mount_point,
 	}
 
 	std::error_code ec;
-	const auto      space = std::filesystem::space(std::filesystem::current_path(), ec);
+	const auto      space = std::filesystem::space(Common::NativeHostPath(std::filesystem::current_path()), ec);
 	if (ec) {
 		LOGF("\t filesystem::space failed: %s\n", ec.message().c_str());
 		*available_space_kb = 1024u * 1024u;
@@ -180,7 +183,8 @@ static int GetAvailableSpaceKb(const AppContentMountPoint* mount_point,
 int KYTY_SYSV_ABI AppContentDownloadDataGetAvailableSpaceKb(const AppContentMountPoint* mount_point,
                                                             size_t* available_space_kb) {
 	PRINT_NAME();
-	return GetAvailableSpaceKb(mount_point, available_space_kb);
+	return Common::StallDump::Result(__func__,
+	                                 GetAvailableSpaceKb(mount_point, available_space_kb));
 }
 
 int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         service_label,
@@ -195,7 +199,7 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 	     reinterpret_cast<uint64_t>(mount_point));
 
 	if (service_label != 0 || entitlement_label == nullptr || mount_point == nullptr) {
-		return APP_CONTENT_ERROR_PARAMETER;
+		return Common::StallDump::Result(__func__, APP_CONTENT_ERROR_PARAMETER);
 	}
 
 	std::memset(mount_point->data, 0, sizeof(mount_point->data));
@@ -203,7 +207,7 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 	const auto* entry =
 	    Loader::AddContentFind(entitlement_label->data, sizeof(entitlement_label->data));
 	if (entry == nullptr) {
-		return APP_CONTENT_ERROR_NOT_FOUND;
+		return Common::StallDump::Result(__func__, APP_CONTENT_ERROR_NOT_FOUND);
 	}
 
 	std::lock_guard lock(g_addcont_mutex);
@@ -213,16 +217,16 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 			const auto guest_point = m.point.substr(0, m.point.size() - 1);
 			std::strncpy(mount_point->data, guest_point.c_str(), sizeof(mount_point->data) - 1);
 			LOGF("\t already mounted %s\n", guest_point.c_str());
-			return OK;
+			return Common::StallDump::Result(__func__, OK);
 		}
 	}
 
 	if (g_addcont_mounts.size() == APP_CONTENT_ADDCONT_MOUNT_MAXNUM) {
-		return APP_CONTENT_ERROR_MOUNT_FULL;
+		return Common::StallDump::Result(__func__, APP_CONTENT_ERROR_MOUNT_FULL);
 	}
 	std::error_code ec;
-	if (!std::filesystem::is_directory(entry->mount_dir, ec)) {
-		return APP_CONTENT_ERROR_NOT_FOUND;
+	if (!std::filesystem::is_directory(Common::NativeHostPath(entry->mount_dir), ec)) {
+		return Common::StallDump::Result(__func__, APP_CONTENT_ERROR_NOT_FOUND);
 	}
 
 	uint32_t index = 0;
@@ -242,14 +246,14 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 
 	// Titles scan /download0/pdlc for downloaded content; it must exist even when empty.
 	if (const auto pdlc = LibKernel::FileSystem::GetRealFilename("/download0/pdlc"); !pdlc.empty()) {
-		std::filesystem::create_directories(pdlc, ec);
+		std::filesystem::create_directories(Common::NativeHostPath(pdlc), ec);
 	}
 
 	const auto guest_point = mount.point.substr(0, mount.point.size() - 1);
 	std::strncpy(mount_point->data, guest_point.c_str(), sizeof(mount_point->data) - 1);
 	g_addcont_mounts.push_back(std::move(mount));
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK);
 }
 
 int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_point) {
@@ -258,11 +262,11 @@ int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_poi
 	LOGF("\t mount_point = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(mount_point));
 
 	if (mount_point == nullptr) {
-		return APP_CONTENT_ERROR_PARAMETER;
+		return Common::StallDump::Result(__func__, APP_CONTENT_ERROR_PARAMETER);
 	}
 
 	if (mount_point->data[0] == '\0') {
-		return APP_CONTENT_ERROR_NOT_MOUNTED;
+		return Common::StallDump::Result(__func__, APP_CONTENT_ERROR_NOT_MOUNTED);
 	}
 
 	const std::string point = Common::FixDirectorySlash(
@@ -273,13 +277,13 @@ int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_poi
 	const auto it = std::find_if(g_addcont_mounts.begin(), g_addcont_mounts.end(),
 	                             [&](const AddcontMount& m) { return m.point == point; });
 	if (it == g_addcont_mounts.end()) {
-		return APP_CONTENT_ERROR_NOT_MOUNTED;
+		return Common::StallDump::Result(__func__, APP_CONTENT_ERROR_NOT_MOUNTED);
 	}
 	LibKernel::FileSystem::Umount(point);
 	g_addcont_mounts.erase(it);
 	AprShared::InvalidateFailedResolves();
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK);
 }
 
 } // namespace AppContent
@@ -299,7 +303,7 @@ static int KYTY_SYSV_ABI AppContentTemporaryDataMount2(uint32_t              opt
 	     option, reinterpret_cast<uint64_t>(mount_point));
 
 	if (mount_point == nullptr) {
-		return AppContent::APP_CONTENT_ERROR_PARAMETER;
+		return Common::StallDump::Result(__func__, AppContent::APP_CONTENT_ERROR_PARAMETER);
 	}
 
 	std::memset(mount_point->data, 0, sizeof(mount_point->data));
@@ -307,7 +311,7 @@ static int KYTY_SYSV_ABI AppContentTemporaryDataMount2(uint32_t              opt
 
 	LOGF("\t mount      = %s\n", mount_point->data);
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK);
 }
 
 static int KYTY_SYSV_ABI AppContentTemporaryDataFormat(const AppContentMountPoint* mount_point) {
@@ -316,16 +320,17 @@ static int KYTY_SYSV_ABI AppContentTemporaryDataFormat(const AppContentMountPoin
 	LOGF("\t mount_point = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(mount_point));
 
 	if (mount_point == nullptr) {
-		return AppContent::APP_CONTENT_ERROR_PARAMETER;
+		return Common::StallDump::Result(__func__, AppContent::APP_CONTENT_ERROR_PARAMETER);
 	}
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK);
 }
 
 static int KYTY_SYSV_ABI AppContentTemporaryDataGetAvailableSpaceKb(
     const AppContentMountPoint* mount_point, size_t* available_space_kb) {
 	PRINT_NAME();
-	return AppContent::GetAvailableSpaceKb(mount_point, available_space_kb);
+	return Common::StallDump::Result(
+	    __func__, AppContent::GetAvailableSpaceKb(mount_point, available_space_kb));
 }
 
 } // namespace AppContentTemporary

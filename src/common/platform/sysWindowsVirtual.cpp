@@ -10,6 +10,7 @@
 #include <windows.h> // IWYU pragma: keep
 
 #include "common/assert.h"
+#include "common/guestCpuProfile.h"
 #include "common/virtualMemory.h"
 
 // IWYU pragma: no_include <basetsd.h>
@@ -315,6 +316,7 @@ bool FreeRange(uint64_t address, uint64_t size) {
 }
 
 bool Protect(uint64_t address, uint64_t size, Mode mode) {
+	Common::GuestCpuProfile::Stage protect(Common::GuestCpuProfile::Part::VirtualProtect);
 	DWORD old_protect = 0;
 	if (VirtualProtect(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                   GetProtectionFlag(mode), &old_protect) == 0) {

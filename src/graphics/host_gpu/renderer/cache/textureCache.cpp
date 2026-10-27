@@ -1,3 +1,4 @@
+#include "common/gpuThreadSampler.h"
 #include "common/renderStageProfile.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
@@ -283,6 +284,7 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
+	if (!image.info.data.Empty()) m_buffer_cache.ExcludeHotRange(image.info.data.address, image.info.data.size, Common::SubmitProfile::Extra::HotRetireImage);
 	if (image.registered || image.info.data.Empty()) {
 		EXIT("TextureCache: invalid image registration\n");
 	}
@@ -380,6 +382,7 @@ void TextureCache::TrackImage(ImageId id) {
 	}
 	const auto image_begin = image.info.data.address;
 	const auto image_end   = image.info.data.End();
+	m_buffer_cache.ExcludeHotRange(image_begin, image_end - image_begin, Common::SubmitProfile::Extra::HotRetireImage);
 	if (image_begin == image.track_addr && image_end == image.track_addr_end) {
 		return;
 	}
@@ -500,6 +503,7 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
                                                         bool page_overlap) const {
+	Common::GuestCpuProfile::Stage lookup(Common::GuestCpuProfile::Part::TextureLookup);
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
 		return {};
@@ -840,7 +844,7 @@ bool Publish(TextureCache& cache, Image& image) {
 	}
 	// ObtainBuffer preserves padding and records ownership before the GPU-only transfer.
 	auto [buffer, offset] =
-	    cache.m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
+	    cache.m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true, false, {}, Common::BufferUploadProfile::Use::Image);
 	cache.DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
 	image.ClearGpuModified();
 	image.MarkBufferModified();
@@ -1030,6 +1034,8 @@ bool TextureCache::CanDownload(const Image& image) const {
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op::Detile, image.info,
+	    uint32_t(image.IsCpuDirty()) | (uint32_t(image.IsBufferModified()) << 1));
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto& info        = image.info;
 	const auto  binding     = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
@@ -1210,13 +1216,14 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				InitializeImage(id);
 				const bool expand = desc.type != BindingType::VideoOut;
 				const auto [buffer, offset] =
-				    m_buffer_cache.ObtainBuffer(viewed.address, viewed.size, expand);
+				    m_buffer_cache.ObtainBuffer(viewed.address, viewed.size, expand, false, {}, Common::BufferUploadProfile::Use::Image);
 				const auto predicates = m_tiler.CheckColorClear(
 				    {buffer->Handle(), offset, viewed.size}, count, keys, expand);
+				RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op::MetadataClear, image.info, keys);
 				if (expand) {
 					m_buffer_cache.MarkColorMetadataChecked(viewed.address, viewed.size, keys);
 				}
-				const auto command = m_scheduler.Current().Handle();
+				const auto command = m_scheduler.Current().Commands();
 				const auto area    = BeginColorRendering(image, view.format, view.base_level,
 				                                         image_first, count, nullptr, command);
 				vk::ClearRect rect {.rect = area, .layerCount = 1};
@@ -1227,13 +1234,20 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 							const vk::ConditionalRenderingBeginInfoEXT predicate {
 							    .buffer = predicates,
 							    .offset = (slice * clears.size() + key) * sizeof(uint32_t)};
+							Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 							command.beginConditionalRenderingEXT(&predicate);
+							Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
 							command.clearAttachments(1, &clears[key], 1, &rect);
+							Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 							command.endConditionalRenderingEXT();
 						}
 					}
 				}
+				Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 				command.endRendering();
+				Common::ReadbackProfile::DrawWork::Record(Common::ReadbackProfile::DrawWork::Op::EndPass,
+				    image.info.data.address, image.info.data.size, static_cast<uint32_t>(view.format),
+				    area.extent.width, area.extent.height, count, 1u << 16);
 				CommitGpuWrite(image);
 				return;
 			}
@@ -1385,6 +1399,7 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format) {
 		ValidateImageDesc(desc);
 		EXIT_IF(desc.info.data.Empty());
 	}
+	m_buffer_cache.ExcludeHostImport(desc.info.data.address, desc.info.data.size, Common::SubmitProfile::Extra::HostImportFallbackImage);
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
@@ -1599,6 +1614,8 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
+	RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op::TargetBefore, image.info,
+	    uint32_t(image.IsGpuModified()) | (uint32_t(image.IsCpuDirty()) << 1) | (uint32_t(image.IsBufferModified()) << 2));
 	image.MarkGpuModified();
 	image.usage.render_target = true;
 	RefreshImage(id);
@@ -1617,6 +1634,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
+	RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op::TargetBefore, image.info,
+	    uint32_t(image.IsGpuModified()) | (uint32_t(image.IsCpuDirty()) << 1) | (uint32_t(image.IsBufferModified()) << 2));
 	image.MarkGpuModified();
 	if (desc.info.HasStencil()) {
 		const auto layers = image.info.resources.layers;
@@ -1662,6 +1681,8 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 }
 
 void TextureCache::CommitGpuWrite(Image& image) {
+	RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op::MarkWritten, image.info,
+	    uint32_t(image.IsGpuModified()));
 	if (!image.depth_id && image.backing.image == nullptr) {
 		EXIT("TextureCache: GPU writes require a native image or stencil association\n");
 	}
@@ -1745,6 +1766,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
 	auto& image = m_slot_images[id];
+	RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op::Clear, image.info);
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
 	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
@@ -1782,23 +1804,27 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		EXIT_NOT_IMPLEMENTED(range.aspectMask != vk::ImageAspectFlagBits::eColor ||
 		                     range.levelCount != 1);
 		BeginColorRendering(image, format, range.baseMipLevel, range.baseArrayLayer,
-		                    range.layerCount, &clear, command.Handle());
-		command.Handle().endRendering();
+		                    range.layerCount, &clear, command.Commands());
+		Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
+		command.Commands().endRendering();
+		RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op::EndPass, image.info, 1u << 16);
 		CommitGpuWrite(image);
 		return;
 	}
 	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
-	              command.Handle());
+	              command.Commands());
 	auto native_range = range;
 	if (image.info.IsVolume()) {
 		native_range.baseArrayLayer = 0;
 		native_range.layerCount     = 1;
 	}
 	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
-		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
+		command.Commands().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
 		                                 &clear.color, 1, &native_range);
 	} else {
-		command.Handle().clearDepthStencilImage(image.backing.image,
+		Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Copy);
+		command.Commands().clearDepthStencilImage(image.backing.image,
 		                                        vk::ImageLayout::eTransferDstOptimal,
 		                                        &clear.depthStencil, 1, &native_range);
 	}
@@ -1808,7 +1834,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, uint32_t level,
                                              uint32_t layer, uint32_t layers,
                                              const vk::ClearValue* clear,
-                                             vk::CommandBuffer     command) {
+                                             NativeCommands     command) {
 	ImageViewInfo view {};
 	view.format      = format;
 	view.type        = layers == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
@@ -1835,7 +1861,14 @@ vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, ui
 	rendering.layerCount           = layers;
 	rendering.colorAttachmentCount = 1;
 	rendering.pColorAttachments    = &attachment;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.beginRendering(&rendering);
+	// These short clear passes bypass CommandBuffer's cached render state; their
+	// callers end them immediately after the clear(s).
+	Common::ReadbackProfile::DrawWork::Record(Common::ReadbackProfile::DrawWork::Op::BeginPass,
+	    image.info.data.address, image.info.data.size, static_cast<uint32_t>(format),
+	    rendering.renderArea.extent.width, rendering.renderArea.extent.height, layers,
+	    (1u << 16) | uint32_t(clear != nullptr));
 	return rendering.renderArea;
 }
 
@@ -2010,7 +2043,8 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	barrier.offset              = offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
-	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::Barrier);
+	m_scheduler.Current().Commands().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {

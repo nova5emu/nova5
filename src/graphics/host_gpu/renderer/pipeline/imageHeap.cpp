@@ -1,3 +1,4 @@
+#include "common/gpuThreadSampler.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 
 #include "common/alignment.h"
@@ -6,6 +7,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -242,6 +244,8 @@ void ImageHeap::MarkDirty(Memory& memory, size_t begin, size_t end) {
 template <bool track>
 void ImageHeap::Watch(const Memory& memory, size_t begin, size_t end) {
 	const auto [address, limit] = PageRange(memory.base, memory.size, begin, end);
+	if constexpr (track)
+		m_context.GetBufferCache().ExcludeHotRange(address, limit - address, Common::SubmitProfile::Extra::HotRetireImage);
 	m_page_manager.UpdatePageWatchers<track>(address, limit - address);
 }
 
@@ -469,13 +473,22 @@ void ImageHeap::WriteDescriptors() {
 		writes[write].descriptorType  = vk::DescriptorType::eSampledImage;
 		writes[write].pImageInfo      = &infos.back();
 	}
-	m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()),
-	                                                    writes.data(), 0, nullptr);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
+	auto& scheduler = m_context.GetCommandScheduler();
+	// Elements are append-only or retired behind the native tick in Allocate.
+	// UPDATE_UNUSED_WHILE_PENDING permits these disjoint slots, but recording
+	// and updates of the shared set still run in one worker sequence.
+	if (scheduler.Active()) {
+		scheduler.Current().Commands().UpdateDescriptors(m_context.GetGraphics().device,
+		    static_cast<uint32_t>(writes.size()), writes.data());
+	} else {
+		// Constructor's null element: there is no command lane yet.
+		m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+	}
 	m_writes.clear();
 }
 
-void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
-                       vk::PipelineLayout layout) {
+vk::DescriptorSet ImageHeap::PrepareBinding(CommandBuffer& buffer) {
 	KYTY_PROFILER_FUNCTION();
 	const auto epoch = Image::heap_epoch.load(std::memory_order_relaxed);
 	for (auto* view: m_active) {
@@ -508,13 +521,12 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 			image->Transit(image->ReadLayout(), vk::AccessFlagBits2::eShaderRead,
 			               ImageSubresourceRange {view_info.base_level, view_info.level_count,
 			                                      view_info.base_layer, view_info.layer_count},
-			               buffer.Handle());
+			               buffer.Commands());
 			return true;
 		});
 	}
 	m_active.clear();
-	buffer.Handle().bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &m_set, 0,
-	                                   nullptr);
+	return m_set;
 }
 
 void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {

@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/gpuTimeProfile.h"
+#include "graphics/host_gpu/renderer/guestClock.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
@@ -41,9 +42,11 @@ public:
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
 	void                                    ShutdownGpu();
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
+	[[nodiscard]] bool                      HasGpu() const { return m_gpu != nullptr; }
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
 	GpuTimeProfile& GetGpuTimeProfile() { return m_gpu_time_profile; }
+	GuestClock& GetGuestClock() { return m_guest_clock; }
 	Common::Mutex&      GetMutex() { return m_mutex; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
@@ -77,6 +80,7 @@ private:
 	GraphicContext&           m_graphics;
 	Common::Mutex             m_mutex;
 	GpuTimeProfile            m_gpu_time_profile;
+	GuestClock                m_guest_clock;
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;

@@ -1,3 +1,4 @@
+#define KYTY_STALL_HLE
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -87,10 +88,10 @@ int KYTY_SYSV_ABI PlayGoInitialize(const PlayGoInitParams* init) {
 	PRINT_NAME();
 
 	if (init == nullptr || init->buf_addr == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_POINTER, 0, g_chunks_num);
 	}
 	if (init->buf_size < 2u * 1024u * 1024u) {
-		return PLAYGO_ERROR_BAD_SIZE;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_SIZE, 0, g_chunks_num);
 	}
 
 	LOGF("\t buf_addr = %016" PRIx64 "\n"
@@ -103,41 +104,42 @@ int KYTY_SYSV_ABI PlayGoInitialize(const PlayGoInitParams* init) {
 		LOGF("\t playgo_hack chunks = %" PRIu32 "\n", g_chunks_num);
 	}
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoTerminate() {
 	PRINT_NAME();
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoOpen(int* out_handle, const void* param) {
 	PRINT_NAME();
 
 	if (out_handle == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_POINTER, 0, g_chunks_num);
 	}
 	if (param != nullptr) {
-		return PLAYGO_ERROR_INVALID_ARGUMENT;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_INVALID_ARGUMENT, 0, g_chunks_num);
 	}
 	if (!ensure_chunks_loaded()) {
-		return PLAYGO_ERROR_NOT_SUPPORT_PLAYGO;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_NOT_SUPPORT_PLAYGO, 0,
+		                                 g_chunks_num);
 	}
 
 	*out_handle = PLAYGO_HANDLE;
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoClose(int handle) {
 	PRINT_NAME();
 
 	if (auto ret = validate_handle(handle); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoGetLocus(int handle, const uint16_t* chunk_ids, uint32_t number_of_entries,
@@ -147,13 +149,13 @@ int KYTY_SYSV_ABI PlayGoGetLocus(int handle, const uint16_t* chunk_ids, uint32_t
 	LOGF("\t handle = %d\n", handle);
 
 	if (auto ret = validate_handle(handle); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 	if (chunk_ids == nullptr || out_loci == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_POINTER, 0, g_chunks_num);
 	}
 	if (number_of_entries == 0) {
-		return PLAYGO_ERROR_BAD_SIZE;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_SIZE, 0, g_chunks_num);
 	}
 	ensure_chunks_loaded();
 
@@ -163,11 +165,12 @@ int KYTY_SYSV_ABI PlayGoGetLocus(int handle, const uint16_t* chunk_ids, uint32_t
 		if (is_valid_chunk(chunk_ids[i])) {
 			out_loci[i] = PLAYGO_LOCUS_LOCAL_FAST;
 		} else {
-			return PLAYGO_ERROR_BAD_CHUNK_ID;
+			Common::StallDump::Observe("PlayGo.bad_chunk", handle, chunk_ids[i], g_chunks_num);
+			return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_CHUNK_ID, 0, g_chunks_num);
 		}
 	}
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoGetInstallSpeed(int handle, int32_t* out_speed) {
@@ -176,15 +179,15 @@ int KYTY_SYSV_ABI PlayGoGetInstallSpeed(int handle, int32_t* out_speed) {
 	LOGF("\t handle = %d\n", handle);
 
 	if (auto ret = validate_handle(handle); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 	if (out_speed == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_POINTER, 0, g_chunks_num);
 	}
 
 	*out_speed = PLAYGO_INSTALL_SPEED_FULL;
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoSetInstallSpeed(int handle, int32_t speed) {
@@ -195,13 +198,13 @@ int KYTY_SYSV_ABI PlayGoSetInstallSpeed(int handle, int32_t speed) {
 	     handle, speed);
 
 	if (auto ret = validate_handle(handle); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 	if (speed < 0 || speed > 2) {
-		return PLAYGO_ERROR_BAD_SPEED;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_SPEED, 0, g_chunks_num);
 	}
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoGetChunkId(int handle, uint16_t* out_chunk_id_list,
@@ -216,20 +219,20 @@ int KYTY_SYSV_ABI PlayGoGetChunkId(int handle, uint16_t* out_chunk_id_list,
 	     reinterpret_cast<uint64_t>(out_entries));
 
 	if (auto ret = validate_handle(handle); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 	if (out_entries == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_POINTER, 0, g_chunks_num);
 	}
 	if (out_chunk_id_list != nullptr && number_of_entries == 0) {
-		return PLAYGO_ERROR_BAD_SIZE;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_SIZE, 0, g_chunks_num);
 	}
 	ensure_chunks_loaded();
 
 	// A null output buffer asks for the total chunk count.
 	if (out_chunk_id_list == nullptr) {
 		*out_entries = g_chunks_num;
-		return OK;
+		return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 	}
 
 	const uint32_t entries = std::min(number_of_entries, g_chunks_num);
@@ -238,7 +241,7 @@ int KYTY_SYSV_ABI PlayGoGetChunkId(int handle, uint16_t* out_chunk_id_list,
 	}
 	*out_entries = entries;
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoGetToDoList(int handle, PlayGoToDo* out_todo_list,
@@ -253,17 +256,17 @@ int KYTY_SYSV_ABI PlayGoGetToDoList(int handle, PlayGoToDo* out_todo_list,
 	     reinterpret_cast<uint64_t>(out_entries));
 
 	if (auto ret = validate_handle(handle); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 	if (out_entries == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_POINTER, 0, g_chunks_num);
 	}
 	if (number_of_entries != 0 && out_todo_list == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_POINTER, 0, g_chunks_num);
 	}
 	*out_entries = 0;
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoSetToDoList(int handle, const PlayGoToDo* todo_list,
@@ -276,24 +279,24 @@ int KYTY_SYSV_ABI PlayGoSetToDoList(int handle, const PlayGoToDo* todo_list,
 	     handle, reinterpret_cast<uint64_t>(todo_list), number_of_entries);
 
 	if (auto ret = validate_handle(handle); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 	if (todo_list == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_POINTER, 0, g_chunks_num);
 	}
 	if (number_of_entries == 0) {
-		return PLAYGO_ERROR_BAD_SIZE;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_SIZE, 0, g_chunks_num);
 	}
 	for (uint32_t i = 0; i < number_of_entries; i++) {
 		if (!is_valid_chunk(todo_list[i].chunk_id)) {
-			return PLAYGO_ERROR_BAD_CHUNK_ID;
+			return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_CHUNK_ID, 0, g_chunks_num);
 		}
 		if (!is_valid_locus(todo_list[i].locus)) {
-			return PLAYGO_ERROR_BAD_LOCUS;
+			return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_LOCUS, 0, g_chunks_num);
 		}
 	}
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoPrefetch(int handle, const uint16_t* chunk_ids, uint32_t number_of_entries,
@@ -307,24 +310,24 @@ int KYTY_SYSV_ABI PlayGoPrefetch(int handle, const uint16_t* chunk_ids, uint32_t
 	     handle, reinterpret_cast<uint64_t>(chunk_ids), number_of_entries, minimum_locus);
 
 	if (auto ret = validate_handle(handle); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 	if (chunk_ids == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_POINTER, 0, g_chunks_num);
 	}
 	if (number_of_entries == 0) {
-		return PLAYGO_ERROR_BAD_SIZE;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_SIZE, 0, g_chunks_num);
 	}
 	if (!is_valid_locus(minimum_locus)) {
-		return PLAYGO_ERROR_BAD_LOCUS;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_LOCUS, 0, g_chunks_num);
 	}
 	for (uint32_t i = 0; i < number_of_entries; i++) {
 		if (!is_valid_chunk(chunk_ids[i])) {
-			return PLAYGO_ERROR_BAD_CHUNK_ID;
+			return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_CHUNK_ID, 0, g_chunks_num);
 		}
 	}
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoGetEta(int handle, const uint16_t* chunk_ids, uint32_t number_of_entries,
@@ -332,37 +335,37 @@ int KYTY_SYSV_ABI PlayGoGetEta(int handle, const uint16_t* chunk_ids, uint32_t n
 	PRINT_NAME();
 
 	if (auto ret = validate_handle(handle); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 	if (chunk_ids == nullptr || out_eta == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_POINTER, 0, g_chunks_num);
 	}
 	if (number_of_entries == 0) {
-		return PLAYGO_ERROR_BAD_SIZE;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_SIZE, 0, g_chunks_num);
 	}
 	for (uint32_t i = 0; i < number_of_entries; i++) {
 		if (!is_valid_chunk(chunk_ids[i])) {
-			return PLAYGO_ERROR_BAD_CHUNK_ID;
+			return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_CHUNK_ID, 0, g_chunks_num);
 		}
 	}
 	*out_eta = 0;
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoGetLanguageMask(int handle, uint64_t* out_language_mask) {
 	PRINT_NAME();
 
 	if (auto ret = validate_handle(handle); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 	if (out_language_mask == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_POINTER, 0, g_chunks_num);
 	}
 
 	*out_language_mask = PLAYGO_LANGUAGE_MASK_ALL;
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoGetProgress(int handle, const uint16_t* chunk_ids,
@@ -370,42 +373,44 @@ int KYTY_SYSV_ABI PlayGoGetProgress(int handle, const uint16_t* chunk_ids,
 	PRINT_NAME();
 
 	if (auto ret = validate_handle(handle); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 	if (chunk_ids == nullptr || out_progress == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_POINTER, 0, g_chunks_num);
 	}
 	if (number_of_entries == 0) {
-		return PLAYGO_ERROR_BAD_SIZE;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_SIZE, 0, g_chunks_num);
 	}
 	for (uint32_t i = 0; i < number_of_entries; i++) {
 		if (!is_valid_chunk(chunk_ids[i])) {
-			return PLAYGO_ERROR_BAD_CHUNK_ID;
+			return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_CHUNK_ID, 0, g_chunks_num);
 		}
 	}
 
 	out_progress->total_size    = number_of_entries;
 	out_progress->progress_size = number_of_entries;
+	Common::StallDump::Observe("PlayGo.progress", handle, out_progress->progress_size,
+	                           out_progress->total_size, g_chunks_num);
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoGetOptionalChunk(int handle, int32_t type, PlayGoOptionalChunk* option) {
 	PRINT_NAME();
 
 	if (auto ret = validate_handle(handle); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 	if (option == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_POINTER, 0, g_chunks_num);
 	}
 	if (auto ret = validate_optional_type(type); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 
 	set_optional_chunk(type, option);
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoPrefetchOptionalChunk(int handle, int32_t type,
@@ -413,30 +418,33 @@ int KYTY_SYSV_ABI PlayGoPrefetchOptionalChunk(int handle, int32_t type,
 	PRINT_NAME();
 
 	if (auto ret = validate_handle(handle); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 	if (option == nullptr) {
-		return PLAYGO_ERROR_BAD_POINTER;
+		return Common::StallDump::Result(__func__, PLAYGO_ERROR_BAD_POINTER, 0, g_chunks_num);
 	}
 	if (auto ret = validate_optional_type(type); ret != OK) {
-		return ret;
+		return Common::StallDump::Result(__func__, ret, 0, g_chunks_num);
 	}
 
-	return OK;
+	return Common::StallDump::Result(__func__, OK, 0, g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoGetInstallChunkId(int handle, uint16_t* out_chunk_id_list,
                                           uint32_t number_of_entries, uint32_t* out_entries) {
 	PRINT_NAME();
 
-	return PlayGoGetChunkId(handle, out_chunk_id_list, number_of_entries, out_entries);
+	return Common::StallDump::Result(
+	    __func__, PlayGoGetChunkId(handle, out_chunk_id_list, number_of_entries, out_entries), 0,
+	    g_chunks_num);
 }
 
 int KYTY_SYSV_ABI PlayGoGetSupportedOptionalChunk(int handle, int32_t type,
                                                   PlayGoOptionalChunk* option) {
 	PRINT_NAME();
 
-	return PlayGoGetOptionalChunk(handle, type, option);
+	return Common::StallDump::Result(__func__, PlayGoGetOptionalChunk(handle, type, option), 0,
+	                                 g_chunks_num);
 }
 
 } // namespace PlayGo

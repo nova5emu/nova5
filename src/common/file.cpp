@@ -201,11 +201,18 @@ uint64_t File::Size(const std::filesystem::path& name) {
 }
 
 std::optional<File::Info> File::GetInfo(const std::filesystem::path& name) {
+	return GetInfo(name, nullptr);
+}
+
+std::optional<File::Info> File::GetInfo(const std::filesystem::path& name, std::error_code* error) {
+	if (error) { error->clear(); }
 	if (IsArchivePath(name)) {
-		return GetArchiveInfo(name);
+		const auto info = GetArchiveInfo(name);
+		if (!info && error) { *error = std::make_error_code(std::errc::no_such_file_or_directory); }
+		return info;
 	}
 	Info info {};
-	return SysFileGetInfo(name, &info.is_file, &info.size) ? std::optional(info) : std::nullopt;
+	return SysFileGetInfo(name, &info.is_file, &info.size, error) ? std::optional(info) : std::nullopt;
 }
 
 bool File::Seek(uint64_t offset) {

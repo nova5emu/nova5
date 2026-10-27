@@ -1,3 +1,4 @@
+#define KYTY_STALL_HLE
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -120,9 +121,24 @@ struct AvPlayerEventReplacement {
 	AvPlayerEventCallback event_callback = nullptr;
 };
 static void emit_event(AvPlayerEventReplacement event, int32_t id, void* data = nullptr) {
+	Common::StallDump::Note("AvPlayer.event", reinterpret_cast<uintptr_t>(event.event_callback),
+	                         static_cast<uint32_t>(id));
+	Common::StallDump::Progress(event.event_callback != nullptr ? Common::StallDump::Milestone::AvEventDelivered
+	                                                          : Common::StallDump::Milestone::AvEventNoCallback);
 	if (event.event_callback != nullptr) {
+		const auto warning = id == AVPLAYER_EVENT_WARNING_ID && data != nullptr
+		                         ? static_cast<uint32_t>(*static_cast<const int32_t*>(data))
+		                         : 0;
+		Common::StallDump::Observe(
+		    "Av.event_enter", reinterpret_cast<uintptr_t>(event.object_pointer),
+		    static_cast<uint32_t>(id), warning, reinterpret_cast<uintptr_t>(event.event_callback));
+		Common::StallDump::Scope callback("AvPlayer.event_callback",
+		                                  reinterpret_cast<uintptr_t>(event.event_callback));
 		LOGF("\t event_id = %d\n", id);
 		event.event_callback(event.object_pointer, id, 0, data);
+		Common::StallDump::Observe(
+		    "Av.event_return", reinterpret_cast<uintptr_t>(event.object_pointer),
+		    static_cast<uint32_t>(id), warning, reinterpret_cast<uintptr_t>(event.event_callback));
 	}
 }
 
@@ -417,6 +433,7 @@ class PacketQueue {
 public:
 	explicit PacketQueue(size_t byte_capacity): capacity(byte_capacity) {}
 	bool Push(DemuxPacket value, const std::atomic_bool& stop) {
+		Common::StallDump::Scope wait("AvPlayer.packet_queue_space", reinterpret_cast<uintptr_t>(this), true);
 		const auto size =
 		    value.packet == nullptr ? 0u : static_cast<size_t>(std::max(value.packet->size, 0));
 		std::unique_lock lock(mutex);
@@ -433,6 +450,7 @@ public:
 	}
 	std::optional<DemuxPacket> WaitPop(const std::atomic_bool& stop,
 	                                   const std::atomic_bool& finished) {
+		Common::StallDump::Scope wait("AvPlayer.packet_queue_data", reinterpret_cast<uintptr_t>(this), true);
 		std::unique_lock lock(mutex);
 		available.wait(lock, [&] { return stop || finished || !queue.empty(); });
 		if (stop || queue.empty()) {
@@ -541,6 +559,7 @@ public:
 		return value;
 	}
 	std::optional<T> WaitPop(const std::atomic_bool& stop) {
+		Common::StallDump::Scope wait("AvPlayer.free_buffer", reinterpret_cast<uintptr_t>(this), true);
 		std::unique_lock lock(mutex);
 		available.wait(lock, [&] { return stop || !queue.empty(); });
 		if (stop || queue.empty()) {
@@ -799,6 +818,10 @@ public:
 		return StartImpl(ms);
 	}
 	int StartImpl(uint64_t ms, bool paused_after_start = false, bool show_seek_frame = false) {
+		Common::StallDump::Observe("Av.source_queues", reinterpret_cast<uintptr_t>(this),
+		                           reinterpret_cast<uintptr_t>(&video_buffers),
+		                           reinterpret_cast<uintptr_t>(&video_packets),
+		                           reinterpret_cast<uintptr_t>(&audio_buffers));
 		{
 			std::lock_guard lock(mutex);
 			state = State::Ready;
@@ -810,6 +833,7 @@ public:
 		{
 			std::lock_guard lock(mutex);
 			ResetNoLock(true);
+			++playback_generation;
 			if (!video_id && !audio_id) {
 				AutoEnable();
 			}
@@ -881,6 +905,7 @@ public:
 		}
 		paused     = true;
 		pause_time = std::chrono::steady_clock::now();
+		TraceStateNoLock("Av.pause_state");
 		return 0;
 	}
 	void Resume() {
@@ -891,18 +916,47 @@ public:
 		}
 		paused                   = false;
 		seek_video_frame_pending = false;
+		TraceStateNoLock("Av.resume_state");
 	}
-	void SetLoop(bool v) { loop = v; }
+	void SetLoop(bool v) {
+		loop = v;
+		Common::StallDump::Observe("Av.loop_request", reinterpret_cast<uintptr_t>(this), v);
+	}
 	void SetSync(uint32_t v) {
 		std::lock_guard lock(mutex);
 		sync_mode = v;
+		TraceStateNoLock("Av.sync_state");
 	}
 	void SetTrick(int32_t v) {
 		std::lock_guard lock(mutex);
 		trick_speed = v;
 	}
-	bool Active() const {
-		std::lock_guard lock(mutex);
+	bool Active() {
+		std::unique_lock lock(mutex);
+		if (Common::StallDump::Enabled()) {
+			// Bit layout documented in docs/stall-dump.md. Read under the existing lock.
+			const uint64_t flags = static_cast<uint64_t>(state) |
+			    (uint64_t(demux_eof.load()) << 2) | (uint64_t(video_done.load()) << 3) |
+			    (uint64_t(audio_done.load()) << 4) | (uint64_t(video_frames.Empty()) << 5) |
+			    (uint64_t(audio_frames.Empty()) << 6) | (uint64_t(paused) << 7) |
+			    (uint64_t(pipeline_failed.load()) << 8) | (uint64_t(loop.load()) << 9);
+			Common::StallDump::Note("AvPlayer.active_flags", reinterpret_cast<uintptr_t>(this), flags);
+			Common::StallDump::Observe("Av.active_flags", reinterpret_cast<uintptr_t>(this), flags);
+		}
+		// A finished pipeline may still have output waiting for the caller. Never discard
+		// that output because the caller paused or stopped polling. Only acknowledge
+		// natural completion once both decoders and both output queues have drained.
+		if (state == State::Playing && !paused && !loop && !pipeline_failed && !worker_stop &&
+		    natural_end && DrainedNoLock()) {
+			state                      = State::Stopped;
+			const auto completed_event = event;
+			TraceStateNoLock("Av.natural_stop");
+			lock.unlock();
+			// The guest callback may query, Stop, restart, or destroy this Source.
+			// No locks, joins, or accesses to this after dispatch.
+			emit_event(completed_event, AVPLAYER_EVENT_STATE_STOP);
+			return false;
+		}
 		return state == State::Ready ||
 		       (state == State::Playing && !pipeline_failed && !DrainedNoLock());
 	}
@@ -956,25 +1010,39 @@ public:
 		return 0;
 	}
 	bool Video(AvPlayerFrameInfoEx* out) {
+		Common::StallDump::Observe("Av.video_poll", reinterpret_cast<uintptr_t>(this));
 		if (out == nullptr) {
 			return false;
 		}
 		std::lock_guard lock(mutex);
 		if (state != State::Playing || !video_id) {
+			Common::StallDump::Observe("Av.video_inactive", reinterpret_cast<uintptr_t>(this),
+			                           static_cast<uint64_t>(state), video_id.has_value());
 			return false;
 		}
 		const bool deliver_seek_frame = paused && seek_video_frame_pending;
 		if (paused && !deliver_seek_frame) {
+			Common::StallDump::Observe("Av.video_paused", reinterpret_cast<uintptr_t>(this));
 			return false;
 		}
-		auto frame = video_frames.TryPopIf([&](const ReadyFrame& candidate) {
-			if (deliver_seek_frame || sync_mode != 0) {
+		bool candidate_seen = false;
+		auto frame          = video_frames.TryPopIf([&](const ReadyFrame& candidate) {
+            candidate_seen = true;
+            if (deliver_seek_frame || sync_mode != 0) {
 				return true;
 			}
 			auto now = CurrentTimeNoLock();
-			return now == 0 || candidate.info.time_stamp + candidate.timestamp_offset <= now;
-		});
+            if (now != 0 && candidate.info.time_stamp + candidate.timestamp_offset > now) {
+                Common::StallDump::Observe("Av.video_clock_wait", reinterpret_cast<uintptr_t>(this),
+				                                    candidate.info.time_stamp + candidate.timestamp_offset,
+				                                    now);
+            }
+            return now == 0 || candidate.info.time_stamp + candidate.timestamp_offset <= now;
+        });
 		if (!frame) {
+			if (!candidate_seen) {
+				Common::StallDump::Observe("Av.video_empty", reinterpret_cast<uintptr_t>(this));
+			}
 			return false;
 		}
 		if (current_video) {
@@ -982,6 +1050,10 @@ public:
 		}
 		current_video = std::move(*frame);
 		*out          = current_video->info;
+		TraceStateNoLock("Av.video_state");
+		Common::StallDump::Observe("Av.video_delivered", reinterpret_cast<uintptr_t>(this),
+		                           out->time_stamp, current_video->timestamp_offset,
+		                           reinterpret_cast<uintptr_t>(out->data));
 		RecordLoopBoundary(*current_video);
 		if (deliver_seek_frame) {
 			seek_video_frame_pending = false;
@@ -989,16 +1061,21 @@ public:
 		return true;
 	}
 	bool Audio(AvPlayerFrameInfo* out) {
+		Common::StallDump::Observe("Av.audio_poll", reinterpret_cast<uintptr_t>(this));
 		if (out == nullptr) {
 			return false;
 		}
 		std::lock_guard lock(mutex);
 		if (paused || state != State::Playing || !audio_id ||
 		    trick_speed != AVPLAYER_TRICK_SPEED_NORMAL) {
+			Common::StallDump::Observe("Av.audio_inactive", reinterpret_cast<uintptr_t>(this),
+			                           static_cast<uint64_t>(state) | (uint64_t(paused) << 7),
+			                           audio_id.has_value(), trick_speed);
 			return false;
 		}
 		auto frame = audio_frames.TryPop();
 		if (!frame) {
+			Common::StallDump::Observe("Av.audio_empty", reinterpret_cast<uintptr_t>(this));
 			return false;
 		}
 		if (current_audio) {
@@ -1017,6 +1094,9 @@ public:
 		clock_start   = std::chrono::steady_clock::now();
 		paused_extra  = {};
 		RecordLoopBoundary(*current_audio);
+		Common::StallDump::Observe("Av.audio_delivered", reinterpret_cast<uintptr_t>(this),
+		                           out->time_stamp, current_audio->timestamp_offset,
+		                           out->details.audio.size);
 		return true;
 	}
 	std::optional<int32_t> TakeWarning() {
@@ -1030,6 +1110,20 @@ public:
 
 private:
 	enum class State { Ready, Playing, Stopped };
+	uint64_t playback_generation = 0; // Advanced only after joining the previous workers.
+	void     TraceStateNoLock(const char* operation) const {
+        if (!Common::StallDump::Enabled()) {
+            return;
+        }
+        const uint64_t flags =
+            static_cast<uint64_t>(state) | (uint64_t(demux_eof.load()) << 2) |
+            (uint64_t(video_done.load()) << 3) | (uint64_t(audio_done.load()) << 4) |
+            (uint64_t(video_frames.Empty()) << 5) | (uint64_t(audio_frames.Empty()) << 6) |
+            (uint64_t(paused) << 7) | (uint64_t(pipeline_failed.load()) << 8) |
+            (uint64_t(loop.load()) << 9) | (uint64_t(sync_mode != 0) << 10);
+        Common::StallDump::Observe(operation, reinterpret_cast<uintptr_t>(this), flags,
+		                               CurrentTimeNoLock(), playback_generation);
+	}
 
 	bool DrainedNoLock() const {
 		return demux_eof && video_done && audio_done && video_frames.Empty() &&
@@ -1215,6 +1309,7 @@ private:
 		interrupt_io    = false;
 		pipeline_failed = false;
 		demux_eof       = false;
+		natural_end     = false;
 		video_done      = !video_id;
 		audio_done      = !audio_id;
 		if ((video_id && !CreateWorker(video_thread, VideoDecoderEntry, "AvPlayerVideoDecoder")) ||
@@ -1225,6 +1320,7 @@ private:
 			return false;
 		}
 		state = State::Playing;
+		TraceStateNoLock("Av.start_state");
 		return true;
 	}
 	void NotifyWorkers() {
@@ -1263,8 +1359,10 @@ private:
 		NotifyWorkers();
 	}
 	void Demux() {
+		Common::StallDump::Scope demux("AvPlayer.demux", reinterpret_cast<uintptr_t>(this));
 		uint64_t video_offset = 0;
 		uint64_t audio_offset = 0;
+		bool                     natural_eof  = false;
 		uint64_t loop_period  = fmt->duration > 0 ? static_cast<uint64_t>(fmt->duration / 1000) : 0;
 		if (loop_period == 0) {
 			if (video_id) {
@@ -1280,7 +1378,11 @@ private:
 				FailPipeline();
 				break;
 			}
-			auto result = av_read_frame(fmt, packet.get());
+			int result = 0;
+			{
+				Common::StallDump::Scope read("AvPlayer.av_read_frame", reinterpret_cast<uintptr_t>(this));
+				result = av_read_frame(fmt, packet.get());
+			}
 			if (result < 0) {
 				if (result == AVERROR_EOF && loop) {
 					video_offset += loop_period;
@@ -1299,6 +1401,7 @@ private:
 					LOGF("\t av_read_frame failed: %s\n", fferr(result).c_str());
 					FailPipeline();
 				}
+				natural_eof = result == AVERROR_EOF && !worker_stop;
 				break;
 			}
 			if (video_id && packet->stream_index == video_id.value()) {
@@ -1311,6 +1414,17 @@ private:
 				}
 			}
 		}
+		Common::StallDump::Note("AvPlayer.demux_end", reinterpret_cast<uintptr_t>(this), worker_stop.load());
+		Common::StallDump::Observe("Av.demux_end", reinterpret_cast<uintptr_t>(this),
+		                           worker_stop.load());
+		Common::StallDump::Observe("Av.demux_exit", reinterpret_cast<uintptr_t>(this),
+		                           worker_stop       ? 1
+		                           : pipeline_failed ? 2
+		                           : natural_eof     ? 0
+		                                             : 3,
+		                           playback_generation, video_offset);
+		Common::StallDump::Progress(Common::StallDump::Milestone::AvDemuxEnd);
+		natural_end = natural_eof;
 		demux_eof = true;
 		video_packets.Notify();
 		audio_packets.Notify();
@@ -1328,6 +1442,7 @@ private:
 	void Decoder(PacketQueue& packets, AVCodecContext* codec,
 	             WorkQueue<std::unique_ptr<GuestBuffer>>& buffers, WorkQueue<ReadyFrame>& frames,
 	             std::atomic_bool& done, PrepareFrame prepare, const char* kind) {
+		Common::StallDump::Scope decode("AvPlayer.decode", reinterpret_cast<uintptr_t>(this));
 		uint64_t timestamp_offset = 0;
 		while (!worker_stop) {
 			auto item = packets.WaitPop(worker_stop, demux_eof);
@@ -1361,6 +1476,7 @@ private:
 				break;
 			}
 		}
+		Common::StallDump::Note("AvPlayer.decoder_end", reinterpret_cast<uintptr_t>(&done), worker_stop.load());
 		done = true;
 	}
 	bool DecodePacket(AVCodecContext* codec, AVPacket* packet, uint64_t timestamp_offset,
@@ -1678,6 +1794,7 @@ private:
 	std::atomic_bool                         interrupt_io {false};
 	std::atomic_bool                         pipeline_failed {false};
 	std::atomic_bool                         demux_eof {true};
+	std::atomic_bool                         natural_end {false};
 	std::atomic_bool                         video_done {true};
 	std::atomic_bool                         audio_done {true};
 	std::mutex                               lifecycle_mutex;

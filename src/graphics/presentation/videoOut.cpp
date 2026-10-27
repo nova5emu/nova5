@@ -1,13 +1,17 @@
+#define KYTY_STALL_HLE
 #include "graphics/presentation/videoOut.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
+#include "common/frameTrace.h"
+#include "common/frameTimeline.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "common/threadDelay.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -1112,6 +1116,18 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 			}
 			const auto& group   = cfg->groups[surface.group_index];
 			source_info         = group.ImageInfo(surface);
+			Common::FrameTrace::Print(Common::FrameTrace::ActiveId(),
+			    "video_surface request=%llu index=%d addr=0x%llx extent=%ux%u pitch=%u format=0x%llx tile=%u",
+			    static_cast<unsigned long long>(request_id), index, static_cast<unsigned long long>(surface.data_address),
+			    group.attribute.width, group.attribute.height, group.attribute.pitch_in_pixel,
+			    static_cast<unsigned long long>(group.attribute.pixel_format), group.attribute.tiling_mode);
+			Common::StallDump::Observe("Video.surface_route", request_id,
+			                           static_cast<uint32_t>(index), cfg->bus,
+			                           surface.data_address);
+			Common::StallDump::Observe(
+			    "Video.prepare_surface", surface.data_address, group.attribute.pixel_format,
+			    (uint64_t(group.attribute.width) << 32) | group.attribute.height,
+			    (uint64_t(group.attribute.tiling_mode) << 32) | group.attribute.pitch_in_pixel);
 			hdr                 = Graphics::IsHdrVideoOutPixelFormat(group.attribute.pixel_format);
 			premultiplied_alpha = (group.attribute.option &
 			                       VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED) != 0;
@@ -1135,6 +1151,8 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	}
 	Graphics::Presenter::Frame* frame = nullptr;
 	if (special) {
+		Common::StallDump::Observe("Video.prepare_blank", request_id, static_cast<uint32_t>(index),
+		                           width, height);
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
 	} else {
@@ -1175,6 +1193,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
 		}
 		request->state = RequestState::Ready;
+		Common::FrameTimeline::Event(Common::FrameTimeline::Kind::FlipReady, 0, 0, 0, request_id);
 		m_submit_cond_var.Signal();
 		m_mutex.Unlock();
 		return;
@@ -1291,6 +1310,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		}
 		if (layer_count != 0) {
 			m_presenter.Present(std::span(layers.data(), layer_count));
+			Common::StallDump::Observe("Video.present", group, layer_count, count);
 		}
 		if (requests[0].cfg->bus == 0) {
 			Graphics::PerformanceOverlayRecordFlip(requests[0].cfg->width, requests[0].cfg->height);
@@ -1309,6 +1329,10 @@ bool FlipQueue::Flip(uint32_t micros) {
 		}
 		auto& r = *it;
 		r.cfg->flip_status.count++;
+		Common::FrameTimeline::Event(Common::FrameTimeline::Kind::FlipPresented, 0, 0, 0,
+		    r.id, static_cast<uint32_t>(r.index), r.flip_arg, r.cfg->flip_status.count);
+		Common::StallDump::Observe("Video.flip_completed", r.id, static_cast<uint32_t>(r.index),
+		                           r.cfg->bus, r.cfg->flip_status.count);
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
 		r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
@@ -1656,10 +1680,13 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	PRINT_NAME();
+	Common::FrameTimeline::Event(Common::FrameTimeline::Kind::CpuFlipCall, 0, 0, 0, handle, index, flip_mode, flip_arg);
 
 	uint64_t  request_id = 0;
 	const int result     = ReserveFlipRequest(DriverState(), handle, index, flip_mode, flip_arg,
 	                                          FlipRequestSource::Cpu, request_id);
+	Common::StallDump::Observe("Video.submit_cpu", handle, static_cast<uint32_t>(result),
+	                           static_cast<uint32_t>(index), request_id);
 	if (result == VIDEO_OUT_ERROR_INVALID_FLIP_MODE) {
 		LOGF("\t unsupported flip_mode = %d\n", flip_mode);
 	}
@@ -1677,6 +1704,8 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
 
 	const int result = ReserveFlipRequest(*m_impl, handle, index, flip_mode, flip_arg,
 	                                      FlipRequestSource::GpuEop, request_id);
+	Common::StallDump::Observe("Video.submit_gpu", handle, static_cast<uint32_t>(result),
+	                           static_cast<uint32_t>(index), request_id);
 	if (result != OK) {
 		return result;
 	}
@@ -1694,6 +1723,11 @@ void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& b
 }
 
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {
+	// Called by the priority worker AFTER the native timeline tick completed,
+	// before taking the flip queue lock/publishing ready. One dose per flip,
+	// not per priority callback (readbacks, labels, etc. must not multiply it).
+	Common::ThreadDelay::Apply<Common::ThreadDelay::Site::Completion>("complete_flip_before_ready", "priority flip callback");
+	Common::StallDump::Observe("Video.gpu_ready", request_id);
 	m_impl->GetFlipQueue().Complete(request_id);
 }
 
@@ -1839,7 +1873,10 @@ KYTY_SYSV_ABI int VideoOutGetEventCount(const EventQueue::KernelEvent* ev) {
 }
 
 KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
+	Common::FrameTimeline::WaitScope timeline(Common::FrameTimeline::Kind::VblankBegin,
+	    Common::FrameTimeline::Kind::VblankEnd, handle);
 	PRINT_NAME();
+	Common::StallDump::Scope wait(__func__, static_cast<uintptr_t>(handle), true);
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {

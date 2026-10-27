@@ -38,6 +38,7 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/host_gpu/renderer/vkRecorderBackend.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include <vulkan/vulkan_format_traits.hpp>
 #include "graphics/presentation/videoOut.h"
@@ -126,6 +127,12 @@ void InitAgcDriver_1(Loader::SymbolDatabase *symbols);
 
 namespace Libs::Graphics {
 
+struct VkRecorderSchedulerTestAccess {
+  static void Enable(CommandScheduler& scheduler, bool enabled) { scheduler.SetRecorderEnabled(enabled); }
+  static VkRecording::Backend& Recorder(CommandScheduler& scheduler) { return *scheduler.m_recorder; }
+  static void Drain(CommandScheduler& scheduler, Common::CommandRecording::Drain cause) { scheduler.DrainRecorder(cause); }
+};
+
 template <typename Cache>
 concept HasGetDownloadBuffer =
     requires(Cache &cache) { cache.GetDownloadBuffer(uint64_t{1}); };
@@ -170,6 +177,60 @@ static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
 struct BufferCacheTestAccess {
+	static bool HotSelected(const BufferCache& cache) { return cache.m_hot_selected; }
+	static void EnableRetiredHotTest(BufferCache& cache) { cache.m_hot_selected = true; }
+	static bool Coarsening(const BufferCache& cache, uint64_t base) {
+		const auto it = cache.m_coarsen_owners.find(base);
+		return it != cache.m_coarsen_owners.end() && it->second.active;
+	}
+	static uint64_t CoarsenBlock(const BufferCache& cache) { return cache.m_coarsen_block; }
+	static bool Hot(const BufferCache& cache, uint64_t base) {
+		const auto it = cache.m_hot_owners.find(base);
+		return it != cache.m_hot_owners.end() && it->second.hot;
+	}
+	static void ExhaustHotBudget(BufferCache& cache) { cache.m_hot_frame_bytes = cache.m_hot_budget; }
+	static bool HotObserving(const BufferCache& cache, uint64_t base) {
+		const auto it = cache.m_hot_owners.find(base);
+		return it != cache.m_hot_owners.end() && it->second.observing;
+	}
+	static void UnaffordableHotBdaPeak(BufferCache& cache, uint64_t owner_size) {
+		cache.m_hot_bda_peak = cache.m_hot_budget / owner_size + 1;
+	}
+	static uint64_t HotVisits(const BufferCache& cache) { return cache.m_hot_exclusion_visits; }
+	static uint64_t HotActive(const BufferCache& cache) { return cache.m_hot_active; }
+	static uint64_t HotFrameBytes(const BufferCache& cache) { return cache.m_hot_frame_bytes; }
+	static uint64_t HotFrameUses(const BufferCache& cache) { return cache.m_hot_frame_uses; }
+  static bool ImportIdle(const BufferCache& cache) {
+    return !cache.m_import_gate && cache.m_host_imports.empty() &&
+        cache.m_import_gpu_excluded.Empty() && cache.m_import_image_excluded.Empty();
+  }
+  static bool ImportProbed(const BufferCache& cache) { return cache.m_import_probed; }
+  static void ImportGuard(BufferCache& cache, bool enabled) { cache.m_import_guard_enabled = enabled; }
+  static auto ImportPending(const BufferCache& cache) { return cache.m_import_readers.PendingBytes(); }
+  static uint64_t ImportPendingTick(const BufferCache& cache, uint64_t address, uint64_t size) {
+    return cache.m_import_readers.Find(address, size).tick;
+  }
+  static uint64_t ImportStaleBytes(const BufferCache& cache, uint64_t address) {
+    uint64_t bytes = 0;
+    cache.m_host_imports.at(address).stale.ForEach([&](uint64_t first, uint64_t last) { bytes += last - first; });
+    return bytes;
+  }
+  static void CollectWithHotImport(BufferCache& cache, Libs::Graphics::Buffer& buffer) {
+    const auto trigger = cache.m_trigger_gc_memory;
+    cache.m_trigger_gc_memory = 0;
+    ++cache.m_gc_tick;
+    cache.TouchBuffer(buffer);
+    cache.RunGarbageCollector();
+    cache.m_trigger_gc_memory = trigger;
+  }
+  static Libs::Graphics::Buffer* Imported(BufferCache& cache, uint64_t address) {
+    const auto it = cache.m_host_imports.find(address);
+    return it == cache.m_host_imports.end() ? nullptr : it->second.imported.get();
+  }
+  static void RetryImport(BufferCache& cache, Libs::Graphics::Buffer& buffer) {
+    buffer.import_retry_frame = 0;
+    buffer.import_observations = 3;
+  }
   // Standalone renderer fixtures have no GuestGpu command thread. Publish through
   // the same download/unmark sequence as ReadMemory before unmapping their pages.
   static void DownloadOnCurrentThread(BufferCache& cache, uint64_t address, uint64_t size) {
@@ -438,6 +499,17 @@ struct CommandProcessorTestAccess {
     processor.m_pending_indirect_counts.push_back({snapshot, records, maximum, stride});
   }
   static uint32_t Instances(CommandProcessor& processor) { return processor.NumInstances(); }
+};
+
+struct GpuTimeProfileTestAccess {
+  static std::array<uint64_t, 4> Counts(const GpuTimeProfile& profile) {
+    return {profile.m_clock_sequence, profile.m_clock_completed, profile.m_clock_failed, profile.m_clock_pending};
+  }
+};
+
+struct GuestClockTestAccess {
+  static bool Rendering(const CommandBuffer& command) { return command.m_rendering; }
+  static bool Ready(const GuestClock& clock) { return clock.m_active >= 0; }
 };
 
 struct RenderExecutorTestAccess {
@@ -3009,6 +3081,299 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckGuestClockPublish() {
+    constexpr const char* name = "GuestClockPublish";
+    namespace Profile = Common::SubmitProfile;
+    uint64_t converted = 0;
+    Require(name, "conversion",
+            GuestClock::Convert(1000010, 10, 500, UINT64_MAX, 1.0, converted) && converted == 100500 &&
+            GuestClock::Convert(1010, 10, 500, UINT64_MAX, 2.5, converted) && converted == 750 &&
+            GuestClock::Convert(5, 250, 100, 255, 10.0, converted) && converted == 111 &&
+            GuestClock::Convert(1793076240209391616ull, 1793076240179912704ull,
+                                36572057196972ull, UINT64_MAX, 1.0, converted) &&
+                converted == 36572060144863ull &&
+            !GuestClock::Convert(9, 10, 500, UINT64_MAX, 1.0, converted) &&
+            !GuestClock::Convert(10, 0, UINT64_MAX, UINT64_MAX, 1.0, converted),
+            "100 MHz conversion, large epoch, wrap or overflow is incorrect");
+    EnsureRuntimeContext();
+    Require(name, "calibration support", m_runtime_context.calibrated_timestamps_enabled,
+            "gpu-timestamps test needs VK_EXT_calibrated_timestamps");
+    Require(name, "selection", Profile::SelectedExperiment() == Profile::Experiment::NoGpuTimestamps,
+            "test requires KYTY_EXPERIMENT=no-gpu-timestamps to exercise the opt-out gate");
+    const auto native_clocks = [](bool enabled) { Profile::SetExperiment(!enabled); };
+    Require(name, "native default", Profile::GpuTimestampsEnabled(),
+            "native clocks must be enabled before opening the opt-out gate");
+    constexpr uint64_t base = 0x0000000205800000ull, size = 0x10000;
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 3, 0x10, physical, size) == 0 &&
+        mapped == reinterpret_cast<void*>(base), "mapping failed");
+    std::memset(mapped, 0, size);
+    Require(name, "atomic backing publication",
+            LibKernel::Memory::TryCompareExchangeBacking64(base, 0, 7) &&
+            !LibKernel::Memory::TryCompareExchangeBacking64(base, 0, 9) &&
+            !LibKernel::Memory::TryCompareExchangeBacking64(base + 1, 0, 9) &&
+            LibKernel::Memory::TryCompareExchangeBacking64(base, 7, 0),
+            "backing publication accepted a stale expected value or an unaligned word");
+    auto& context = Renderer();
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto& scheduler = context.GetCommandScheduler();
+      auto& cache = context.GetBufferCache();
+      auto& clock = context.GetGuestClock();
+      scheduler.Flush(); // Fixture boundary; Record must never create this boundary.
+      Require(name, "armed", GuestClockTestAccess::Ready(clock), "native clock pool was not initialized");
+      auto read = [&](uint64_t address) {
+        uint64_t value = 0;
+        Require(name, "backing read", LibKernel::Memory::TryReadBacking(address, &value, 8), "read failed");
+        return value;
+      };
+      auto extra = [&](Profile::Extra counter) {
+        return Profile::Detail::window.extra[static_cast<size_t>(counter)].load();
+      };
+      Profile::Reset(); Profile::SetRecording(true); native_clocks(true);
+      RenderState rendering {};
+      rendering.width = rendering.height = rendering.num_layers = 1;
+      scheduler.BeginRendering(rendering);
+      const auto tick = scheduler.CurrentTick();
+      processor.ReleaseMem(3, 0, reinterpret_cast<void*>(base), 0, 0);
+      processor.ReleaseMem(3, 0, reinterpret_cast<void*>(base + 8), 0, 0);
+      processor.ReleaseMem(2, 0, reinterpret_cast<void*>(base + 16), 123, 0);
+      Require(name, "capture inside pass",
+              scheduler.CurrentTick() == tick && GuestClockTestAccess::Rendering(scheduler.Current()) &&
+                  read(base) == 0 && read(base + 8) == 0 && read(base + 16) == 123 && clock.HasPending(),
+              "clock submitted, cut the pass, published early or delayed an immediate label");
+      native_clocks(false);
+      scheduler.Finish();
+      Require(name, "ordered completion after disabling native clocks",
+              read(base) != 0 && read(base + 8) >= read(base) && !clock.HasPending() &&
+                  extra(Profile::Extra::GpuTimestampsPublished) == 2 &&
+                  extra(Profile::Extra::GpuTimestampsFailed) == 0 &&
+                  extra(Profile::Extra::GpuTimestampBatches) == 1 &&
+                  extra(Profile::Extra::GpuTimestampBuffersAbsent) == 2 &&
+                  extra(Profile::Extra::GpuTimestampBufferInvalidations) == 0,
+              "pending native clocks were not published in order after completion");
+
+      // A full query block must be harvested in bulk, but never pull clocks
+      // across an intervening normal callback. This also exercises publication
+      // without a resident buffer, before the first upload of those bytes.
+      native_clocks(true);
+      const auto batch_base = base + 0x1000;
+      const auto batches_before = extra(Profile::Extra::GpuTimestampBatches);
+      const auto published_before = extra(Profile::Extra::GpuTimestampsPublished);
+      scheduler.BeginRendering(rendering);
+      const auto batch_tick = scheduler.CurrentTick();
+      for (uint32_t i = 0; i < 1024; ++i) {
+        if (i == 512) scheduler.DeferOperation([&] {
+          Require(name, "interleaved completion order", read(batch_base) != 0 &&
+                      read(batch_base + 511 * 8) >= read(batch_base) && read(batch_base + 512 * 8) == 0,
+                  "batching moved a timestamp across a normal completion");
+        });
+        processor.ReleaseMem(3, 0, reinterpret_cast<void*>(batch_base + i * 8), 0, 0);
+      }
+      Require(name, "bulk capture inside pass", scheduler.CurrentTick() == batch_tick &&
+                  GuestClockTestAccess::Rendering(scheduler.Current()) && read(batch_base) == 0,
+              "full-block capture cut the render pass, submitted or published early");
+      native_clocks(false);
+      scheduler.Finish();
+      Require(name, "bulk query completion", !clock.HasPending() &&
+                  extra(Profile::Extra::GpuTimestampsPublished) == published_before + 1024 &&
+                  extra(Profile::Extra::GpuTimestampBatches) == batches_before + 2 &&
+                  extra(Profile::Extra::GpuTimestampsFallback) == 0,
+              "bulk capture did not use two ordered query reads or lost timestamps");
+      auto ordered_value = read(batch_base);
+      for (uint32_t i = 1; i < 1024; ++i) {
+        const auto value = read(batch_base + i * 8);
+        Require(name, "bulk timestamp order", value >= ordered_value, "bulk timestamps went backwards");
+        ordered_value = value;
+      }
+
+      native_clocks(true);
+      processor.ReleaseMem(3, 0, reinterpret_cast<void*>(base), 0, 0);
+      native_clocks(false);
+      processor.ReleaseMem(3, 0, reinterpret_cast<void*>(base), 0, 0);
+      const auto cpu_value = read(base);
+      scheduler.Finish();
+      Require(name, "gate transition", read(base) == cpu_value && extra(Profile::Extra::GpuTimestampsLate) == 1,
+              "old GPU completion overwrote a newer CPU timestamp");
+      native_clocks(true);
+      processor.ReleaseMem(3, 0, reinterpret_cast<void*>(base + 8), 0, 0);
+      const uint64_t replacement = 42;
+      LibKernel::Memory::WriteBacking(base + 8, &replacement, 8); // Guest-side reuse, no PM4 cancellation.
+      scheduler.Finish();
+      Require(name, "slot reuse", read(base + 8) == replacement && extra(Profile::Extra::GpuTimestampsLate) == 2,
+              "completion overwrote a slot reused by the guest");
+
+      // Fast cancellation must catch a write to the upper dword of a clock,
+      // and retain the general overlap path for a write spanning two slots.
+      const auto cancellation_base = base + 0x4000;
+      processor.ReleaseMem(3, 0, reinterpret_cast<void*>(cancellation_base), 0, 0);
+      processor.ReleaseMem(3, 0, reinterpret_cast<void*>(cancellation_base + 8), 0, 0);
+      processor.ReleaseMem(3, 0, reinterpret_cast<void*>(cancellation_base + 16), 0, 0);
+      clock.Cancel(cancellation_base + 4, 4);
+      clock.Cancel(cancellation_base + 12, 8);
+      scheduler.Finish();
+      Require(name, "overlap cancellation", read(cancellation_base) == 0 &&
+                  read(cancellation_base + 8) == 0 && read(cancellation_base + 16) == 0 &&
+                  extra(Profile::Extra::GpuTimestampsLate) == 5,
+              "batch publication ignored an upper-dword or cross-slot cancellation");
+
+      // Populate a real device-local cache owner, then verify the published
+      // value reaches that resident owner on the next upload and GPU copy.
+      (void)cache.ObtainBuffer(base, size, false);
+      scheduler.Finish();
+      auto [new_resident, new_offset] = cache.ObtainBuffer(batch_base, 8, false);
+      Libs::Graphics::Buffer first_upload(m_runtime_context, scheduler, MemoryUsage::Download, 0,
+                                         vk::BufferUsageFlagBits::eTransferDst, 8);
+      first_upload.CopyFrom(scheduler.Current(), *new_resident, new_offset, 0, 8,
+                            vk::AccessFlagBits::eMemoryWrite, {}, vk::AccessFlagBits::eMemoryRead,
+                            vk::AccessFlagBits::eHostRead);
+      scheduler.Finish();
+      first_upload.Invalidate(0, 8);
+      uint64_t newly_resident_value = 0;
+      std::memcpy(&newly_resident_value, first_upload.Mapped().data(), 8);
+      Require(name, "first resident upload", newly_resident_value == read(batch_base),
+              "first upload of a previously absent buffer missed the published clock");
+      const auto invalidations_before = extra(Profile::Extra::GpuTimestampBufferInvalidations);
+      processor.ReleaseMem(3, 0, reinterpret_cast<void*>(base + 8), 0, 0);
+      scheduler.Finish();
+      const auto published = read(base + 8);
+      Require(name, "resident invalidation", published != replacement && cache.IsRegionCpuModified(base + 8, 8) &&
+                  extra(Profile::Extra::GpuTimestampBufferInvalidations) == invalidations_before + 1,
+              "publication left a clean but stale resident buffer");
+      auto [updated, updated_offset] = cache.ObtainBuffer(base, size, false);
+      Libs::Graphics::Buffer download(m_runtime_context, scheduler, MemoryUsage::Download, 0,
+                                     vk::BufferUsageFlagBits::eTransferDst, 8);
+      download.CopyFrom(scheduler.Current(), *updated, updated_offset + 8, 0, 8,
+                        vk::AccessFlagBits::eMemoryWrite, {}, vk::AccessFlagBits::eMemoryRead,
+                        vk::AccessFlagBits::eHostRead);
+      scheduler.Finish();
+      download.Invalidate(0, 8);
+      uint64_t device_value = 0;
+      std::memcpy(&device_value, download.Mapped().data(), 8);
+      Require(name, "resident upload", device_value == published, "GPU retained the old timestamp");
+
+      // Reuse native query blocks, including wraparound, only after harvest.
+      auto previous_clock = published;
+      for (uint32_t i = 0; i < 70; ++i) {
+        processor.ReleaseMem(3, 0, reinterpret_cast<void*>(base + 8), 0, 0);
+        scheduler.Finish();
+        const auto next_clock = read(base + 8);
+        Require(name, "query reuse", next_clock >= previous_clock && !clock.HasPending() &&
+                    extra(Profile::Extra::GpuTimestampsFailed) == 0 &&
+                    extra(Profile::Extra::GpuTimestampsFallback) == 0,
+                "reused query was unavailable, stale, or fell back");
+        previous_clock = next_clock;
+      }
+
+      // A competing GPU writer on this page must retain ownership and data.
+      auto [dirty, dirty_offset] = cache.ObtainBuffer(base + 32, 4, true);
+      dirty->Fill(dirty_offset, 4, 0x12345678);
+      processor.ReleaseMem(3, 0, reinterpret_cast<void*>(base + 8), 0, 0);
+      scheduler.Finish();
+      Require(name, "GPU ownership conflict",
+              read(base + 8) == previous_clock && cache.HasGpuDirtyBytes(base + 32, 4) &&
+                  extra(Profile::Extra::GpuTimestampsConflict) == 1,
+              "timestamp publication discarded a competing GPU write");
+      cache.ReadMemory(base + 32, 4);
+    });
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      processor.ReleaseMem(3, 0, reinterpret_cast<void*>(base + 64), 0, 0);
+      processor.BufferFlush();
+    });
+    // No subsequent draw, dispatch, Finish or command-lane request may be
+    // needed to publish a timestamp to a CPU guest polling its result.
+    uint64_t idle_clock = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    do {
+      Require(name, "idle read", LibKernel::Memory::TryReadBacking(base + 64, &idle_clock, 8), "read failed");
+      if (idle_clock != 0) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    Require(name, "idle completion", idle_clock != 0, "idle GPU lane never harvested the native timestamp");
+    context.GetGpu().SendCommandSync([&] {
+      native_clocks(false);
+      Profile::SetRecording(false);
+      context.UnmapMemory(base, size);
+    });
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, size) == 0, "unmap failed");
+    Require(name, "release", LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0, "release failed");
+    std::puts("[gpu] GuestClockPublish conversion, completion, pass, gates and resident coherence passed");
+  }
+
+  void CheckGuestClockShadow() {
+    Common::SubmitProfile::SetRecording(false);
+    EnsureRuntimeContext();
+    auto& context = Renderer();
+    auto& scheduler = context.GetCommandScheduler();
+    auto& profile = context.GetGpuTimeProfile();
+    CommandProcessor processor(context, 0);
+    processor.BufferInit();
+    Common::SubmitProfile::SetRecording(true);
+    Require("GuestClockShadow", "armed", GpuTimeProfile::GuestClockRecording(),
+            "test requires KYTY_GUEST_CLOCK_PROFILE=1 and KYTY_SUBMIT_PROFILE=1");
+    uint64_t begin = 0, end = 0;
+    // Opening the gate mid-buffer must not reset queries inside a render pass
+    // or submit work. The probe waits for the next natural command-buffer begin.
+    const auto unarmed_tick = scheduler.CurrentTick();
+    processor.WriteReferenceClock(reinterpret_cast<uint64_t>(&begin), 8);
+    processor.ReleaseMem(3, 0, &end, 0, 0);
+    Require("GuestClockShadow", "await natural command buffer",
+            scheduler.CurrentTick() == unarmed_tick && end >= begin && begin != 0 &&
+                GpuTimeProfileTestAccess::Counts(profile) == std::array<uint64_t, 4>{0, 0, 0, 0},
+            "opening the gate submitted work, changed guest labels, or recorded uninitialized queries");
+    // This boundary belongs to test setup, never to ObserveGuestClock.
+    scheduler.Flush();
+    const auto tick = scheduler.CurrentTick();
+    processor.WriteReferenceClock(reinterpret_cast<uint64_t>(&begin), 8);
+    Libs::Graphics::Buffer scratch(m_runtime_context, scheduler, MemoryUsage::DeviceLocal, 0,
+                                  vk::BufferUsageFlagBits::eTransferDst, 4096);
+    scheduler.Current().Handle().fillBuffer(scratch.Handle(), 0, 4096, 0x12345678);
+    RenderState rendering {};
+    rendering.width = rendering.height = rendering.num_layers = 1;
+    scheduler.BeginRendering(rendering); // Clock observation must also be legal inside a pass.
+    processor.ReleaseMem(3, 0, &end, 0, 0);
+    Require("GuestClockShadow", "no waits or label changes",
+            scheduler.CurrentTick() == tick && end >= begin && begin != 0 &&
+                GpuTimeProfileTestAccess::Counts(profile) == std::array<uint64_t, 4>{2, 0, 0, 2},
+            "shadow capture submitted work, published a native clock, or completed an unsubmitted query");
+    scheduler.Finish();
+    Require("GuestClockShadow", "native completion",
+            GpuTimeProfileTestAccess::Counts(profile) == std::array<uint64_t, 4>{2, 2, 0, 0},
+            "completed queries were unavailable or remained pending");
+    Common::SubmitProfile::SetRecording(false);
+    processor.WriteReferenceClock(reinterpret_cast<uint64_t>(&end), 8);
+    Require("GuestClockShadow", "closed gate",
+            GpuTimeProfileTestAccess::Counts(profile) == std::array<uint64_t, 4>{2, 2, 0, 0},
+            "closed profile gate still allocated a native query");
+    Common::SubmitProfile::Reset(); // Open the next reporting window, as the runtime does.
+    Common::SubmitProfile::SetRecording(true);
+    const auto bounded_tick = scheduler.CurrentTick();
+    for (uint32_t i = 0; i < 300; ++i)
+      processor.WriteReferenceClock(reinterpret_cast<uint64_t>(&end), i & 1 ? 4 : 8);
+    Require("GuestClockShadow", "bounded recording",
+            scheduler.CurrentTick() == bounded_tick &&
+                GpuTimeProfileTestAccess::Counts(profile) == std::array<uint64_t, 4>{258, 2, 0, 256},
+            "capture exceeded its window bound or submitted to free query slots");
+    scheduler.Finish();
+    Require("GuestClockShadow", "second window complete",
+            GpuTimeProfileTestAccess::Counts(profile) == std::array<uint64_t, 4>{258, 258, 0, 0},
+            "second-window queries returned unavailable results or remained pending");
+    Common::SubmitProfile::SetRecording(false);
+    std::puts("[gpu] GuestClockShadow native samples, unchanged guest labels, gates and bounds passed");
+  }
+
   void CheckGpuCommandLane() {
     EnsureRuntimeContext();
     auto &context = Renderer();
@@ -5387,7 +5752,9 @@ public:
       };
       const auto draw = [&] {
         heap.Rebind(executor);
-        heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+        { const auto set = heap.PrepareBinding(scheduler.Current());
+        scheduler.Current().Handle().bindDescriptorSets(vk::PipelineBindPoint::eCompute, layout,
+            ShaderRecompiler::IR::ImageHeapSet, 1, &set, 0, nullptr); }
         scheduler.Finish();
         heap.BeginDraw();
       };
@@ -5482,7 +5849,9 @@ public:
       heap.Rebind(executor);
       const auto freed = ImageHeapTestAccess::ImageOf(heap, filtered.slots[72]);
       textures.UnmapMemory(base + 0x10000u + 13u * 0x1000u, 0x1000u);
-      heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+      { const auto set = heap.PrepareBinding(scheduler.Current());
+        scheduler.Current().Handle().bindDescriptorSets(vk::PipelineBindPoint::eCompute, layout,
+            ShaderRecompiler::IR::ImageHeapSet, 1, &set, 0, nullptr); }
       Require(name, "freed image layout",
               !textures.GetImage(freed).registered &&
                   textures.GetImage(freed).backing.state.layout ==
@@ -5719,6 +6088,1317 @@ public:
             "a metadata write-only fill was not consumed as a clear");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  bool CheckHotUnprotected() {
+    constexpr const char* name = "HotUnprotected";
+    constexpr uint64_t size = 2 * 1024 * 1024;
+    EnsureRuntimeContext();
+    auto& context = Renderer();
+    auto& scheduler = context.GetCommandScheduler();
+    auto& cache = context.GetBufferCache();
+    Require(name, "retired runtime inert", !BufferCacheTestAccess::HotSelected(cache), "old experiment selected runtime work");
+    BufferCacheTestAccess::EnableRetiredHotTest(cache); // Internal regression only; runtime selection is inert.
+    HW::Context registers{}; HW::UserConfig user_config{}; HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct = -1; void* mapped = nullptr;
+    Require(name, "allocation", LibKernel::Memory::KernelAllocateDirectMemory(0,
+        LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &direct) == 0 &&
+        LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0, direct, size) == 0,
+        "could not map hot test memory");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    auto* words = static_cast<uint32_t*>(mapped);
+    words[4] = 0x12345678u;
+    context.MapMemory(base, size);
+    const auto id = cache.FindBuffer(base, size);
+    Libs::Graphics::Buffer& ordinary = cache.GetBuffer(id);
+    auto readback = CreateHostBuffer(name, 16, vk::BufferUsageFlagBits::eTransferDst, {});
+    const auto snapshot = [&] {
+      const vk::BufferCopy copy{16, 0, 4};
+      scheduler.Current().Handle().copyBuffer(ordinary.Handle(), readback.buffer, 1, &copy);
+      vk::MemoryBarrier barrier{}; barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      return ReadBuffer(name, readback, 1)[0];
+    };
+    cache.SynchronizeBuffersInRange(base, size); scheduler.Finish();
+    Require(name, "A inert", !BufferCacheTestAccess::Hot(cache, base), "A promoted an owner");
+    const auto warm = [&](bool expect_hot = true) {
+      Common::SubmitProfile::SetExperiment(true);
+      for (unsigned frame = 0; frame < 14; ++frame) {
+        cache.BufferUploadProfileFrame();
+        for (unsigned n = 0; n < 256; ++n)
+          cache.InvalidateMemory(base + 16, 1, Common::BufferUploadProfile::Cause::CpuWriteFault);
+        cache.SynchronizeBuffersInRange(base, size); scheduler.Finish();
+      }
+      Require(name, "history promotion", BufferCacheTestAccess::Hot(cache, base) == expect_hot, "incorrect hot admission");
+    };
+    warm();
+    cache.ExcludeHotRange(base + size, 4, Common::SubmitProfile::Extra::HotRetireImage);
+    const auto active_visits = BufferCacheTestAccess::HotVisits(cache);
+    for (unsigned i = 0; i < 1024; ++i)
+      cache.ExcludeHotRange(base + size, 4, Common::SubmitProfile::Extra::HotRetireImage);
+    Require(name, "active repeated exclusion", BufferCacheTestAccess::Hot(cache, base) &&
+        BufferCacheTestAccess::HotVisits(cache) == active_visits,
+        "repeated disjoint exclusion traversed owners or retired a neighbor");
+    // Write without InvalidateMemory: no fault is needed to schedule either
+    // exact range sync or the conservative unknown-BDA path.
+    words[4] = 0xaabbccddu;
+    context.PrepareBda();
+    Require(name, "BDA repeat", snapshot() == 0xaabbccddu && cache.IsRegionCpuModified(base, size), "BDA lost unprotected writes");
+    // No frame boundary: even another PrepareBda must see a new CPU write.
+    // A once-per-frame stamp would incorrectly keep 0xaabbccdd in VRAM.
+    const auto before_bytes = BufferCacheTestAccess::HotFrameBytes(cache);
+    const auto before_uses = BufferCacheTestAccess::HotFrameUses(cache);
+    words[4] = 0x89abcdefu;
+    context.PrepareBda();
+    Require(name, "BDA same frame", snapshot() == 0x89abcdefu, "frame deduplication lost a later write");
+    Require(name, "frame counters", BufferCacheTestAccess::HotFrameBytes(cache) == before_bytes + size &&
+        BufferCacheTestAccess::HotFrameUses(cache) == before_uses + 1, "incorrect resync bytes/uses");
+    words[4] = 0x55667788u;
+    cache.SynchronizeBuffersInRange(base + 16, 4);
+    Require(name, "range repeat", snapshot() == 0x55667788u, "range sync reused stale VRAM");
+    words[4] = 0x11223344u;
+    Common::SubmitProfile::SetExperiment(false); cache.BufferUploadProfileFrame();
+    Require(name, "A2 dirty", !BufferCacheTestAccess::Hot(cache, base) && cache.IsRegionCpuModified(base, size), "A2 lost pending bytes");
+    context.PrepareBda();
+    Require(name, "A2 contents", snapshot() == 0x11223344u && !cache.IsRegionCpuModified(base, size), "A2 did not upload and resume normal tracking");
+    warm();
+    const std::pair<Libs::Graphics::Buffer*, uint64_t> writer = cache.ObtainBuffer(base + 16, 4, true);
+    Require(name, "writer retirement", !BufferCacheTestAccess::Hot(cache, base), "GPU writer retained hot pages");
+    writer.first->Fill(writer.second, 4, 0xdecafbadu);
+    BufferCacheTestAccess::DownloadOnCurrentThread(cache, base + 16, 4);
+    Require(name, "writer readback", words[4] == 0xdecafbadu, "retirement overwrote GPU data");
+    Common::SubmitProfile::SetExperiment(false); cache.BufferUploadProfileFrame();
+    warm();
+    BufferCacheTestAccess::ExhaustHotBudget(cache);
+    context.PrepareBda();
+    Require(name, "BDA budget fallback", !BufferCacheTestAccess::Hot(cache, base) && snapshot() == 0xdecafbadu, "budget fallback lost data");
+    Require(name, "budget stops observation", !BufferCacheTestAccess::HotObserving(cache, base) &&
+        BufferCacheTestAccess::HotActive(cache) == 0, "retired owner kept active work");
+    const auto retired_visits = BufferCacheTestAccess::HotVisits(cache);
+    for (unsigned i = 0; i < 1024; ++i)
+      cache.ExcludeHotRange(base + 16, 4, Common::SubmitProfile::Extra::HotRetireImage);
+    Require(name, "retired exclusion fast path", BufferCacheTestAccess::HotVisits(cache) == retired_visits,
+        "repeated exclusions traversed inactive histories");
+    for (unsigned frame = 0; frame < 16; ++frame) {
+      cache.BufferUploadProfileFrame();
+      for (unsigned n = 0; n < 256; ++n)
+        cache.InvalidateMemory(base + 16, 1, Common::BufferUploadProfile::Cause::CpuWriteFault);
+      cache.SynchronizeBuffersInRange(base, size); scheduler.Finish();
+    }
+    Require(name, "budget exclusion persists", !BufferCacheTestAccess::Hot(cache, base), "budget fallback repeated its expensive promotion burst");
+    Common::SubmitProfile::SetExperiment(false); cache.BufferUploadProfileFrame();
+    Common::SubmitProfile::SetExperiment(true); cache.BufferUploadProfileFrame();
+    BufferCacheTestAccess::UnaffordableHotBdaPeak(cache, size);
+    warm(false);
+    Require(name, "BDA admission budget", !BufferCacheTestAccess::HotObserving(cache, base) &&
+        BufferCacheTestAccess::HotFrameBytes(cache) == 0 && BufferCacheTestAccess::HotActive(cache) == 0,
+        "unaffordable BDA workload copied before rejection");
+    Common::SubmitProfile::SetExperiment(false); cache.BufferUploadProfileFrame();
+    warm();
+    cache.ExcludeHotRange(base + 16, 4, Common::SubmitProfile::Extra::HotRetireImage);
+    Require(name, "image exclusion", !BufferCacheTestAccess::Hot(cache, base), "image alias retained hot owner");
+    cache.BufferUploadProfileFrame();
+    Require(name, "excluded observation stopped", !BufferCacheTestAccess::HotObserving(cache, base),
+        "excluded history kept collecting faults");
+    Common::SubmitProfile::SetExperiment(false); cache.BufferUploadProfileFrame();
+    warm();
+    context.UnmapMemory(base, size);
+    Require(name, "unmap", !BufferCacheTestAccess::Hot(cache, base), "unmap retained hot protection state");
+    Common::SubmitProfile::SetExperiment(false); cache.BufferUploadProfileFrame();
+    scheduler.Finish();
+    DestroyBuffer(&readback);
+    Require(name, "release", LibKernel::Memory::KernelMunmap(base, size) == 0 &&
+        LibKernel::Memory::KernelReleaseDirectMemory(direct, size) == 0, "release failed");
+    std::printf("[host]    %-32s ok\n", name);
+    return true;
+  }
+
+  bool CheckFaultCoarsening() {
+    constexpr const char* name = "FaultCoarsening";
+    constexpr uint64_t size = 2 * 1024 * 1024;
+    EnsureRuntimeContext();
+    auto& context = Renderer();
+    auto& scheduler = context.GetCommandScheduler();
+    auto& cache = context.GetBufferCache();
+    const auto block = BufferCacheTestAccess::CoarsenBlock(cache);
+    HW::Context registers{}; HW::UserConfig user_config{}; HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct = -1; void* mapped = nullptr;
+    Require(name, "allocation", LibKernel::Memory::KernelAllocateDirectMemory(0,
+        LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &direct) == 0 &&
+        LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0, direct, size) == 0,
+        "could not map coarsening memory");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    auto* words = static_cast<uint32_t*>(mapped);
+    std::fill_n(words, size / 4, 0u);
+    context.MapMemory(base, size);
+    const auto id = cache.FindBuffer(base, size);
+    Libs::Graphics::Buffer& ordinary = cache.GetBuffer(id);
+    auto readback = CreateHostBuffer(name, 16, vk::BufferUsageFlagBits::eTransferDst, {});
+    const auto snapshot = [&](uint64_t byte_offset) {
+      const vk::BufferCopy copy{byte_offset, 0, 4};
+      scheduler.Current().Handle().copyBuffer(ordinary.Handle(), readback.buffer, 1, &copy);
+      vk::MemoryBarrier barrier{}; barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      return ReadBuffer(name, readback, 1)[0];
+    };
+    cache.SynchronizeBuffersInRange(base, size); scheduler.Finish();
+    const auto warm = [&] {
+      Common::SubmitProfile::SetExperiment(true);
+      for (unsigned frame = 0; frame < 14; ++frame) {
+        cache.BufferUploadProfileFrame();
+        for (unsigned n = 0; n < 256; ++n)
+          cache.InvalidateMemory(base + 16, 1, Common::BufferUploadProfile::Cause::CpuWriteFault);
+        cache.SynchronizeBuffersInRange(base, size); scheduler.Finish();
+      }
+      Require(name, "history", BufferCacheTestAccess::Coarsening(cache, base), "busy owner did not enable coarsening");
+    };
+    warm();
+    cache.InvalidateMemory(base + 16, 1, Common::BufferUploadProfile::Cause::CpuWriteFault);
+    words[4] = 0xaabbccddu;
+    words[(block - 4) / 4] = 0x12345678u; // Different page, no second invalidation.
+    Require(name, "full dirty block", cache.IsRegionCpuModified(base + block - 4, 4) &&
+        !cache.IsRegionCpuModified(base + block, 4), "fault dirty range was not bounded");
+    context.PrepareBda();
+    Require(name, "expanded BDA publication", snapshot(block - 4) == 0x12345678u &&
+        !cache.IsRegionCpuModified(base, block), "BDA synchronized only the original fault page");
+    cache.InvalidateMemory(base + block / 2, 1, Common::BufferUploadProfile::Cause::CpuWriteFault);
+    words[block / 8] = 0x89abcdefu;
+    context.PrepareBda();
+    Require(name, "same-frame refault", snapshot(block / 2) == 0x89abcdefu, "repeat use lost a later write");
+
+    const std::pair<Libs::Graphics::Buffer*, uint64_t> writer = cache.ObtainBuffer(base + TRACKER_PAGE_SIZE, 4, true);
+    writer.first->Fill(writer.second, 4, 0xdecafbadu);
+    cache.InvalidateMemory(base + 16, 1, Common::BufferUploadProfile::Cause::CpuWriteFault);
+    words[4] = 0x55667788u;
+    Require(name, "GPU neighbor fallback", !cache.IsRegionCpuModified(base + 2 * TRACKER_PAGE_SIZE, 4),
+        "GPU neighbor did not restrict fault to one page");
+    BufferCacheTestAccess::DownloadOnCurrentThread(cache, base + TRACKER_PAGE_SIZE, 4);
+    Require(name, "GPU value preserved", words[TRACKER_PAGE_SIZE / 4] == 0xdecafbadu,
+        "coarsening destroyed GPU-owned contents");
+    context.PrepareBda(); scheduler.Finish();
+    Common::SubmitProfile::SetExperiment(false);
+    cache.InvalidateMemory(base + 16, 1, Common::BufferUploadProfile::Cause::CpuWriteFault);
+    words[4] = 0x11223344u;
+    Require(name, "A2 immediate gate", !cache.IsRegionCpuModified(base + 2 * TRACKER_PAGE_SIZE, 4),
+        "gate-off fault still widened before frame cleanup");
+    cache.BufferUploadProfileFrame();
+    context.PrepareBda();
+    Require(name, "A2 contents", snapshot(16) == 0x11223344u && !BufferCacheTestAccess::Coarsening(cache, base),
+        "A2 lost dirty data or retained coarsening");
+    warm();
+    context.UnmapMemory(base, size);
+    Require(name, "unmap", !BufferCacheTestAccess::Coarsening(cache, base), "unmap left eligibility behind");
+    Common::SubmitProfile::SetExperiment(false); cache.BufferUploadProfileFrame();
+    scheduler.Finish(); DestroyBuffer(&readback);
+    Require(name, "release", LibKernel::Memory::KernelMunmap(base, size) == 0 &&
+        LibKernel::Memory::KernelReleaseDirectMemory(direct, size) == 0, "release failed");
+    std::printf("[host]    %-32s ok\n", name);
+    return true;
+  }
+
+  bool CheckVkRecorderRendering(bool scheduler_route = false) {
+    const char* name = scheduler_route ? "VkRecorderSchedulerRendering" : "VkRecorderRendering";
+    namespace Recording = Libs::Graphics::VkRecording;
+    if (!RasterizationSupported()) return false;
+    EnsureRuntimeContext();
+    auto& graphics = RuntimeContext();
+    auto target = CreateImage2D(name, 2, 1, vk::Format::eR32G32B32A32Sfloat,
+        vk::ImageUsageFlagBits::eColorAttachment, {}, 4, vk::ImageLayout::eGeneral);
+    const std::array<float, 18> vertices{-1, -1, 1, 0, 0, 1, 3, -1, 1, 0, 0, 1, -1, 3, 1, 0, 0, 1};
+    std::vector<uint32_t> words(vertices.size());
+    std::memcpy(words.data(), vertices.data(), sizeof(vertices));
+    auto vertex_buffer = CreateHostBuffer(name, sizeof(vertices), vk::BufferUsageFlagBits::eVertexBuffer, words);
+    auto indices = CreateHostBuffer(name, 12, vk::BufferUsageFlagBits::eIndexBuffer, {0, 1, 2});
+    const auto vertex = CreateShaderModule(name, TestSpv::MakePassthroughVertexSpirv(false));
+    const char* assembly = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %input %output
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %input Location 0
+OpDecorate %output Location 0
+%void = OpTypeVoid
+%function = OpTypeFunction %void
+%float = OpTypeFloat 32
+%vector = OpTypeVector %float 4
+%ptr_input = OpTypePointer Input %vector
+%ptr_output = OpTypePointer Output %vector
+%input = OpVariable %ptr_input Input
+%output = OpVariable %ptr_output Output
+%main = OpFunction %void None %function
+%label = OpLabel
+%color = OpLoad %vector %input
+OpStore %output %color
+OpReturn
+OpFunctionEnd
+)";
+    spvtools::SpirvTools spirv_tools(SPV_ENV_VULKAN_1_3);
+    std::vector<uint32_t> code;
+    Require(name, "shader", spirv_tools.Assemble(assembly, &code) && spirv_tools.Validate(code), "invalid fragment fixture");
+    const auto fragment = CreateShaderModule(name, code);
+    vk::PipelineLayoutCreateInfo layout_create{};
+    vk::PipelineLayout layout{};
+    RequireVk(name, "layout", m_device.createPipelineLayout(&layout_create, nullptr, &layout), "create layout");
+    std::array<vk::PipelineShaderStageCreateInfo, 2> stages{};
+    stages[0].stage = vk::ShaderStageFlagBits::eVertex; stages[0].module = vertex; stages[0].pName = "main";
+    stages[1].stage = vk::ShaderStageFlagBits::eFragment; stages[1].module = fragment; stages[1].pName = "main";
+    const vk::VertexInputBindingDescription binding{0, 24, vk::VertexInputRate::eVertex};
+    const std::array<vk::VertexInputAttributeDescription, 2> attributes{{
+        {0, 0, vk::Format::eR32G32Sfloat, 0}, {1, 0, vk::Format::eR32G32B32A32Sfloat, 8}}};
+    vk::PipelineVertexInputStateCreateInfo vertex_input{};
+    vertex_input.vertexBindingDescriptionCount = 1; vertex_input.pVertexBindingDescriptions = &binding;
+    vertex_input.vertexAttributeDescriptionCount = 2; vertex_input.pVertexAttributeDescriptions = attributes.data();
+    vk::PipelineInputAssemblyStateCreateInfo input{}; input.topology = vk::PrimitiveTopology::eTriangleList;
+    vk::PipelineViewportStateCreateInfo viewport{};
+    const std::array dynamic{vk::DynamicState::eViewportWithCount, vk::DynamicState::eScissorWithCount};
+    vk::PipelineDynamicStateCreateInfo dynamic_info{};
+    dynamic_info.dynamicStateCount = static_cast<uint32_t>(dynamic.size()); dynamic_info.pDynamicStates = dynamic.data();
+    vk::PipelineRasterizationStateCreateInfo raster{};
+    raster.polygonMode = vk::PolygonMode::eFill; raster.cullMode = vk::CullModeFlagBits::eNone;
+    raster.frontFace = vk::FrontFace::eCounterClockwise; raster.lineWidth = 1;
+    vk::PipelineMultisampleStateCreateInfo multisample{}; multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+    vk::PipelineColorBlendAttachmentState attachment{};
+    attachment.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    vk::PipelineColorBlendStateCreateInfo blend{}; blend.attachmentCount = 1; blend.pAttachments = &attachment;
+    vk::PipelineRenderingCreateInfo rendering_info{};
+    rendering_info.colorAttachmentCount = 1; rendering_info.pColorAttachmentFormats = &target.format;
+    vk::GraphicsPipelineCreateInfo create{};
+    create.pNext = &rendering_info; create.stageCount = 2; create.pStages = stages.data();
+    create.pVertexInputState = &vertex_input; create.pInputAssemblyState = &input; create.pViewportState = &viewport;
+    create.pRasterizationState = &raster; create.pMultisampleState = &multisample;
+    create.pColorBlendState = &blend; create.pDynamicState = &dynamic_info; create.layout = layout;
+    vk::Pipeline pipeline{};
+    RequireVk(name, "pipeline", m_device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &pipeline), "create pipeline");
+
+    MasterSemaphore master(graphics);
+    Recording::Backend recorder(graphics, master);
+    auto& scheduler = Renderer().GetCommandScheduler();
+    HW::Context registers{}; HW::UserConfig user_config{}; HW::Shader shaders{};
+    if (scheduler_route) {
+      scheduler.Begin(registers, user_config, shaders);
+      VkRecorderSchedulerTestAccess::Enable(scheduler, true);
+    } else { recorder.SetEnabled(true); recorder.Begin(); }
+    auto* encoder = scheduler_route ? nullptr : &recorder.Commands();
+    vk::QueryPool occlusion{};
+    if (scheduler_route) {
+      vk::QueryPoolCreateInfo queries{}; queries.queryType = vk::QueryType::eOcclusion; queries.queryCount = 1;
+      RequireVk(name, "occlusion pool", m_device.createQueryPool(&queries, nullptr, &occlusion), "create occlusion pool");
+      scheduler.Current().ResetQueryPool(occlusion, 0, 1);
+    }
+    vk::ImageMemoryBarrier2 barrier{};
+    barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+    barrier.dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+    barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite;
+    barrier.oldLayout = vk::ImageLayout::eGeneral; barrier.newLayout = vk::ImageLayout::eColorAttachmentOptimal;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = target.image; barrier.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    vk::DependencyInfo dependency{}; dependency.imageMemoryBarrierCount = 1; dependency.pImageMemoryBarriers = &barrier;
+    if (scheduler_route) scheduler.Current().Barrier(dependency);
+    else Require(name, "transition", encoder->Barriers(dependency), "image barrier append failed");
+    RenderState state{}; state.width = 2; state.height = 1; state.num_color_attachments = 1;
+    state.color_attachments[0].image_view = target.view;
+    state.color_attachments[0].image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+    state.color_attachments[0].is_clear = true;
+    state.color_attachments[0].clear_value = {0, 0, 0x3f800000u, 0x3f800000u}; // blue
+    if (scheduler_route) scheduler.BeginRendering(state);
+    else Require(name, "rendering packet", encoder->BeginRendering(state), "rendering append failed");
+    state.color_attachments[0].clear_value = {}; state.color_attachments[0].image_view = nullptr;
+    if (scheduler_route) scheduler.Current().BindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+    else Require(name, "pipeline packet", encoder->Value(Recording::Op::BindPipeline,
+        Recording::Pipeline{vk::PipelineBindPoint::eGraphics, pipeline}), "pipeline append failed");
+    DynamicState dynamic_state{};
+    dynamic_state.num_viewports = dynamic_state.num_scissors = 1;
+    dynamic_state.viewports[0] = {0, 0, 2, 1, 0, 1}; dynamic_state.scissors[0] = {{0, 0}, {1, 1}};
+    dynamic_state.dirty_state.viewports = dynamic_state.dirty_state.scissors = true;
+    if (scheduler_route) {
+      // Comparison/depth-bounds/stencil values remain dirty until their tests
+      // become enabled. Packet acceptance must not clear them prematurely.
+      dynamic_state.dirty_state.depth_compare_op = true;
+      dynamic_state.dirty_state.depth_bounds = true;
+      dynamic_state.dirty_state.stencil_front_reference = true;
+      scheduler.Current().CommitDynamicState(dynamic_state);
+      Require(name, "conditional dirty bits", !dynamic_state.dirty_state.viewports &&
+          !dynamic_state.dirty_state.scissors && dynamic_state.dirty_state.depth_compare_op &&
+          dynamic_state.dirty_state.depth_bounds && dynamic_state.dirty_state.stencil_front_reference,
+          "recording consumed inactive dynamic state");
+    } else Require(name, "dynamic packet", encoder->Dynamic(dynamic_state), "dynamic append failed");
+    dynamic_state.scissors[0].extent = {0, 0};
+    vk::Buffer buffer = vertex_buffer.buffer; uint64_t offset = 0;
+    uint64_t vertex_size = sizeof(vertices);
+    if (scheduler_route) scheduler.Current().BindVertexBuffers(0, 1, &buffer, &offset, &vertex_size);
+    else Require(name, "vertex packet", encoder->BindVertices(0, std::span(&buffer, 1), std::span(&offset, 1)), "vertex append failed");
+    vertex_size = 0;
+    buffer = nullptr; offset = UINT64_MAX;
+    if (scheduler_route) {
+      scheduler.Current().BindIndexBuffer(indices.buffer, 0, 12, vk::IndexType::eUint32, graphics.bounded_index_buffer_enabled);
+      scheduler.Current().BeginQuery(occlusion, 0, {});
+      scheduler.Current().DrawIndexed(3, 1, 0, 0, 0);
+      scheduler.Current().EndQuery(occlusion, 0);
+    }
+    else Require(name, "draw packet", encoder->Value(Recording::Op::Draw, Recording::Draw{3, 1, 0, 0, 0}), "draw append failed");
+    if (scheduler_route) scheduler.EndRendering();
+    else Require(name, "end rendering", encoder->EndRendering(), "end append failed");
+    if (scheduler_route) {
+      // Upload/blit helpers use native RenderingInfo, rather than RenderState.
+      // Preserve the indexed draw and clear only the other pixel in that path.
+      vk::RenderingAttachmentInfo color{}; color.imageView = target.view;
+      color.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+      color.loadOp = vk::AttachmentLoadOp::eLoad; color.storeOp = vk::AttachmentStoreOp::eStore;
+      vk::RenderingInfo info{}; info.renderArea.extent = {2, 1}; info.layerCount = 1;
+      info.colorAttachmentCount = 1; info.pColorAttachments = &color;
+      auto native = scheduler.Current().Commands();
+      vk::MemoryBarrier between{}; between.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
+      between.dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite;
+      native.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+          vk::PipelineStageFlagBits::eColorAttachmentOutput, {}, 1, &between, 0, nullptr, 0, nullptr);
+      native.beginRendering(info); color = {}; info = {};
+      vk::ClearAttachment clear{}; clear.aspectMask = vk::ImageAspectFlagBits::eColor;
+      clear.clearValue.color = vk::ClearColorValue(std::array<float, 4> {0.0f, 1.0f, 0.0f, 1.0f});
+      vk::ClearRect rect{}; rect.rect = {{1, 0}, {1, 1}}; rect.layerCount = 1;
+      native.clearAttachments(1, &clear, 1, &rect); clear = {}; rect = {};
+      native.endRendering();
+    }
+    barrier.srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+    barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+    barrier.srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead;
+    barrier.oldLayout = vk::ImageLayout::eColorAttachmentOptimal; barrier.newLayout = vk::ImageLayout::eGeneral;
+    if (scheduler_route) scheduler.Current().Barrier(dependency);
+    else Require(name, "final transition", encoder->Barriers(dependency), "final image barrier append failed");
+    barrier.image = nullptr;
+    if (scheduler_route) {
+      VkRecorderSchedulerTestAccess::Recorder(scheduler).Frame();
+      scheduler.Finish();
+      scheduler.StopRecorder(); // producer-side shutdown leaves a usable direct command
+    } else { recorder.Frame(); recorder.Finish(); recorder.Stop(); }
+    if (occlusion) {
+      std::array<uint64_t, 2> query{};
+      RequireVk(name, "occlusion result", m_device.getQueryPoolResults(occlusion, 0, 1, sizeof(query),
+          query.data(), sizeof(query), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability),
+          "read completed occlusion without WAIT");
+      Require(name, "occlusion order", query[0] != 0 && query[1] != 0, "query bracket did not enclose the indexed draw");
+      m_device.destroyQueryPool(occlusion);
+    }
+    const auto pixels = ReadImage(name, &target);
+    Require(name, "draw and clear snapshots", pixels == std::vector<uint32_t>{
+        0x3f800000u, 0, 0, 0x3f800000u, 0, scheduler_route ? 0x3f800000u : 0u,
+        scheduler_route ? 0u : 0x3f800000u, 0x3f800000u},
+        "draw did not paint the left pixel red or rendering/clear snapshots lost the right pixel");
+    recorder.Report(stdout);
+    m_device.destroyPipeline(pipeline); m_device.destroyPipelineLayout(layout);
+    m_device.destroyShaderModule(fragment); m_device.destroyShaderModule(vertex);
+    DestroyBuffer(&indices); DestroyBuffer(&vertex_buffer); DestroyImage(&target);
+    std::printf("[gpu]     %-32s ok\n", name);
+    return true;
+  }
+
+  bool CheckVkRecorderBackend(bool prepared_emission = false, bool scheduler_route = false) {
+    const char* name = scheduler_route ? "VkRecorderScheduler" : prepared_emission ? "VkRecorderBindings" : "VkRecorderBackend";
+    namespace Recording = Libs::Graphics::VkRecording;
+    using Drain = Common::CommandRecording::Drain;
+    EnsureRuntimeContext();
+    auto& graphics = RuntimeContext();
+    auto& context = Renderer();
+    auto& scheduler = context.GetCommandScheduler();
+    HW::Context registers{}; HW::UserConfig user_config{}; HW::Shader shaders{};
+    if (prepared_emission) scheduler.Begin(registers, user_config, shaders);
+    MasterSemaphore master(graphics);
+    Recording::Backend recorder(graphics, master);
+    Require(name, "inert constructor", recorder.Snapshot().storage_bytes == 0 &&
+        recorder.Inspect().owner == std::thread::id{}, "disabled backend started a worker");
+
+    // Independent of the guest shader compiler: writes push.value to output[push.index].
+    const char* assembly = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %output %push
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %array ArrayStride 4
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %block Block
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 0
+OpMemberDecorate %pc 0 Offset 0
+OpMemberDecorate %pc 1 Offset 4
+OpDecorate %pc Block
+%void = OpTypeVoid
+%function = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%four = OpConstant %uint 4
+%array = OpTypeArray %uint %four
+%block = OpTypeStruct %array
+%pc = OpTypeStruct %uint %uint
+%ptr_block = OpTypePointer StorageBuffer %block
+%ptr_pc = OpTypePointer PushConstant %pc
+%ptr_storage_uint = OpTypePointer StorageBuffer %uint
+%ptr_push_uint = OpTypePointer PushConstant %uint
+%output = OpVariable %ptr_block StorageBuffer
+%push = OpVariable %ptr_pc PushConstant
+%main = OpFunction %void None %function
+%label = OpLabel
+%index_ptr = OpAccessChain %ptr_push_uint %push %zero
+%value_ptr = OpAccessChain %ptr_push_uint %push %one
+%index = OpLoad %uint %index_ptr
+%value = OpLoad %uint %value_ptr
+%destination = OpAccessChain %ptr_storage_uint %output %zero %index
+OpStore %destination %value
+OpReturn
+OpFunctionEnd
+)";
+    spvtools::SpirvTools spirv_tools(SPV_ENV_VULKAN_1_3);
+    std::vector<uint32_t> code;
+    Require(name, "shader", spirv_tools.Assemble(assembly, &code) && spirv_tools.Validate(code),
+        "recorder fixture SPIR-V is invalid");
+    const auto module = CreateShaderModule(name, code);
+    const vk::DescriptorSetLayoutBinding binding{0, vk::DescriptorType::eStorageBuffer, 1,
+                                                vk::ShaderStageFlagBits::eCompute};
+    vk::DescriptorSetLayoutCreateInfo set_create{};
+    set_create.bindingCount = 1; set_create.pBindings = &binding;
+    vk::DescriptorSetLayout set_layout{};
+    RequireVk(name, "layout", m_device.createDescriptorSetLayout(&set_create, nullptr, &set_layout), "create set layout");
+    const vk::PushConstantRange push_range{vk::ShaderStageFlagBits::eCompute, 0,
+        prepared_emission ? ShaderRecompiler::IR::NativePushConstantSize : 8u};
+    vk::PipelineLayoutCreateInfo layout_create{};
+    layout_create.setLayoutCount = 1; layout_create.pSetLayouts = &set_layout;
+    layout_create.pushConstantRangeCount = 1; layout_create.pPushConstantRanges = &push_range;
+    vk::PipelineLayout layout{};
+    RequireVk(name, "layout", m_device.createPipelineLayout(&layout_create, nullptr, &layout), "create layout");
+    vk::ComputePipelineCreateInfo pipeline_create{};
+    if (scheduler_route) pipeline_create.flags = vk::PipelineCreateFlagBits::eDispatchBase;
+    pipeline_create.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    pipeline_create.stage.module = module; pipeline_create.stage.pName = "main";
+    pipeline_create.layout = layout;
+    vk::Pipeline pipeline{};
+    RequireVk(name, "pipeline", m_device.createComputePipelines(nullptr, 1, &pipeline_create, nullptr, &pipeline), "create pipeline");
+    const vk::DescriptorPoolSize pool_size{vk::DescriptorType::eStorageBuffer, 4};
+    vk::DescriptorPoolCreateInfo pool_create{};
+    pool_create.maxSets = 4; pool_create.poolSizeCount = 1; pool_create.pPoolSizes = &pool_size;
+    vk::DescriptorPool pool{};
+    RequireVk(name, "descriptors", m_device.createDescriptorPool(&pool_create, nullptr, &pool), "create descriptor pool");
+    std::array<vk::DescriptorSetLayout, 4> layouts{set_layout, set_layout, set_layout, set_layout};
+    std::array<vk::DescriptorSet, 4> sets{};
+    vk::DescriptorSetAllocateInfo allocate{};
+    allocate.descriptorPool = pool; allocate.descriptorSetCount = 4; allocate.pSetLayouts = layouts.data();
+    RequireVk(name, "descriptors", m_device.allocateDescriptorSets(&allocate, sets.data()), "allocate sets");
+    auto output = CreateHostBuffer(name, 16, vk::BufferUsageFlagBits::eStorageBuffer, {0, 0, 0, 0});
+    vk::SemaphoreTypeCreateInfo timeline{}; timeline.semaphoreType = vk::SemaphoreType::eTimeline;
+    vk::SemaphoreCreateInfo gate_create{}; gate_create.pNext = &timeline;
+    vk::Semaphore gate{};
+    RequireVk(name, "gate", m_device.createSemaphore(&gate_create, nullptr, &gate), "create gate");
+
+    vk::QueryPool clock_pool{};
+    uint64_t clock_mask = 0;
+    if (prepared_emission) {
+      uint32_t family_count = 0;
+      m_physical_device.getQueueFamilyProperties(&family_count, nullptr);
+      std::vector<vk::QueueFamilyProperties> families(family_count);
+      m_physical_device.getQueueFamilyProperties(&family_count, families.data());
+      const auto bits = families[m_queue_family].timestampValidBits;
+      if (bits) {
+        clock_mask = bits >= 64 ? UINT64_MAX : (uint64_t{1} << bits) - 1;
+        vk::QueryPoolCreateInfo queries{}; queries.queryType = vk::QueryType::eTimestamp; queries.queryCount = 8;
+        RequireVk(name, "timestamp pool", m_device.createQueryPool(&queries, nullptr, &clock_pool), "create queries");
+      } else {
+        std::puts("VkRecorderBindings: native timestamp subsection unavailable on this queue");
+      }
+    }
+    ShaderModule binding_module;
+    binding_module.info.stage = ShaderType::Compute;
+    binding_module.info.bindings.descriptor_mask = 1;
+    binding_module.info.bindings.descriptor_counts[0] = 1;
+    binding_module.info.bindings.push_data_start_dword = 0;
+    binding_module.info.bindings.memory_offset_dword = 2;
+    ShaderRecompiler::IR::ResourceSnapshot resource_snapshot;
+    ShaderStageRuntime runtime{&binding_module, &resource_snapshot};
+    PreparedBindings prepared;
+    prepared.runtime = &runtime;
+    PreparedBindings* stage = &prepared;
+    PipelineCache::Pipeline native_pipeline{};
+    native_pipeline.pipeline = pipeline;
+    native_pipeline.pipeline_layout = layout;
+    native_pipeline.descriptor_set_layout = set_layout;
+    const auto prepare_emission = [&](uint32_t index, uint32_t value) {
+      prepared.buffers = {{output.buffer, 0, 16}};
+      prepared.shader_data = {index, value, 0}; // two user dwords plus one buffer offset word
+      return context.GetRenderExecutor().PrepareBindingEmission(scheduler.Current(),
+          vk::PipelineBindPoint::eCompute, native_pipeline, std::span(&stage, 1));
+    };
+
+    const auto record = [&](uint32_t index, uint32_t value) {
+      recorder.Begin();
+      auto& encoder = recorder.Commands();
+      if (clock_pool) {
+        Require(name, "reset queries", encoder.Value(Recording::Op::ResetQueries,
+            Recording::QueryReset{clock_pool, index * 2, 2}), "query reset packet rejected");
+        Require(name, "begin timestamp", encoder.Value(Recording::Op::Timestamp,
+            Recording::Timestamp{vk::PipelineStageFlagBits::eBottomOfPipe, clock_pool, index * 2}), "timestamp packet rejected");
+      }
+      if (prepared_emission) {
+        const auto emission = prepare_emission(index, value);
+        Require(name, "prepared packet", emission.Enqueue(encoder), "whole binding emission rejected");
+        // Reuse BOTH the executor's scratch and PreparedBindings before the
+        // worker sees the packet. No stack or cache pointer may survive enqueue.
+        prepared.buffers[0].buffer = nullptr; prepared.shader_data.assign(3, UINT32_MAX);
+        (void)prepare_emission(0, 0);
+      } else {
+        vk::DescriptorBufferInfo buffer_info{output.buffer, 0, 16};
+        vk::WriteDescriptorSet write{};
+        write.dstSet = sets[index]; write.descriptorCount = 1;
+        write.descriptorType = vk::DescriptorType::eStorageBuffer; write.pBufferInfo = &buffer_info;
+        Require(name, "descriptor packet", encoder.Descriptors(false, vk::PipelineBindPoint::eCompute,
+            layout, 0, std::span(&write, 1)), "descriptor append failed");
+        // No block has been published yet. Destroying these source values must
+        // not change the worker's later descriptor update or push constants.
+        buffer_info.buffer = nullptr; write.dstSet = nullptr;
+        Require(name, "set packet", encoder.BindDescriptors(vk::PipelineBindPoint::eCompute, layout, 0,
+            std::span(&sets[index], 1)), "set append failed");
+        std::array<uint32_t, 2> constants{index, value};
+        Require(name, "constant packet", encoder.PushConstants(layout, vk::ShaderStageFlagBits::eCompute,
+            0, std::as_bytes(std::span(constants))), "constant append failed");
+        constants.fill(UINT32_MAX);
+      }
+      Require(name, "pipeline packet", encoder.Value(Recording::Op::BindPipeline,
+          Recording::Pipeline{vk::PipelineBindPoint::eCompute, pipeline}), "pipeline append failed");
+      Require(name, "dispatch packet", encoder.Value(Recording::Op::Dispatch, Recording::Dispatch{1, 1, 1}),
+          "dispatch append failed");
+      vk::MemoryBarrier2 barrier{};
+      barrier.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader;
+      barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+      barrier.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+      barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+      vk::DependencyInfo dependency{}; dependency.memoryBarrierCount = 1; dependency.pMemoryBarriers = &barrier;
+      Require(name, "barrier packet", encoder.Barriers(dependency), "barrier append failed");
+      barrier = vk::MemoryBarrier2{};
+      if (clock_pool) {
+        Require(name, "end timestamp", encoder.Value(Recording::Op::Timestamp,
+            Recording::Timestamp{vk::PipelineStageFlagBits::eBottomOfPipe, clock_pool, index * 2 + 1}), "timestamp packet rejected");
+      }
+    };
+    recorder.SetEnabled(true);
+    record(0, 0x12345678u);
+    auto resource = std::make_shared<uint32_t>(1);
+    const std::weak_ptr<uint32_t> retained = resource;
+    recorder.Hold(resource); resource.reset();
+    SubmitInfo blocked{}; blocked.AddWait(gate, 1, vk::PipelineStageFlagBits::eAllCommands);
+    const auto first_tick = recorder.Submit(blocked);
+    blocked.wait_semaphores.fill(nullptr); blocked.wait_ticks.fill(UINT64_MAX);
+    recorder.DrainRecording(Drain::Readback);
+    master.Refresh();
+    Require(name, "recording versus GPU", !master.IsFree(first_tick) && !retained.expired(),
+        "recording drain completed a blocked GPU tick or released its resources");
+    record(1, 0xabcdef01u);
+    const auto second_tick = recorder.Submit();
+    recorder.SetEnabled(false);
+    const auto pending = recorder.Inspect();
+    Require(name, "pool owner and pending slots", pending.owner != std::this_thread::get_id() &&
+        pending.owner != std::thread::id{} && pending.submits == 2 && pending.reuses == 0 &&
+        !retained.expired() && recorder.PendingPins() == 1,
+        "native work ran on the producer, reused a pending slot or gate-off freed a pin");
+    vk::SemaphoreSignalInfo signal{}; signal.semaphore = gate; signal.value = 1;
+    RequireVk(name, "gate", m_device.signalSemaphore(&signal), "signal gate");
+    recorder.Wait(second_tick);
+    const auto values = ReadBuffer(name, output, 4);
+    Require(name, "copied data and ordered submits", values[0] == 0x12345678u && values[1] == 0xabcdef01u &&
+        retained.expired(), "descriptor/constants/submit data changed or native completion did not release the pin");
+
+    recorder.SetEnabled(true);
+    record(2, 0xdeadbeefu);
+    const auto third_tick = master.CurrentTick();
+    recorder.SetEnabled(false); // open command must be submitted and drained
+    recorder.Wait(third_tick);
+    Require(name, "gate closes open command", ReadBuffer(name, output, 4)[2] == 0xdeadbeefu &&
+        recorder.Inspect().reuses > 0 && recorder.Inspect().owner == pending.owner,
+        "gate-off lost work, pool was not reused, or owner changed");
+
+    // Shutdown must wait for GPU completion, not just the recorder's queue.
+    recorder.SetEnabled(true);
+    record(3, 0x76543210u);
+    resource = std::make_shared<uint32_t>(2);
+    const std::weak_ptr<uint32_t> shutdown_pin = resource;
+    recorder.Hold(resource); resource.reset();
+    blocked = {}; blocked.AddWait(gate, 2, vk::PipelineStageFlagBits::eAllCommands);
+    recorder.Submit(blocked); recorder.DrainRecording(Drain::Submit);
+    std::atomic<bool> stop_returned{false}, early_return{false};
+    std::jthread release([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      early_return = stop_returned.load() || shutdown_pin.expired();
+      vk::SemaphoreSignalInfo release_info{}; release_info.semaphore = gate; release_info.value = 2;
+      RequireVk(name, "shutdown gate", m_device.signalSemaphore(&release_info), "release shutdown gate");
+    });
+    recorder.Frame(); recorder.Stop(); stop_returned = true; release.join();
+    Require(name, "shutdown lifetime", !early_return && shutdown_pin.expired() &&
+        ReadBuffer(name, output, 4)[3] == 0x76543210u, "shutdown freed pending pool/data or lost its final dispatch");
+    if (clock_pool) {
+      struct ClockResult { uint64_t value = 0, available = 0; };
+      std::array<ClockResult, 8> clocks{};
+      RequireVk(name, "ordered timestamps", m_device.getQueryPoolResults(clock_pool, 0, 8, sizeof(clocks),
+          clocks.data(), sizeof(ClockResult), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability),
+          "read completed timestamps without WAIT");
+      for (size_t i = 0; i < clocks.size(); ++i) {
+        Require(name, "timestamp availability", clocks[i].available != 0, "tick completed before its native timestamp");
+        if (i) Require(name, "timestamp order", ((clocks[i].value - clocks[i - 1].value) & clock_mask) <= clock_mask / 2,
+            "timestamp packets executed out of order");
+      }
+    }
+    if (prepared_emission) {
+      const auto recorded = ReadBuffer(name, output, 4);
+      WriteBuffer(name, output, {0, 0, 0, 0});
+      for (uint32_t index = 0; index < recorded.size(); ++index) {
+        const auto emission = prepare_emission(index, recorded[index]);
+        scheduler.Current().EmitBindings(emission);
+        const auto command = scheduler.Current().Handle();
+        command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+        command.dispatch(1, 1, 1);
+      }
+      vk::MemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+          vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+      Require(name, "direct versus worker", ReadBuffer(name, output, 4) == recorded,
+          "prepared direct/recorded emission produced different GPU data");
+    }
+    if (scheduler_route) {
+      using Access = VkRecorderSchedulerTestAccess;
+      // Keep the facade across command retirement and A/B/A changes. Unlike a
+      // cached VkCommandBuffer, it must always target the scheduler's current lane.
+      const auto native = scheduler.Current().Commands();
+      std::vector<uint32_t> upload_words(513);
+      for (uint32_t i = 0; i < upload_words.size(); ++i) upload_words[i] = i + 1000;
+      auto upload = CreateHostBuffer(name, upload_words.size() * 4,
+          vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst, upload_words);
+      auto download = CreateHostBuffer(name, 515 * 4, vk::BufferUsageFlagBits::eTransferDst, {});
+      for (unsigned pass = 0; pass != 3; ++pass) {
+        const bool recorded = pass != 1;
+        Access::Enable(scheduler, recorded);
+        native.fillBuffer(upload.buffer, 0, 4, 700 + pass);
+        vk::MemoryBarrier transfer{};
+        transfer.srcAccessMask = vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eHostWrite;
+        transfer.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+        native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eHost,
+            vk::PipelineStageFlagBits::eTransfer, {}, 1, &transfer, 0, nullptr, 0, nullptr);
+        std::array<vk::BufferCopy, 513> regions{};
+        for (uint32_t i = 0; i < regions.size(); ++i) {
+          regions[i].srcOffset = regions[i].dstOffset = i * 4; regions[i].size = 4;
+        }
+        // Larger than the packet encoder's bound: execute on the owner and
+        // drain RECORDING, retaining the stack array until that call completes.
+        native.copyBuffer(upload.buffer, download.buffer, regions);
+        regions = {};
+        vk::BufferCopy single{}; single.srcOffset = 4; single.dstOffset = 514 * 4; single.size = 4;
+        native.copyBuffer(upload.buffer, download.buffer, 1, &single);
+        single = {}; // normal packet must have copied the region
+        std::thread::id callback_owner;
+        native.Synchronous([&](vk::CommandBuffer command) {
+          callback_owner = std::this_thread::get_id();
+          command.fillBuffer(download.buffer, 513 * 4, 4, 800 + pass);
+        });
+        Require(name, "native island ownership", recorded ? callback_owner != std::this_thread::get_id() :
+            callback_owner == std::this_thread::get_id(), "fallback borrowed a worker handle on the producer");
+        transfer.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        transfer.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+            {}, 1, &transfer, 0, nullptr, 0, nullptr);
+        if (pass == 0) scheduler.Wait(scheduler.CurrentTick());
+        else scheduler.Finish();
+        if (recorded) {
+          // The required tick is complete, but the next command now has work.
+          // A stream-reuse check must neither publish nor drain that command.
+          native.fillBuffer(download.buffer, 514 * 4, 4, upload_words[1]);
+          const auto before_wait = Access::Recorder(scheduler).Snapshot();
+          {
+            Common::SubmitProfile::WaitSiteScope site(Common::SubmitProfile::WaitSite::StreamWrap);
+            scheduler.Wait(scheduler.CurrentTick() - 1);
+          }
+          const auto after_wait = Access::Recorder(scheduler).Snapshot();
+          Require(name, "completed tick does not drain current work", before_wait.batches == after_wait.batches &&
+              before_wait.requests == after_wait.requests, "stream reuse published/drained an unrelated current command");
+          scheduler.Finish();
+        }
+        auto expected = upload_words; expected[0] = 700 + pass;
+        expected.push_back(800 + pass); expected.push_back(upload_words[1]);
+        Require(name, "transfer order and snapshots", ReadBuffer(name, download, 515) == expected,
+            "copied regions, fallback order or cached facade across gates lost data");
+      }
+      Access::Enable(scheduler, false);
+      DestroyBuffer(&download); DestroyBuffer(&upload);
+      // Block the worker's queue submission without blocking command encoding.
+      // Flush must return before the native queue is available. A timeout makes
+      // a regression fail rather than leaving the test deadlocked.
+      Access::Enable(scheduler, true);
+      std::binary_semaphore queue_locked{0}, release_queue{0};
+      std::atomic<bool> flush_timeout{false};
+      std::jthread queue_blocker([&] {
+        Common::LockGuard lock(graphics.queue_mutex);
+        queue_locked.release();
+        if (!release_queue.try_acquire_for(std::chrono::seconds(2))) flush_timeout = true;
+      });
+      queue_locked.acquire();
+      const auto before_flush = Access::Recorder(scheduler).Snapshot();
+      const auto flush_tick = scheduler.CurrentTick();
+      scheduler.Flush();
+      const auto after_flush = Access::Recorder(scheduler).Snapshot();
+      release_queue.release(); queue_blocker.join();
+      Require(name, "asynchronous flush", !flush_timeout && scheduler.CurrentTick() == flush_tick + 1 &&
+          after_flush.batches > before_flush.batches && after_flush.requests == before_flush.requests,
+          "Flush did not publish exactly one tick or waited for recording/native submit");
+      scheduler.Wait(flush_tick); // submission is guaranteed by the native completion
+      const auto after_native_wait = Access::Recorder(scheduler).Snapshot();
+      Require(name, "wait only for published tick", after_native_wait.batches == after_flush.batches &&
+          after_native_wait.requests == after_flush.requests, "native tick wait drained the following command");
+      Access::Enable(scheduler, false);
+      WriteBuffer(name, output, {0, 0, 0, 0});
+      // Use the real scheduler, its master, descriptor allocator, clock OnBegin,
+      // priority runner and normal lifetime callbacks. No second timeline.
+      const auto record_scheduled = [&](uint32_t index, uint32_t value) {
+        scheduler.Begin(registers, user_config, shaders);
+        auto& command = scheduler.Current();
+        if (clock_pool) {
+          command.ResetQueryPool(clock_pool, index * 2, 2);
+          command.WriteTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, clock_pool, index * 2);
+        }
+        const auto emission = prepare_emission(index, value);
+        command.EmitBindings(emission);
+        prepared.buffers[0].buffer = nullptr; prepared.shader_data.assign(3, UINT32_MAX);
+        (void)prepare_emission(0, 0); // invalidate producer scratch before publish
+        command.BindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+        if (index == 1) command.DispatchBase(1, 0, 0, 1, 1, 1);
+        else command.Dispatch(1, 1, 1);
+        vk::MemoryBarrier dependency{};
+        dependency.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+        dependency.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        command.EmitMemoryBarrier(vk::PipelineStageFlagBits::eComputeShader,
+            vk::PipelineStageFlagBits::eHost, dependency);
+        if (clock_pool) command.WriteTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, clock_pool, index * 2 + 1);
+      };
+      Access::Enable(scheduler, true);
+      record_scheduled(0, 101);
+      auto held = std::make_shared<uint32_t>(42);
+      std::weak_ptr<uint32_t> weak = held;
+      std::atomic<bool> priority_done{false}, normal_done{false}, order_ok{false};
+      scheduler.DeferOperation([held, &normal_done, &order_ok, &priority_done] {
+        order_ok = priority_done.load(); normal_done = true;
+      });
+      scheduler.DeferPriorityOperation([&priority_done] { priority_done = true; });
+      held.reset();
+      SubmitInfo wait{}; wait.AddWait(gate, 3, vk::PipelineStageFlagBits::eAllCommands);
+      const auto reserved = scheduler.CurrentTick();
+      const auto first = scheduler.Submit(wait);
+      wait.wait_ticks.fill(UINT64_MAX); wait.wait_semaphores.fill(nullptr);
+      Access::Drain(scheduler, Drain::Readback);
+      scheduler.PopPendingOperations();
+      Require(name, "one tick and native lifetime", first == reserved && scheduler.CurrentTick() == first + 1 &&
+          !scheduler.IsFree(first) && !weak.expired() && !normal_done && !priority_done,
+          "tick reserved twice, recording released a resource, or callback ran before GPU completion");
+      const auto worker = Access::Recorder(scheduler).Inspect().owner;
+      Require(name, "scheduler pool owner", worker != std::this_thread::get_id() && worker != std::thread::id{},
+          "scheduler recorded on its producer");
+
+      record_scheduled(1, 202);
+      const auto second = scheduler.CurrentTick();
+      Access::Enable(scheduler, false); // submits the open worker command, then drains
+      Require(name, "B to A without GPU wait", scheduler.CurrentTick() == second + 1 &&
+          !weak.expired() && !scheduler.IsFree(first), "gate lost work or waited for native completion");
+      record_scheduled(2, 303);
+      const auto third = scheduler.Submit(); // direct pool, queued AFTER worker submissions
+      Access::Enable(scheduler, true);
+      record_scheduled(3, 404);
+      const auto fourth = scheduler.Submit();
+      Access::Drain(scheduler, Drain::Submit);
+      Require(name, "shared timeline", second == first + 1 && third == second + 1 && fourth == third + 1 &&
+          Access::Recorder(scheduler).Inspect().owner == worker,
+          "mode switches reordered/skipped timeline values or changed worker ownership");
+      signal.value = 3;
+      RequireVk(name, "scheduler gate", m_device.signalSemaphore(&signal), "release scheduler gate");
+      scheduler.Wait(fourth);
+      scheduler.PopPendingOperations();
+      Require(name, "scheduler data and callbacks", ReadBuffer(name, output, 4) ==
+          std::vector<uint32_t>{101, 202, 303, 404} && weak.expired() && normal_done && order_ok,
+          "mode switches lost data, scratch escaped or callbacks retired out of order");
+
+      record_scheduled(3, 505);
+      held = std::make_shared<uint32_t>(43);
+      std::weak_ptr<uint32_t> shutdown_weak = held;
+      scheduler.DeferOperation([held] {}); held.reset();
+      wait = {}; wait.AddWait(gate, 4, vk::PipelineStageFlagBits::eAllCommands);
+      scheduler.Submit(wait); Access::Drain(scheduler, Drain::Submit);
+      std::atomic<bool> shutdown_returned{false}, shutdown_early{false};
+      std::jthread unblock([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        shutdown_early = shutdown_returned.load() || shutdown_weak.expired();
+        vk::SemaphoreSignalInfo release_info{}; release_info.semaphore = gate; release_info.value = 4;
+        RequireVk(name, "scheduler shutdown gate", m_device.signalSemaphore(&release_info), "release shutdown");
+      });
+      Access::Recorder(scheduler).Frame();
+      scheduler.Shutdown(); shutdown_returned = true; unblock.join();
+      Require(name, "scheduler shutdown", !shutdown_early && shutdown_weak.expired() &&
+          ReadBuffer(name, output, 4)[3] == 505, "scheduler destroyed pending worker resources");
+      const auto stats = Access::Recorder(scheduler).Snapshot();
+      Require(name, "drain counters", stats.drains[static_cast<size_t>(Drain::Readback)] != 0 &&
+          stats.drains[static_cast<size_t>(Drain::Gate)] != 0 && stats.packets != 0,
+          "scheduler did not account its recording drains");
+      if (clock_pool) {
+        struct ClockResult { uint64_t value = 0, available = 0; };
+        std::array<ClockResult, 8> clocks{};
+        RequireVk(name, "scheduler timestamps", m_device.getQueryPoolResults(clock_pool, 0, 8, sizeof(clocks),
+            clocks.data(), sizeof(ClockResult), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability),
+            "read timestamps after scheduler completion without WAIT");
+        for (size_t i = 0; i < clocks.size(); ++i) {
+          Require(name, "scheduler timestamp availability", clocks[i].available != 0, "native tick completed before its query");
+          if (i) Require(name, "scheduler timestamp order", ((clocks[i].value - clocks[i - 1].value) & clock_mask) <= clock_mask / 2,
+              "direct and worker timestamps executed out of order");
+        }
+      }
+      Access::Recorder(scheduler).Report(stdout);
+    }
+    recorder.Report(stdout);
+    if (clock_pool) m_device.destroyQueryPool(clock_pool);
+    m_device.destroySemaphore(gate);
+    DestroyBuffer(&output);
+    m_device.destroyDescriptorPool(pool);
+    m_device.destroyPipeline(pipeline);
+    m_device.destroyPipelineLayout(layout);
+    m_device.destroyDescriptorSetLayout(set_layout);
+    m_device.destroyShaderModule(module);
+    std::printf("[gpu]     %-32s ok\n", name);
+    return true;
+  }
+
+  bool CheckGuestHostImportCopy() {
+    constexpr const char* name = "GuestHostImportCopy";
+    constexpr uint64_t size = 2 * 1024 * 1024;
+    constexpr uint64_t first = TRACKER_PAGE_SIZE + 16, second = 7 * TRACKER_PAGE_SIZE + 32;
+    auto& graphics = RuntimeContext();
+    auto& context = Renderer();
+    auto& scheduler = context.GetCommandScheduler();
+    auto& cache = context.GetBufferCache();
+    HW::Context registers{}; HW::UserConfig user_config{}; HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct = -1; void* mapped = nullptr;
+    Require(name, "allocation", LibKernel::Memory::KernelAllocateDirectMemory(0,
+        LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &direct) == 0 &&
+        LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0, direct, size) == 0,
+        "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    auto* words = static_cast<uint32_t*>(mapped);
+    std::fill_n(words, size / sizeof(uint32_t), 0x12345678u);
+    context.MapMemory(base, size);
+    Libs::Graphics::Buffer& ordinary = cache.GetBuffer(cache.FindBuffer(base, size));
+    cache.SynchronizeBuffersInRange(base, size);
+    Require(name, "selected A idle", BufferCacheTestAccess::ImportIdle(cache) && !BufferCacheTestAccess::ImportProbed(cache),
+        "copy mode did work before B");
+    auto readback = CreateHostBuffer(name, 32, vk::BufferUsageFlagBits::eTransferDst, {});
+    const auto snapshot = [&](const Libs::Graphics::Buffer& source, uint64_t offset, uint64_t target, uint64_t bytes = 4) {
+      const vk::BufferCopy copy{offset, target, bytes};
+      scheduler.Current().Handle().copyBuffer(source.Handle(), readback.buffer, 1, &copy);
+    };
+    const auto finish = [&] {
+      vk::MemoryBarrier barrier{}; barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+    };
+    finish();
+    Common::SubmitProfile::SetExperiment(true);
+    for (unsigned frame = 0; frame < 3; ++frame) {
+      cache.InvalidateMemory(base, size);
+      cache.BufferUploadProfileFrame();
+      cache.SynchronizeBuffersInRange(base, size);
+      finish();
+    }
+    const bool supported = graphics.guest_host_import_enabled;
+    snapshot(ordinary, 0, 0); finish();
+    Require(name, "contents or fallback", ReadBuffer(name, readback, 1)[0] == 0x12345678u,
+        "DMA or unsupported-driver staging fallback lost bytes");
+    if (supported) {
+      Require(name, "source-only promotion", BufferCacheTestAccess::Imported(cache, base) &&
+          !cache.HasHostImports() && BufferCacheTestAccess::ImportStaleBytes(cache, base) == 0,
+          "copy mode redirected shader reads or made VRAM stale");
+      cache.InvalidateMemory(base + first, 4); words[first / 4] = 0xabcdef01u;
+      cache.InvalidateMemory(base + second, 4); words[second / 4] = 0x87654321u;
+      cache.SynchronizeBuffersInRange(base, size);
+      Require(name, "exact DMA lifetime ranges", BufferCacheTestAccess::ImportPendingTick(cache, base + first, 4) == scheduler.CurrentTick() &&
+          BufferCacheTestAccess::ImportPendingTick(cache, base + second, 4) == scheduler.CurrentTick() &&
+          !BufferCacheTestAccess::ImportPendingTick(cache, base + 4 * TRACKER_PAGE_SIZE, 4),
+          "DMA lifetime used a whole owner or missed a copied range");
+      const auto pending = BufferCacheTestAccess::ImportPending(cache).total;
+      cache.AddHostImportRead(base, size); cache.PrepareHostImportReads(true);
+      Require(name, "no shader readers", BufferCacheTestAccess::ImportPending(cache).total == pending &&
+          BufferCacheTestAccess::ImportPending(cache).unknown == 0, "copy mode added unbounded BDA readers");
+      const auto tick = scheduler.CurrentTick();
+      // Write AFTER recording but BEFORE submitting: intentionally changes the
+      // DMA source, without a host write racing a running native GPU command.
+      cache.InvalidateMemory(base + first, 4, Common::BufferUploadProfile::Cause::CpuWriteFault);
+      words[first / 4] = 0xaabbccddu;
+      Require(name, "ordinary dirty path", scheduler.CurrentTick() == tick && cache.IsRegionCpuModified(base + first, 4),
+          "copy source waited on a CPU write or lost its dirty bit");
+      cache.SynchronizeBuffersInRange(base, size);
+      Require(name, "next-use dirty consumption", !cache.IsRegionCpuModified(base + first, 4), "later write was not rescheduled");
+      const std::pair<Libs::Graphics::Buffer*, uint64_t> descriptor = cache.ObtainBuffer(base + first, 96, false, false, {},
+          Common::BufferUploadProfile::Use::ShaderRead);
+      vk::DescriptorBufferInfo binding{descriptor.first->Handle(), descriptor.second, 96};
+      Require(name, "ordinary descriptor", descriptor.first == &ordinary && !cache.ResolveHostImportRead(base + first, 96, binding) &&
+          binding.buffer == ordinary.Handle(), "copy mode bound host memory to a shader");
+      snapshot(ordinary, first, 0); snapshot(ordinary, second, 4); snapshot(ordinary, 0, 8);
+      snapshot(*cache.GetBdaPageTableBuffer(), BufferCache::PageIndex(base) * sizeof(vk::DeviceAddress), 16, 8);
+      finish();
+      auto values = ReadBuffer(name, readback, 8);
+      Require(name, "DMA offsets and VRAM BDA", values[0] == 0xaabbccddu && values[1] == 0x87654321u && values[2] == 0x12345678u &&
+          (uint64_t{values[4]} | (uint64_t{values[5]} << 32)) == ordinary.BufferDeviceAddress(),
+          "noncontiguous DMA offsets, unchanged bytes or BDA were wrong");
+
+      // A2 must wait for a blocked submitted DMA before freeing its source,
+      // but must not consume another dirty page to restore an already-current VRAM buffer.
+      cache.InvalidateMemory(base + first, 4); cache.SynchronizeBuffersInRange(base, size);
+      vk::SemaphoreTypeCreateInfo type{}; type.semaphoreType = vk::SemaphoreType::eTimeline;
+      vk::SemaphoreCreateInfo create{}; create.pNext = &type; vk::Semaphore gate{};
+      RequireVk(name, "lifetime", graphics.device.createSemaphore(&create, nullptr, &gate), "create timeline");
+      SubmitInfo submit{}; submit.AddWait(gate, 1, vk::PipelineStageFlagBits::eAllCommands);
+      scheduler.Flush(submit);
+      cache.InvalidateMemory(base + second, 4); words[second / 4] = 0x44556677u; // disjoint from the DMA
+      std::binary_semaphore started{0}; std::atomic<bool> retired{false};
+      std::jthread retire([&] {
+        Common::SubmitProfile::SetExperiment(false); started.release();
+        cache.BufferUploadProfileFrame(); retired = true;
+      });
+      started.acquire(); std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      Require(name, "DMA source lifetime", !retired.load(), "B->A freed an in-flight DMA source");
+      vk::SemaphoreSignalInfo signal{}; signal.semaphore = gate; signal.value = 1;
+      RequireVk(name, "lifetime", graphics.device.signalSemaphore(&signal), "release DMA");
+      retire.join();
+      Require(name, "A2 no restore", BufferCacheTestAccess::ImportIdle(cache) && Common::GuestHostImport::retained_bytes == 0 &&
+          cache.IsRegionCpuModified(base + second, 4), "retirement copied dirty bytes or retained the source");
+      cache.SynchronizeBuffersInRange(base, size); snapshot(ordinary, second, 4); finish();
+      Require(name, "A2 staging", ReadBuffer(name, readback, 2)[1] == 0x44556677u, "A2 staging did not resume");
+      graphics.device.destroySemaphore(gate);
+
+      Common::SubmitProfile::SetExperiment(true); cache.BufferUploadProfileFrame();
+      BufferCacheTestAccess::RetryImport(cache, ordinary);
+      cache.InvalidateMemory(base, size); cache.SynchronizeBuffersInRange(base, size);
+      Require(name, "reimport", BufferCacheTestAccess::Imported(cache, base) != nullptr, "copy reimport failed");
+      const std::pair<Libs::Graphics::Buffer*, uint64_t> writable = cache.ObtainBuffer(base, 4, true, false);
+      Require(name, "GPU writer fallback", writable.first == &ordinary && Common::GuestHostImport::retained_bytes == 0,
+          "GPU destination retained an imported source");
+      writable.first->Fill(writable.second, 4, 0xdecafbadu);
+      BufferCacheTestAccess::DownloadOnCurrentThread(cache, base, 4);
+      Require(name, "GPU publish", words[0] == 0xdecafbadu, "GPU fallback readback failed");
+
+      // Exclusion history must prevent FUTURE imports, even with no live
+      // imported owner. Repeating a texture lookup takes the cached path.
+      Common::SubmitProfile::SetExperiment(false); cache.BufferUploadProfileFrame();
+      Common::SubmitProfile::SetExperiment(true); cache.BufferUploadProfileFrame();
+      using ImportExtra = Common::SubmitProfile::Extra;
+      cache.ExcludeHostImport(base + second, 96, ImportExtra::HostImportFallbackImage);
+      cache.ExcludeHostImport(base + second, 96, ImportExtra::HostImportFallbackImage);
+      BufferCacheTestAccess::RetryImport(cache, ordinary);
+      cache.InvalidateMemory(base, size); cache.SynchronizeBuffersInRange(base, size);
+      Require(name, "excluded history", !BufferCacheTestAccess::Imported(cache, base), "history permitted a future import");
+
+      Common::SubmitProfile::SetExperiment(false); cache.BufferUploadProfileFrame();
+      Common::SubmitProfile::SetExperiment(true); cache.BufferUploadProfileFrame();
+      BufferCacheTestAccess::RetryImport(cache, ordinary);
+      cache.InvalidateMemory(base, size); cache.SynchronizeBuffersInRange(base, size);
+      Require(name, "new B imports", BufferCacheTestAccess::Imported(cache, base) != nullptr, "new B retained exclusion history");
+      cache.ExcludeHostImport(base + second, 96, ImportExtra::HostImportFallbackImage);
+      Require(name, "new B image retirement", !BufferCacheTestAccess::Imported(cache, base),
+          "cached proof survived the gate and skipped retirement of an in-flight DMA source");
+
+      Common::SubmitProfile::SetExperiment(false); cache.BufferUploadProfileFrame();
+      Common::SubmitProfile::SetExperiment(true); cache.BufferUploadProfileFrame();
+      BufferCacheTestAccess::RetryImport(cache, ordinary);
+      cache.InvalidateMemory(base, size); cache.SynchronizeBuffersInRange(base, size);
+      Require(name, "pending unmap", BufferCacheTestAccess::Imported(cache, base) &&
+          BufferCacheTestAccess::ImportPendingTick(cache, base, size), "no DMA pending for unmap");
+    }
+    context.UnmapMemory(base, size); finish();
+    Require(name, "unmap drains source", Common::GuestHostImport::retained_bytes == 0, "unmap left a DMA lease alive");
+    DestroyBuffer(&readback);
+    Require(name, "release", LibKernel::Memory::KernelMunmap(base, size) == 0 &&
+        LibKernel::Memory::KernelReleaseDirectMemory(direct, size) == 0, "guest release failed");
+    Common::SubmitProfile::SetExperiment(false);
+    std::printf("[gpu]     %-32s %s\n", name, supported ? "ok" : "fallback ok; import unsupported (skip)");
+    return supported;
+  }
+
+  bool CheckGuestHostImport() {
+    constexpr const char* name = "GuestHostImport";
+    constexpr uint64_t size = 1024 * 1024;
+    auto& graphics = RuntimeContext(); // Probe must remain deferred throughout A.
+    auto& context = Renderer();
+    auto& scheduler = context.GetCommandScheduler();
+    auto& cache = context.GetBufferCache();
+    using Extra = Common::SubmitProfile::Extra;
+    Extra failure{};
+    bool supported = graphics.guest_host_import_enabled;
+    graphics.guest_host_import_enabled = false;
+    Require(name, "extension fallback", !Libs::Graphics::Buffer::ImportHost(graphics, scheduler, 0,
+        reinterpret_cast<void*>(uintptr_t{0x10000}), size, failure) && failure == Extra::HostImportFallbackUnsupported,
+        "unsupported driver did not fall back before using a pointer");
+    graphics.guest_host_import_enabled = supported;
+    HW::Context registers{}; HW::UserConfig user_config{}; HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct = -1; void* mapped = nullptr;
+    Require(name, "allocation", LibKernel::Memory::KernelAllocateDirectMemory(0,
+        LibKernel::Memory::KernelGetDirectMemorySize(), 4 * size, size, 0, &direct) == 0 &&
+        LibKernel::Memory::KernelMapDirectMemory(&mapped, 4 * size, 0x3, 0, direct, size) == 0,
+        "guest allocation failed");
+    const auto base = reinterpret_cast<uint64_t>(mapped);
+    auto* words = static_cast<uint32_t*>(mapped);
+    std::fill_n(words, 4 * size / sizeof(uint32_t), 0x12345678u);
+    context.MapMemory(base, 4 * size);
+    const auto id = cache.FindBuffer(base, size);
+    Libs::Graphics::Buffer& ordinary = cache.GetBuffer(id);
+    (void)cache.ObtainBuffer(base, 4, false, false, {}, Common::BufferUploadProfile::Use::Index);
+    cache.ExcludeHostImport(base, size, Extra::HostImportFallbackImage);
+    Require(name, "selected A idle", BufferCacheTestAccess::ImportIdle(cache) && !BufferCacheTestAccess::ImportProbed(cache),
+        "selection without gate ran the probe or collected resource exclusions");
+    auto readback = CreateHostBuffer(name, 32, vk::BufferUsageFlagBits::eTransferDst, {});
+    const auto snapshot = [&](const Libs::Graphics::Buffer& source, uint64_t offset, uint64_t target, uint64_t bytes = 4) {
+      const vk::BufferCopy copy{offset, target, bytes};
+      scheduler.Current().Handle().copyBuffer(source.Handle(), readback.buffer, 1, &copy);
+    };
+    const auto finish = [&] {
+      vk::MemoryBarrier barrier{}; barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+      scheduler.Finish();
+    };
+    Common::SubmitProfile::SetExperiment(true);
+    for (unsigned frame = 0; frame < 3; ++frame) {
+      cache.InvalidateMemory(base, size);
+      cache.BufferUploadProfileFrame();
+      cache.SynchronizeBuffersInRange(base, size);
+      cache.PrepareHostImportReads(false);
+    }
+    supported = graphics.guest_host_import_enabled;
+    if (!supported) {
+      Require(name, "inert cache", !BufferCacheTestAccess::Imported(cache, base), "unsupported import became active");
+      snapshot(ordinary, 0, 0); finish();
+      Require(name, "fallback contents", ReadBuffer(name, readback, 1)[0] == 0x12345678u, "fallback upload lost bytes");
+    } else {
+      auto* imported = BufferCacheTestAccess::Imported(cache, base);
+      Require(name, "promotion", imported != nullptr && Common::GuestHostImport::retained_bytes == size,
+          "hot contiguous backing was not imported");
+      Require(name, "alignment fallback", !Libs::Graphics::Buffer::ImportHost(graphics, scheduler, base,
+          imported->Mapped().data() + 1, size, failure) && failure == Extra::HostImportFallbackAlignment,
+          "misaligned alias was accepted");
+      Require(name, "hole fallback", !LibKernel::Memory::AcquireHostImport(base + 3 * size, 2 * size),
+          "a span extending past the mapping was leased");
+      const auto imported_bda = imported->BufferDeviceAddress();
+      // A different byte of the same fault page is still protected.
+      cache.AddHostImportRead(base + 64, 4);
+      cache.PrepareHostImportReads(false);
+      snapshot(*cache.GetBdaPageTableBuffer(), BufferCache::PageIndex(base) * sizeof(vk::DeviceAddress), 16, 8);
+      snapshot(*imported, 64, 0);
+      // Block this reader in the native queue. A CPU write must stay blocked until
+      // it completes, including when the read was submitted before the fault.
+      vk::SemaphoreTypeCreateInfo type{}; type.semaphoreType = vk::SemaphoreType::eTimeline;
+      vk::SemaphoreCreateInfo create{}; create.pNext = &type;
+      vk::Semaphore gate{};
+      RequireVk(name, "guard", graphics.device.createSemaphore(&create, nullptr, &gate), "create timeline");
+      SubmitInfo submit{}; submit.AddWait(gate, 1, vk::PipelineStageFlagBits::eAllCommands);
+      scheduler.Flush(submit);
+      const auto recording_tick = scheduler.CurrentTick();
+      std::binary_semaphore disjoint_done{0};
+      std::jthread disjoint_writer([&] {
+        cache.InvalidateMemory(base + 2 * TRACKER_PAGE_SIZE, 4, Common::BufferUploadProfile::Cause::CpuWriteFault);
+        words[2 * TRACKER_PAGE_SIZE / 4] = 0x11223344u;
+        disjoint_done.release();
+      });
+      Require(name, "disjoint page guard", disjoint_done.try_acquire_for(std::chrono::seconds(2)),
+          "a different page in the same owner waited for the blocked reader");
+      disjoint_writer.join();
+      std::binary_semaphore started{0}; std::atomic<bool> written{false};
+      std::jthread writer([&] {
+        started.release();
+        cache.InvalidateMemory(base, 4, Common::BufferUploadProfile::Cause::CpuWriteFault);
+        words[0] = 0xaabbccddu;
+        written.store(true);
+      });
+      started.acquire();
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      Require(name, "CPU guard", !written.load(), "CPU overwrote an in-flight imported reader");
+      vk::SemaphoreSignalInfo signal{}; signal.semaphore = gate; signal.value = 1;
+      RequireVk(name, "guard", graphics.device.signalSemaphore(&signal), "release reader");
+      writer.join();
+      Require(name, "older tick only", scheduler.CurrentTick() == recording_tick,
+          "waiting an already submitted reader flushed unrelated recording work");
+      cache.SynchronizeBuffersInRange(base, size); cache.PrepareHostImportReads();
+      snapshot(*imported, 0, 4); finish();
+      auto values = ReadBuffer(name, readback, 8);
+      Require(name, "coherent reads", values[0] == 0x12345678u && values[1] == 0xaabbccddu &&
+          (uint64_t{values[4]} | (uint64_t{values[5]} << 32)) == imported_bda,
+          "guard, CPU coherence or imported BDA page table failed");
+      // A reference in the OPEN tick does need a submit before releasing the CPU.
+      cache.AddHostImportRead(base, 4); cache.PrepareHostImportReads(false);
+      snapshot(*imported, 0, 4);
+      const auto open_tick = scheduler.CurrentTick();
+      cache.InvalidateMemory(base, 4, Common::BufferUploadProfile::Cause::CpuWriteFault);
+      Require(name, "recording tick guard", scheduler.CurrentTick() > open_tick,
+          "an unsubmitted reader did not flush before releasing its page");
+      words[0] = 0xaabbccddu;
+      // Unknown BDA still protects other pages conservatively.
+      cache.PrepareHostImportReads(true);
+      snapshot(*imported, 3 * TRACKER_PAGE_SIZE, 8);
+      SubmitInfo unknown_submit{}; unknown_submit.AddWait(gate, 2, vk::PipelineStageFlagBits::eAllCommands);
+      scheduler.Flush(unknown_submit);
+      std::binary_semaphore unknown_started{0}; std::atomic<bool> unknown_written{false};
+      std::jthread unknown_writer([&] {
+        unknown_started.release();
+        cache.InvalidateMemory(base + 3 * TRACKER_PAGE_SIZE, 4, Common::BufferUploadProfile::Cause::CpuWriteFault);
+        words[3 * TRACKER_PAGE_SIZE / 4] = 0x44556677u;
+        unknown_written = true;
+      });
+      unknown_started.acquire();
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      Require(name, "unknown BDA guard", !unknown_written.load(), "unbounded BDA lost its conservative guard");
+      signal.value = 2; RequireVk(name, "unknown guard", graphics.device.signalSemaphore(&signal), "release unknown reader");
+      unknown_writer.join(); finish();
+
+      // The no-guard experiment releases a CPU writer even with a pending
+      // reference, but MUST still keep the import alive until GPU completion.
+      BufferCacheTestAccess::ImportGuard(cache, false);
+      cache.PrepareHostImportReads(true);
+      snapshot(*imported, 3 * TRACKER_PAGE_SIZE, 8);
+      SubmitInfo unsafe_submit{}; unsafe_submit.AddWait(gate, 3, vk::PipelineStageFlagBits::eAllCommands);
+      scheduler.Flush(unsafe_submit);
+      std::binary_semaphore unsafe_done{0};
+      std::jthread unsafe_writer([&] {
+        cache.InvalidateMemory(base + 3 * TRACKER_PAGE_SIZE, 4, Common::BufferUploadProfile::Cause::CpuWriteFault);
+        words[3 * TRACKER_PAGE_SIZE / 4] = 0x55667788u;
+        unsafe_done.release();
+      });
+      Require(name, "no-guard write", unsafe_done.try_acquire_for(std::chrono::seconds(2)), "no-guard still waited for a GPU reader");
+      unsafe_writer.join();
+      std::binary_semaphore retire_started{0}; std::atomic<bool> retired{false};
+      std::jthread retire([&] { retire_started.release(); cache.DrainHostImports(); retired = true; });
+      retire_started.acquire();
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      Require(name, "no-guard lifetime", !retired.load(), "no-guard freed imported memory with GPU readers pending");
+      signal.value = 3; RequireVk(name, "no-guard lifetime", graphics.device.signalSemaphore(&signal), "release final reader");
+      retire.join();
+      snapshot(ordinary, 3 * TRACKER_PAGE_SIZE, 8); finish();
+      Require(name, "no-guard read and retirement", Common::GuestHostImport::retained_bytes == 0 &&
+          ReadBuffer(name, readback, 3)[2] == 0x55667788u, "no-guard retirement lost the CPU write");
+      BufferCacheTestAccess::ImportGuard(cache, true);
+      graphics.device.destroySemaphore(gate);
+      Common::SubmitProfile::SetExperiment(false);
+      cache.BufferUploadProfileFrame();
+      Require(name, "B to A", BufferCacheTestAccess::ImportIdle(cache) && Common::GuestHostImport::retained_bytes == 0,
+          "gate off retained imported memory");
+      snapshot(ordinary, 0, 8);
+      snapshot(*cache.GetBdaPageTableBuffer(), BufferCache::PageIndex(base) * sizeof(vk::DeviceAddress), 24, 8);
+      finish(); values = ReadBuffer(name, readback, 8);
+      Require(name, "restored mirror", values[2] == 0xaabbccddu &&
+          (uint64_t{values[6]} | (uint64_t{values[7]} << 32)) == ordinary.BufferDeviceAddress(),
+          "retirement restored stale bytes or BDA");
+      Common::SubmitProfile::SetExperiment(true); cache.BufferUploadProfileFrame();
+      (void)cache.ObtainBuffer(base, 4, false, false, {}, Common::BufferUploadProfile::Use::Index);
+      BufferCacheTestAccess::RetryImport(cache, ordinary);
+      constexpr uint64_t read_offset = 0x120;
+      cache.InvalidateMemory(base + read_offset, 96);
+      words[read_offset / 4] = 0x24681357u;
+      cache.SynchronizeBuffersInRange(base, size);
+      imported = BufferCacheTestAccess::Imported(cache, base);
+      Require(name, "B read-only coexistence", imported != nullptr,
+          "a conventional read still vetoed the owner's import");
+      Require(name, "partial mirror debt", BufferCacheTestAccess::ImportStaleBytes(cache, base) == TRACKER_PAGE_SIZE,
+          "one dirty page made the entire VRAM owner stale");
+      BufferCacheTestAccess::CollectWithHotImport(cache, ordinary);
+      Require(name, "GC hot import", BufferCacheTestAccess::Imported(cache, base) == imported,
+          "crossing the GC budget retired a hot owner not selected by the LRU");
+      for (const auto use : {Common::BufferUploadProfile::Use::ShaderScalarRead,
+                            Common::BufferUploadProfile::Use::ShaderRead,
+                            Common::BufferUploadProfile::Use::ShaderFormattedRead}) {
+        const std::pair<Libs::Graphics::Buffer*, uint64_t> read = cache.ObtainBuffer(base + read_offset, 96, false, false, {}, use);
+        vk::DescriptorBufferInfo descriptor{read.first->Handle(), read.second, 96};
+        Require(name, "prepared ordinary handle", descriptor.buffer == ordinary.Handle() && descriptor.offset == read_offset,
+            "preparation exposed an imported handle before all fallback points");
+        Require(name, "final read-only descriptor", cache.ResolveHostImportRead(base + read_offset, 96, descriptor) &&
+            descriptor.buffer == imported->Handle() && descriptor.offset == read_offset && descriptor.range == 96,
+            "read-only descriptor did not select the import at the original offset");
+        cache.PrepareHostImportReads(false);
+        const vk::BufferCopy copy{descriptor.offset, 0, 4};
+        scheduler.Current().Handle().copyBuffer(descriptor.buffer, readback.buffer, 1, &copy);
+        finish();
+        Require(name, "descriptor contents", ReadBuffer(name, readback, 1)[0] == 0x24681357u,
+            "read-only descriptor read the stale VRAM mirror");
+      }
+      const std::pair<Libs::Graphics::Buffer*, uint64_t> index = cache.ObtainBuffer(base + read_offset, 4, false, false, {}, Common::BufferUploadProfile::Use::Index);
+      Require(name, "snapshot keeps import", BufferCacheTestAccess::Imported(cache, base) == imported,
+          "a non-shader read retired the ring");
+      snapshot(*index.first, index.second, 0); finish();
+      Require(name, "snapshot contents", ReadBuffer(name, readback, 1)[0] == 0x24681357u, "index snapshot read stale bytes");
+      const std::pair<Libs::Graphics::Buffer*, uint64_t> prepared = cache.ObtainBuffer(base + read_offset, 96, false, false, {}, Common::BufferUploadProfile::Use::ShaderRead);
+      vk::DescriptorBufferInfo late{prepared.first->Handle(), prepared.second, 96};
+      Common::SubmitProfile::SetExperiment(false); cache.BufferUploadProfileFrame();
+      Require(name, "fallback after preparation", !cache.ResolveHostImportRead(base + read_offset, 96, late) && late.buffer == ordinary.Handle(),
+          "fallback left a dangling imported handle in prepared state");
+      snapshot(ordinary, read_offset, 0); snapshot(ordinary, TRACKER_PAGE_SIZE, 4); finish();
+      values = ReadBuffer(name, readback, 2);
+      Require(name, "partial restore", values[0] == 0x24681357u && values[1] == 0x12345678u,
+          "partial retirement lost dirty or previously clean contents");
+      Require(name, "A clears veto", BufferCacheTestAccess::ImportIdle(cache), "B exclusions leaked into A2");
+      const auto promote = [&] {
+        Common::SubmitProfile::SetExperiment(true);
+        BufferCacheTestAccess::RetryImport(cache, ordinary);
+        cache.InvalidateMemory(base, size); cache.SynchronizeBuffersInRange(base, size);
+        Require(name, "reimport", BufferCacheTestAccess::Imported(cache, base) != nullptr, "reimport failed");
+        cache.PrepareHostImportReads();
+      };
+      promote();
+      void* alias = nullptr;
+      Require(name, "alias map", LibKernel::Memory::KernelMapDirectMemory(&alias, size, 0x3, 0, direct, size) == 0,
+          "second physical alias failed");
+      Require(name, "alias drain", Common::GuestHostImport::retained_bytes == 0 &&
+          !LibKernel::Memory::AcquireHostImport(base, size), "physical alias remained importable");
+      Require(name, "alias unmap", LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(alias), size) == 0, "alias unmap failed");
+      promote();
+      const auto merged = cache.FindBuffer(base, 2 * size);
+      Require(name, "merge retirement", Common::GuestHostImport::retained_bytes == 0 && merged != id,
+          "merge retained a stale imported owner");
+      Libs::Graphics::Buffer& merged_buffer = cache.GetBuffer(merged);
+      BufferCacheTestAccess::RetryImport(cache, merged_buffer);
+      cache.InvalidateMemory(base, 2 * size); cache.SynchronizeBuffersInRange(base, 2 * size);
+      Require(name, "merged reimport", BufferCacheTestAccess::Imported(cache, base) != nullptr, "merged import failed");
+      cache.PrepareHostImportReads();
+      const std::pair<Libs::Graphics::Buffer*, uint64_t> before_write = cache.ObtainBuffer(base, 96, false, false, {}, Common::BufferUploadProfile::Use::ShaderRead);
+      vk::DescriptorBufferInfo write_fallback{before_write.first->Handle(), before_write.second, 96};
+      const std::pair<Libs::Graphics::Buffer*, uint64_t> writable = cache.ObtainBuffer(base, 4, true, false);
+      Require(name, "GPU write fallback", writable.first == &merged_buffer && Common::GuestHostImport::retained_bytes == 0,
+          "GPU writer received an imported owner");
+      Require(name, "writer after prepared read", !cache.ResolveHostImportRead(base, 96, write_fallback) &&
+          write_fallback.buffer == merged_buffer.Handle(), "writer invalidated a previously prepared descriptor");
+      writable.first->Fill(writable.second, 4, 0xdecafbadu);
+      BufferCacheTestAccess::DownloadOnCurrentThread(cache, base, 4);
+      Require(name, "GPU publish", words[0] == 0xdecafbadu, "fallback GPU readback failed");
+    }
+    context.UnmapMemory(base, 4 * size); finish();
+    DestroyBuffer(&readback);
+    Require(name, "release", LibKernel::Memory::KernelMunmap(base, 4 * size) == 0 &&
+        LibKernel::Memory::KernelReleaseDirectMemory(direct, 4 * size) == 0, "guest release failed");
+    Common::SubmitProfile::SetExperiment(false);
+    std::printf("[gpu]     %-32s %s\n", name, supported ? "ok" : "fallback ok; import unsupported (skip)");
+    return supported;
   }
 
   void CheckBdaSyncUploads() {
@@ -20166,6 +21846,92 @@ public:
           ShaderMeshInputInfo mesh{};
           mesh.input_primitive = static_cast<uint32_t>(Prospero::PrimitiveType::kTriList);
           mesh.primitives_per_group = 1;
+          // Real compute producer -> argument copy -> conversion -> later compute
+          // overwrite, with no intermediate Finish. The producer/WAR barriers
+          // must suffice without a second ALL_COMMANDS barrier in the converter.
+          static const auto mesh_record_writer = [] {
+            std::vector<u32> code;
+            for (u32 i = 0; i < 5; ++i) {
+              code.push_back(EncodeVop1(0x01u, 1, 4u + i));
+              code.push_back(EncodeMubuf0(0x1cu, i * 4, false, false));
+              code.push_back(EncodeMubuf1(1, 0, 0));
+            }
+            AppendEnd(&code);
+            return code;
+          }();
+          ShaderMapUserData(reinterpret_cast<uint64_t>(mesh_record_writer.data()),
+              {.type = Prospero::ShaderBinaryType::kCs,
+               .code_size_bytes = static_cast<uint32_t>(mesh_record_writer.size() * sizeof(u32))});
+          const auto write_record_compute = [&](std::array<u32, 5> record) {
+            shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(mesh_record_writer.data()),
+                .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1, .wave_size = 64, .user_sgpr = 9});
+            const std::array<u32, 4> descriptor {static_cast<u32>(mesh_args),
+                static_cast<u32>(mesh_args >> 32), 20, 0x00014004u};
+            for (u32 i = 0; i < 4; ++i) shaders.SetCsUserSgpr(i, descriptor[i]);
+            for (u32 i = 0; i < 5; ++i) shaders.SetCsUserSgpr(4 + i, record[i]);
+            executor.DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41u, false);
+          };
+          for (const u32 count : {0u, 1u, 6u}) for (const u32 instances : {0u, 2u}) {
+            const std::array<u32, 5> record {count, instances, 3, UINT32_MAX, 5};
+            write_record_compute(record);
+            auto snapshot = ConvertIndirectMeshArgs(context, mesh_args, mesh, 6, mesh_indices, 4, 24, true);
+            write_record_compute({});
+            scheduler.Finish();
+            snapshot->Invalidate(0, 64);
+            std::array<u32, 16> words;
+            std::memcpy(words.data(), snapshot->Mapped().data(), sizeof(words));
+            const u32 groups = count >= 3 && instances ? count / 3 : 0;
+            Require("IndirectMeshGpu", "compute-generated empty/nonempty snapshot",
+                words[0] == groups && words[1] == (groups ? instances : 1u) && words[2] == 1 &&
+                words[3] == count && words[4] == UINT32_MAX && words[5] == 5 && words[9] == 3 &&
+                words[10] == 0 && std::equal(record.begin(), record.end(), words.begin() + 11),
+                "compute publication or subsequent overwrite corrupted the zero/nonzero mesh command");
+          }
+          // Native indexed records: clamp only the private GPU snapshot. Exercise
+          // multi-record stride, unchanged original counts, counter zero/one/max,
+          // firstIndex beyond the bound and writes AFTER snapshot creation.
+          for (const bool legacy : {false, true}) for (const uint32_t limit : {0u, 1u, 6u})
+          for (const uint32_t actual : {0u, 1u, 3u, UINT32_MAX}) {
+            constexpr auto address = mesh_args + 0x100;
+            constexpr auto counter_address = mesh_args + 0x180;
+            constexpr uint32_t stride = 32, size = 2 * stride + 20;
+            const std::array<vk::DrawIndexedIndirectCommand, 3> originals {{
+                {0, 1, 0, 0, 0}, {9, 0, 3, -2, 4}, {UINT32_MAX, 2, UINT32_MAX, 3, 7}}};
+            const auto source = buffer_cache.ObtainBuffer(address, size, true);
+            for (uint32_t i = 0; i < 3; ++i) {
+              const auto words = std::bit_cast<std::array<uint32_t, 5>>(originals[i]);
+              for (uint32_t j = 0; j < 5; ++j) source.first->Fill(source.second + i * stride + j * 4, 4, words[j]);
+            }
+            std::shared_ptr<Libs::Graphics::Buffer> counter;
+            if (actual != UINT32_MAX) {
+              const auto dst = buffer_cache.ObtainBuffer(counter_address, 4, true);
+              dst.first->Fill(dst.second, 4, actual);
+              counter = SnapshotIndirectCount(context, counter_address, 3).buffer;
+            }
+            const auto samples_before = Common::SubmitProfile::Detail::window.extra[
+                static_cast<size_t>(Common::SubmitProfile::Extra::IndirectIndexSamples)].load();
+            auto snapshot = SnapshotIndirectIndexedArgs(context, {address, 3, stride, counter ? counter->Handle() : vk::Buffer{}}, limit, legacy);
+            Require("IndirectMeshGpu", "indexed diagnostic snapshot", snapshot != nullptr, "small indexed snapshot rejected");
+            // Obtain again: creating the counter may have changed buffer owners.
+            const auto overwrite = buffer_cache.ObtainBuffer(address, size, true);
+            overwrite.first->Fill(overwrite.second, size, 0);
+            scheduler.Finish();
+            snapshot->Invalidate(0, size * 2 + 4);
+            for (uint32_t i = 0; i < 3; ++i) {
+              vk::DrawIndexedIndirectCommand issued, original;
+              std::memcpy(&issued, snapshot->Mapped().data() + i * stride, sizeof(issued));
+              std::memcpy(&original, snapshot->Mapped().data() + size + i * stride, sizeof(original));
+              auto expected = originals[i];
+              if (legacy) expected.indexCount = std::min(expected.indexCount, limit);
+              Require("IndirectMeshGpu", "native clamp and snapshot",
+                  std::memcmp(&issued, &expected, sizeof(issued)) == 0 &&
+                  std::memcmp(&original, &originals[i], sizeof(original)) == 0,
+                  "native clamp changed offsets, lost original counts or observed a later guest write");
+            }
+            if (Common::SubmitProfile::Recording()) Require("IndirectMeshGpu", "asynchronous index counters",
+                Common::SubmitProfile::Detail::window.extra[static_cast<size_t>(Common::SubmitProfile::Extra::IndirectIndexSamples)] ==
+                    samples_before + std::min(actual, 3u), "diagnostic counted records not executed by countBuffer");
+          }
           struct Record { uint32_t count, instances, first; int32_t vertex; uint32_t instance; };
           const Record cases[]{{0, 1, 0, 0, 0}, {3, 0, 0, 0, 0}, {1, 1, 0, 0, 0},
               {2, 1, 1, 0, 0}, {3, 1, 0, 0, 0}, {3, 2, 1, -1, 5}, {6, 1, 3, 7, 2},
@@ -20207,10 +21973,18 @@ public:
                                          Prospero::PrimitiveType::kTriList, Prospero::PrimitiveType::kTriStrip,
                                          Prospero::PrimitiveType::kTriFan})
               for (const uint32_t per_group : {1u, 2u, 62u})
-              for (const bool offsets : {false, true}) {
+              for (const bool offsets : {false, true})
+              for (uint32_t pass = 0; pass < (Common::SubmitProfile::ExperimentSelected(Common::SubmitProfile::Experiment::LegacyIndexClamp) ? 2u : 1u); ++pass) {
+                Common::SubmitProfile::SetExperiment(pass != 0);
                 mesh.input_primitive = static_cast<uint32_t>(topology);
                 mesh.primitives_per_group = per_group;
                 write_args(false);
+                const auto counter = [](Common::SubmitProfile::Extra extra) {
+                  return Common::SubmitProfile::Detail::window.extra[static_cast<size_t>(extra)].load();
+                };
+                const auto snapshots_before = counter(Common::SubmitProfile::Extra::IndirectMeshSnapshots);
+                const auto groups_before = counter(Common::SubmitProfile::Extra::IndirectMeshGroups);
+                const auto empty_before = counter(Common::SubmitProfile::Extra::IndirectMeshEmpty);
                 auto snapshot = ConvertIndirectMeshArgs(context, mesh_args, mesh, bound,
                     0x2fffffffcull, element_size, 64, offsets);
                 write_args(true); // Later guest writes cannot alter the snapshot.
@@ -20218,7 +21992,7 @@ public:
                 snapshot->Invalidate(0, 64);
                 std::array<uint32_t, 16> words{};
                 std::memcpy(words.data(), snapshot->Mapped().data(), sizeof(words));
-                const auto count = record.count;
+                const auto count = pass ? std::min(record.count, bound) : record.count;
                 const auto primitives = mesh.InputPrimitiveCount(count);
                 const auto groups = primitives == 0 ? 0 : (primitives - 1) / per_group + 1;
                 const bool active = groups && record.instances;
@@ -20229,6 +22003,11 @@ public:
                     record.first < bound ? bound - record.first : 0, 0};
                 Require("IndirectMeshGpu", "conversion and snapshot", std::equal(expected.begin(), expected.end(), words.begin()),
                         "GPU task counts, offsets or snapshot differ from CPU formulas");
+                if (Common::SubmitProfile::Recording()) Require("IndirectMeshGpu", "completed GPU group counters",
+                    counter(Common::SubmitProfile::Extra::IndirectMeshSnapshots) == snapshots_before + 1 &&
+                    counter(Common::SubmitProfile::Extra::IndirectMeshGroups) == groups_before + (active ? uint64_t(groups) * record.instances : 0) &&
+                    counter(Common::SubmitProfile::Extra::IndirectMeshEmpty) == empty_before + !active,
+                    "deferred counters lost real GPU groups or confused zero groups with missing samples");
               }
               std::vector<uint32_t> reference;
               // Independent oracle: explicitly padded indices, with no bounds
@@ -20250,6 +22029,15 @@ public:
                 }
                 const auto before = Common::SubmitProfile::Detail::window.extra[
                     static_cast<size_t>(Common::SubmitProfile::Extra::IndirectMeshDraws)].load();
+                if (gpu && Common::SubmitProfile::ExperimentSelected(Common::SubmitProfile::Experiment::NoIndirectMeshGpu)) {
+                  Common::SubmitProfile::SetExperiment(true);
+                  Require("IndirectMeshGpu", "disable GPU route",
+                      !RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+                          {.index_count = bound, .index_addr = reinterpret_cast<const void*>(mesh_indices),
+                           .index_type_and_size = element_size == 4 ? 1u : 0u,
+                           .indirect = {mesh_args, 1, 20}}), "disabled mesh route still accepted GPU arguments");
+                  Common::SubmitProfile::SetExperiment(false);
+                }
                 if (route == 1) BufferCacheTestAccess::DownloadOnCurrentThread(buffer_cache, mesh_indices, 64);
                 const auto drawn = gpu
                     ? RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
@@ -22192,6 +23980,8 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_calibrated_timestamps_supported = false;
+  bool m_host_import_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -22220,9 +24010,17 @@ private:
     m_physical_device.getProperties(
         &m_runtime_context.physical_device_properties);
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
+    m_runtime_context.guest_host_import_enabled = m_host_import_supported;
+    if (m_host_import_supported) {
+      vk::PhysicalDeviceExternalMemoryHostPropertiesEXT host{};
+      vk::PhysicalDeviceProperties2 properties{}; properties.pNext = &host;
+      m_physical_device.getProperties2(&properties);
+      m_runtime_context.host_import_alignment = host.minImportedHostPointerAlignment;
+    }
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
+    m_runtime_context.calibrated_timestamps_enabled = m_calibrated_timestamps_supported;
     m_runtime_context.maintenance8_enabled = true;
     m_runtime_context.conditional_rendering_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
@@ -22573,6 +24371,28 @@ private:
         VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
         VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME};
+    uint32_t extension_count = 0;
+    RequireVk("VulkanHarness", "clock extensions", m_physical_device.enumerateDeviceExtensionProperties(
+        nullptr, &extension_count, nullptr), "vkEnumerateDeviceExtensionProperties");
+    std::vector<vk::ExtensionProperties> clock_extensions(extension_count);
+    RequireVk("VulkanHarness", "clock extensions", m_physical_device.enumerateDeviceExtensionProperties(
+        nullptr, &extension_count, clock_extensions.data()), "vkEnumerateDeviceExtensionProperties");
+    for (const auto& extension : clock_extensions) {
+      if (std::strcmp(extension.extensionName.data(), VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0) {
+        device_extensions.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        m_calibrated_timestamps_supported = true;
+        break;
+      }
+    }
+    if (Common::SubmitProfile::ExperimentSelected(Common::SubmitProfile::Experiment::GuestHostImport)) {
+      for (const auto& extension : clock_extensions) {
+        if (std::strcmp(extension.extensionName.data(), VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) == 0) {
+          device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+          m_host_import_supported = true;
+          break;
+        }
+      }
+    }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
@@ -52209,12 +54029,83 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
-  if (argc == 2 && std::strcmp(argv[1], "--indirect-mesh-only") == 0) {
+  if (argc == 2 && (std::strcmp(argv[1], "--fault-coarsening-only") == 0 ||
+                    std::strcmp(argv[1], "--fault-coarsening-copy-only") == 0)) {
+    const bool copy = std::strcmp(argv[1], "--fault-coarsening-copy-only") == 0;
 #if defined(_WIN32)
-    _putenv_s("KYTY_EXPERIMENT", "");
+    _putenv_s("KYTY_EXPERIMENT", copy ? "fault-coarsening,guest-host-import" : "fault-coarsening");
+    _putenv_s("KYTY_HOST_IMPORT_MODE", "copy");
+    _putenv_s("KYTY_BUFFER_UPLOAD_PROFILE", "0");
+#else
+    setenv("KYTY_EXPERIMENT", copy ? "fault-coarsening,guest-host-import" : "fault-coarsening", 1);
+    setenv("KYTY_HOST_IMPORT_MODE", "copy", 1);
+    setenv("KYTY_BUFFER_UPLOAD_PROFILE", "0", 1);
+#endif
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    return vulkan.CheckFaultCoarsening() ? 0 : 77;
+  }
+  if (argc == 2 && (std::strcmp(argv[1], "--hot-unprotected-only") == 0 ||
+                    std::strcmp(argv[1], "--hot-unprotected-copy-only") == 0)) {
+    const bool copy = std::strcmp(argv[1], "--hot-unprotected-copy-only") == 0;
+#if defined(_WIN32)
+    _putenv_s("KYTY_EXPERIMENT", copy ? "hot-unprotected,guest-host-import" : "hot-unprotected");
+    _putenv_s("KYTY_HOST_IMPORT_MODE", "copy");
+    _putenv_s("KYTY_BUFFER_UPLOAD_PROFILE", "0");
+#else
+    setenv("KYTY_EXPERIMENT", copy ? "hot-unprotected,guest-host-import" : "hot-unprotected", 1);
+    setenv("KYTY_HOST_IMPORT_MODE", "copy", 1);
+    setenv("KYTY_BUFFER_UPLOAD_PROFILE", "0", 1);
+#endif
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    return vulkan.CheckHotUnprotected() ? 0 : 77;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--vk-recorder-scheduler-only") == 0) {
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    if (!vulkan.CheckVkRecorderRendering(true)) return 77;
+    return vulkan.CheckVkRecorderBackend(true, true) ? 0 : 77;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--vk-recorder-bindings-only") == 0) {
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    return vulkan.CheckVkRecorderBackend(true) ? 0 : 77;
+  }
+  if (argc == 2 && (std::strcmp(argv[1], "--vk-recorder-backend-only") == 0 ||
+                    std::strcmp(argv[1], "--vk-recorder-rendering-only") == 0)) {
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    const bool rendering = std::strcmp(argv[1], "--vk-recorder-rendering-only") == 0;
+    return (rendering ? vulkan.CheckVkRecorderRendering() : vulkan.CheckVkRecorderBackend()) ? 0 : 77;
+  }
+  if (argc == 2 && (std::strcmp(argv[1], "--guest-host-import-only") == 0 ||
+                    std::strcmp(argv[1], "--guest-host-import-copy-only") == 0)) {
+    const bool copy = std::strcmp(argv[1], "--guest-host-import-copy-only") == 0;
+#if defined(_WIN32)
+    _putenv_s("KYTY_EXPERIMENT", "guest-host-import");
+    _putenv_s("KYTY_HOST_IMPORT_GUARD", "1");
+    _putenv_s("KYTY_HOST_IMPORT_MODE", copy ? "copy" : "direct");
+    _putenv_s("KYTY_BUFFER_UPLOAD_PROFILE", "0");
+#else
+    setenv("KYTY_EXPERIMENT", "guest-host-import", 1);
+    setenv("KYTY_HOST_IMPORT_GUARD", "1", 1);
+    setenv("KYTY_HOST_IMPORT_MODE", copy ? "copy" : "direct", 1);
+    setenv("KYTY_BUFFER_UPLOAD_PROFILE", "0", 1);
+#endif
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    return (copy ? vulkan.CheckGuestHostImportCopy() : vulkan.CheckGuestHostImport()) ? 0 : 77;
+  }
+  if (argc == 2 && (std::strcmp(argv[1], "--indirect-mesh-only") == 0 ||
+                    std::strcmp(argv[1], "--indirect-menu-diagnostics-only") == 0)) {
+    const auto* experiment = std::strcmp(argv[1], "--indirect-menu-diagnostics-only") == 0
+        ? "legacy-index-clamp,no-indirect-mesh-gpu" : "";
+#if defined(_WIN32)
+    _putenv_s("KYTY_EXPERIMENT", experiment);
     _putenv_s("KYTY_SUBMIT_PROFILE", "1");
 #else
-    setenv("KYTY_EXPERIMENT", "", 1);
+    setenv("KYTY_EXPERIMENT", experiment, 1);
     setenv("KYTY_SUBMIT_PROFILE", "1", 1);
 #endif
     Common::SubmitProfile::SetRecording(true);
@@ -52992,6 +54883,16 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--flip-only") == 0) {
     CheckPm4Flip();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--guest-clock-shadow-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGuestClockShadow();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--guest-clock-publish-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGuestClockPublish();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {

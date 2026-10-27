@@ -197,6 +197,32 @@ public:
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 
+	bool QueryImport(Common::GuestHostImport::Span& span) {
+		std::shared_lock lock(m_mutex);
+		MapEntry entry {};
+		if (!IsAvailable() || !span.size || UINT64_MAX - span.address < span.size ||
+		    !FindContainingUnlocked(span.address, 1, &entry)) return false;
+		const auto offset = entry.backing_offset + span.address - entry.vaddr;
+		if (!RangeOk(offset, span.size)) return false;
+		for (auto cursor = span.address; cursor < span.address + span.size;) {
+			if (!FindContainingUnlocked(cursor, 1, &entry)) return false;
+			if (entry.backing_offset + cursor - entry.vaddr != offset + cursor - span.address) {
+				span.reject = Common::GuestHostImport::Reject::Discontiguous; return false;
+			}
+			cursor = std::min(entry.vaddr + entry.size, span.address + span.size);
+		}
+		// No second guest alias may write these physical pages without our guard.
+		for (const auto& [_, other]: m_maps) {
+			if (!Common::GuestHostImport::Overlap(offset, span.size, other.backing_offset, other.size)) continue;
+			const auto shared = std::max(offset, other.backing_offset);
+			if (other.vaddr + shared - other.backing_offset != span.address + shared - offset) {
+				span.reject = Common::GuestHostImport::Reject::GuestAlias; return false;
+			}
+		}
+		span.pointer = m_backing_base + offset; span.physical_offset = offset;
+		return true;
+	}
+
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
@@ -222,6 +248,21 @@ public:
 		    },
 		    [](uint64_t, uint64_t) {});
 		return true;
+	}
+
+	bool TryCompareExchangeBacking64(uint64_t vaddr, uint64_t expected, uint64_t value) {
+		if (!IsAvailable() || (vaddr & 7u) != 0 || vaddr > UINT64_MAX - 8) return false;
+		std::lock_guard lock(m_mutex);
+		bool changed = false;
+		ForEachSparseRange(m_maps, vaddr, 8,
+		    [&](const auto& entry, uint64_t start, uint64_t bytes) {
+			    if (start != vaddr || bytes != 8) return;
+			    const auto offset = entry.backing_offset + start - entry.vaddr;
+			    if ((offset & 7u) != 0 || !RangeOk(offset, 8)) return;
+			    auto* word = reinterpret_cast<uint64_t*>(m_backing_base + offset);
+			    changed = std::atomic_ref<uint64_t>(*word).compare_exchange_strong(expected, value);
+		    }, [](uint64_t, uint64_t) {});
+		return changed;
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -743,7 +784,13 @@ public:
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_backing->GetBackingSize(); }
 
 	bool ZeroBacking(uint64_t backing_offset, uint64_t size) {
+		Common::GuestHostImport::Mutation mutation;
 		return m_backing->ZeroRange(backing_offset, size);
+	}
+
+	bool QueryImport(Common::GuestHostImport::Span& span) {
+		std::shared_lock lock(m_mutex);
+		return ContainsMappedUnlocked(span.address, span.size, MappingType::Backing) && m_backing->QueryImport(span);
 	}
 
 	[[nodiscard]] bool Owns(uint64_t vaddr, uint64_t size) {
@@ -780,6 +827,13 @@ public:
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
 
+	bool TryCompareExchangeBacking64(uint64_t vaddr, uint64_t expected, uint64_t value) {
+		if (!Owns(vaddr, 8)) return false;
+		std::shared_lock lock(m_mutex);
+		return !OverlapsPrivateUnlocked(vaddr, 8) &&
+		       m_backing->TryCompareExchangeBacking64(vaddr, expected, value);
+	}
+
 	template <bool copy_private>
 	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
 		if (data == nullptr || !Owns(vaddr, size)) {
@@ -813,6 +867,7 @@ public:
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		Common::GuestHostImport::Mutation mutation;
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
@@ -825,13 +880,16 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
+		Common::GuestCpuProfile::Stage acquire(Common::GuestCpuProfile::Part::MapLock);
 		std::shared_lock lock(m_mutex);
+		acquire.End();
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
+		Common::GuestHostImport::Mutation mutation;
 		std::lock_guard lock(m_mutex);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		const bool replacing = ContainsMappedUnlocked(vaddr, size, MappingType::Backing);
@@ -860,6 +918,7 @@ public:
 	}
 
 	bool UnmapBacking(uint64_t vaddr, uint64_t size) {
+		Common::GuestHostImport::Mutation mutation;
 		std::lock_guard lock(m_mutex);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Backing)) {
 			return false;

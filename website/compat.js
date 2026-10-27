@@ -10,11 +10,15 @@
     'doesnt-boot': { label: 'No arranca', css: 'bad' },
   };
   // Tested on Nova5 by us; these override the community status when we know better.
+  // `playable` games also appear in the "100% jugables" section, in this order.
   const NOVA5 = {
-    PPSA21564: { status: 'in-game', note: 'Jugable a unos 12–13 FPS en el aterrizaje de Sky Garden (RTX + CPU Intel).' },
+    PPSA28997: { status: 'in-game', playable: true, title: 'God of War Sons of Sparta',
+      note: 'Gameplay a 60 FPS estables, con sonido y control (Nova5 0.5.0 o posterior).' },
+    PPSA21564: { status: 'in-game', note: 'Jugable a unos 16–17 FPS en el aterrizaje de Sky Garden (RTX + CPU Intel).' },
     PPSA03671: { note: 'Ya no se cierra al iniciar: Nova5 analiza sus shaders grandes sin desbordarse. Pendiente de jugar.' },
   };
 
+  const playableGrid = document.getElementById('playable-grid');
   const grid = document.getElementById('compat-grid');
   const more = document.getElementById('compat-more');
   const search = document.getElementById('compat-search');
@@ -33,24 +37,39 @@
       (!q || norm(g.title).includes(q) || g.ids.some((id) => id.toLowerCase().includes(q))));
   }
 
+  function card(g) {
+    const s = STATUS[g.status] ?? STATUS.logo;
+    const el = document.createElement('article');
+    el.className = 'compat-card';
+    el.innerHTML =
+      `<div class="cover">${g.cover ? `<img loading="lazy" src="${text(g.cover)}" alt="">` : `<span>${text(g.title.slice(0, 1))}</span>`}</div>` +
+      `<div class="info"><h3>${text(g.title)}</h3><p class="id">${text(g.titleId)}</p>` +
+      `<p class="tags">${g.playable ? '<b class="tag full">100% jugable</b>' : `<b class="tag ${s.css}">${s.label}</b>`}` +
+      `${g.nova5 ? '<b class="tag nova">Probado en Nova5</b>' : ''}</p>` +
+      `${g.note ? `<p class="note">${text(g.note)}</p>` : ''}</div>`;
+    return el;
+  }
+
   function render() {
     const list = visible();
     grid.innerHTML = list.length ? '' : '<p class="fine">No hay juegos con ese filtro.</p>';
     const frag = document.createDocumentFragment();
-    for (const g of list.slice(0, shown)) {
-      const s = STATUS[g.status] ?? STATUS.logo;
-      const card = document.createElement('article');
-      card.className = 'compat-card';
-      card.innerHTML =
-        `<div class="cover">${g.cover ? `<img loading="lazy" src="${text(g.cover)}" alt="">` : `<span>${text(g.title.slice(0, 1))}</span>`}</div>` +
-        `<div class="info"><h3>${text(g.title)}</h3><p class="id">${text(g.titleId)}</p>` +
-        `<p class="tags"><b class="tag ${s.css}">${s.label}</b>${g.nova5 ? '<b class="tag nova">Probado en Nova5</b>' : ''}</p>` +
-        `${g.note ? `<p class="note">${text(g.note)}</p>` : ''}</div>`;
-      frag.appendChild(card);
-    }
+    for (const g of list.slice(0, shown)) frag.appendChild(card(g));
     grid.appendChild(frag);
     more.hidden = list.length <= shown;
   }
+
+  // The playable list comes from our own data, so it shows even if the community index fails.
+  function renderPlayable() {
+    const known = new Map(games.map((g) => [g.titleId, g]));
+    playableGrid.innerHTML = '';
+    for (const [titleId, ours] of Object.entries(NOVA5).filter(([, o]) => o.playable)) {
+      const g = known.get(titleId) ?? games.find((x) => x.ids.includes(titleId));
+      playableGrid.appendChild(card(g ?? { title: ours.title, titleId, ids: [titleId], status: ours.status,
+        nova5: true, playable: true, note: ours.note }));
+    }
+  }
+  renderPlayable();
 
   function count() {
     const counts = { all: games.length };
@@ -75,11 +94,14 @@
         const ours = NOVA5[g.titleId] ?? (g.allTitleIds ?? []).map((id) => NOVA5[id]).find(Boolean);
         return {
           title: g.title ?? g.titleId, titleId: g.titleId, ids: g.allTitleIds ?? [g.titleId],
-          cover: g.cover, status: ours?.status ?? g.overall, nova5: Boolean(ours), note: ours?.note,
+          cover: g.cover, status: ours?.status ?? g.overall, nova5: Boolean(ours), playable: Boolean(ours?.playable),
+          note: ours?.note,
         };
-      }).sort((a, b) => (b.nova5 - a.nova5) || (rank[a.status] - rank[b.status]) || a.title.localeCompare(b.title, 'es'));
+      }).sort((a, b) => (b.playable - a.playable) || (b.nova5 - a.nova5) || (rank[a.status] - rank[b.status]) ||
+        a.title.localeCompare(b.title, 'es'));
       count();
       render();
+      renderPlayable();
     })
     .catch(() => {
       grid.innerHTML = '<p class="fine">No se pudo cargar la lista ahora mismo. Consúltala en <a href="https://kytyps5.github.io/compatibility">kytyps5.github.io</a>.</p>';

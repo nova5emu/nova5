@@ -42,8 +42,9 @@ public:
 	             ShaderRecompiler::IR::ImageHeapView&          result) override;
 	// Image discovery: resolves new elements and rediscovers changed images.
 	void Rebind(RenderExecutor& executor);
-	// Recording: uploads slots, moves resident images to their read layout and binds the array.
-	void Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point, vk::PipelineLayout layout);
+	// Producer preparation: uploads slots and transitions resident images. May
+	// rotate the command buffer. Returns the set for the final emission; no bind.
+	vk::DescriptorSet PrepareBinding(CommandBuffer& buffer);
 	// CPU write fault, on any thread.
 	void InvalidateMemory(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);

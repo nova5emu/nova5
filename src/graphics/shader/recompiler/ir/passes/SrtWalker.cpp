@@ -1477,6 +1477,7 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 	plan.walker_read_sites.clear();
 	plan.walker_control_disabled.clear();
 	plan.walker_control_rejected = false;
+	plan.walker_control_history = {};
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 	auto& c = *plan.srt_code;
 	// One body. r12 holds page hints across thunks and the C++ clean-read
@@ -1508,9 +1509,12 @@ static bool WalkSrtImpl(const ResourcePlan& plan, const SrtRuntime& runtime, std
 		[[maybe_unused]] ProgramScope<Profile> profile {ProgramStage::SrtNative};
 		const auto* previous_walker = std::exchange(t_running_walker, &plan);
 		const auto previous_reader = std::exchange(t_clean_reader, runtime.read_clean_memory);
-		const auto* controls = !plan.walker_control_disabled.empty() && !plan.walker_control_rejected
+		const auto* controls = !plan.walker_control_disabled.empty() && !plan.walker_control_rejected &&
+		    !Common::SubmitProfile::ExperimentActive(Common::SubmitProfile::Experiment::NoWalkerControlGpu)
 		    ? plan.walker_control_disabled.data() : nullptr;
-		if (controls) Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::WalkerControlWalks);
+		// A vector of eligible sites alone is not an active promotion.
+		if (controls && plan.walker_control_history.learned_sites != 0)
+			Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::WalkerControlWalks);
 		end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 		    plan.srt_scratch.data(), runtime.shader_base, t_clean_pages.data(), controls);
 		t_clean_reader = previous_reader;
@@ -1587,13 +1591,17 @@ bool NoteSrtControlReadback(uint64_t rip) {
 	using namespace Common::SubmitProfile;
 	if (!SrtWalkerLoadLength(rip)) return false;
 	const auto& plan = *t_running_walker;
-	if (plan.walker_control_rejected) return false;
 	const auto offset = rip - reinterpret_cast<uint64_t>(plan.srt_code->getCode());
 	const auto site = std::lower_bound(plan.walker_read_sites.begin(), plan.walker_read_sites.end(), offset,
 	    [](const ResourcePlan::WalkerReadSite& site, uint64_t key) { return site.offset < key; });
 	if (site == plan.walker_read_sites.end() || site->offset != offset || site->control_slot == UINT32_MAX) return false;
 	auto& disabled = plan.walker_control_disabled[site->control_slot];
-	if (!disabled) AddExtra(Extra::WalkerControlPromotions);
+	// Keep learning during the fallback cooldown too. Handling/delegating the
+	// readback has already completed on the walker owner before this callback.
+	if (!disabled) {
+		++plan.walker_control_history.learned_sites;
+		AddExtra(Extra::WalkerControlPromotions);
+	}
 	disabled = 1;
 	return true;
 }

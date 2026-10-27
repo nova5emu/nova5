@@ -396,6 +396,15 @@ if(LINUX)
 	target_link_libraries(submit_profile_tests Threads::Threads)
 endif()
 
+add_executable(gpu_thread_sampler_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GpuThreadSamplerTests.cpp"
+	"${KYTY_SOURCE_DIR}/common/gpuThreadSampler.cpp")
+target_include_directories(gpu_thread_sampler_tests PRIVATE "${KYTY_SOURCE_DIR}")
+target_compile_definitions(gpu_thread_sampler_tests PRIVATE KYTY_GPU_SAMPLER_TESTS=1)
+if(LINUX)
+	target_link_libraries(gpu_thread_sampler_tests Threads::Threads)
+endif()
+
 add_executable(submit_profile_runtime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SubmitProfileRuntimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/submitProfileRuntime.cpp")
@@ -445,8 +454,12 @@ if(WIN32)
 		"${KYTY_TESTS_DIR}/WindowsFileReadTests.cpp")
 	target_link_libraries(windows_file_read_tests common)
 	target_include_directories(windows_file_read_tests PRIVATE ${inc_headers})
+	add_executable(windows_long_path_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/WindowsLongPathTests.cpp")
+	target_link_libraries(windows_long_path_tests common)
+	target_include_directories(windows_long_path_tests PRIVATE ${inc_headers})
 	if(BUILD_TESTING)
 		add_test(NAME windows_file_read COMMAND $<TARGET_FILE:windows_file_read_tests>)
+		add_test(NAME windows_long_path COMMAND $<TARGET_FILE:windows_long_path_tests>)
 	endif()
 endif()
 
@@ -590,6 +603,13 @@ add_executable(occlusion_queries_tests EXCLUDE_FROM_ALL
 target_link_libraries(occlusion_queries_tests common fmt::fmt Vulkan::Headers)
 target_include_directories(occlusion_queries_tests PRIVATE ${inc_headers})
 
+add_executable(vk_recorder_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/VkRecorderTests.cpp")
+target_link_libraries(vk_recorder_tests common fmt::fmt Vulkan::Headers)
+target_include_directories(vk_recorder_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(vk_recorder_tests Threads::Threads)
+endif()
+
 add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(ces_tests PRIVATE ${inc_headers})
@@ -622,6 +642,20 @@ add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(sync_on_address_tests common)
 target_include_directories(sync_on_address_tests PRIVATE ${inc_headers})
+
+add_executable(stall_dump_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/StallDumpTests.cpp"
+	"${KYTY_SOURCE_DIR}/common/stallDump.cpp"
+)
+target_include_directories(stall_dump_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(bank_io_trace_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BankIoTraceTests.cpp")
+target_include_directories(bank_io_trace_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(frame_trace_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/FrameTraceTests.cpp")
+target_include_directories(frame_trace_tests PRIVATE "${KYTY_SOURCE_DIR}")
+target_link_libraries(frame_trace_tests common)
+if(TARGET Threads::Threads)
+	target_link_libraries(stall_dump_tests Threads::Threads)
+endif()
 
 add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImagePageTableTests.cpp"
@@ -665,6 +699,18 @@ if(NOT KYTY_CLANG_CL)
 endif()
 
 if(BUILD_TESTING)
+	add_test(NAME vk_recorder_transport COMMAND $<TARGET_FILE:vk_recorder_tests>)
+	set_tests_properties(vk_recorder_transport PROPERTIES TIMEOUT 30)
+	add_test(NAME vk_recorder_backend_gpu
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vk-recorder-backend-only)
+	add_test(NAME vk_recorder_rendering_gpu
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vk-recorder-rendering-only)
+	add_test(NAME vk_recorder_bindings_gpu
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vk-recorder-bindings-only)
+	add_test(NAME vk_recorder_scheduler_gpu
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vk-recorder-scheduler-only)
+	set_tests_properties(vk_recorder_backend_gpu vk_recorder_rendering_gpu vk_recorder_bindings_gpu vk_recorder_scheduler_gpu
+	                     PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 	add_test(NAME emulator_user_name_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
 	add_test(NAME emulator_user_name_too_long
@@ -687,8 +733,19 @@ if(BUILD_TESTING)
 	add_test(NAME render_stage_detail_without_profile COMMAND $<TARGET_FILE:render_stage_profile_tests>)
 	set_tests_properties(render_stage_detail_without_profile PROPERTIES ENVIRONMENT "KYTY_RENDER_STAGE_PROFILE=0;KYTY_RENDER_STAGE_DETAIL=1")
 	add_test(NAME submit_profile COMMAND $<TARGET_FILE:submit_profile_tests>)
+	add_test(NAME gpu_thread_sampler_disabled COMMAND $<TARGET_FILE:gpu_thread_sampler_tests>)
+	set_tests_properties(gpu_thread_sampler_disabled PROPERTIES ENVIRONMENT "KYTY_GPU_THREAD_SAMPLER=0")
+	add_test(NAME gpu_thread_sampler_enabled COMMAND $<TARGET_FILE:gpu_thread_sampler_tests>)
+	set_tests_properties(gpu_thread_sampler_enabled PROPERTIES ENVIRONMENT "KYTY_GPU_THREAD_SAMPLER=1")
+	set_tests_properties(gpu_thread_sampler_disabled gpu_thread_sampler_enabled PROPERTIES TIMEOUT 45)
+	if(WIN32)
+		add_test(NAME gpu_thread_sampler_capture_tool COMMAND powershell.exe -NoProfile -File
+		    "${KYTY_TESTS_DIR}/CaptureGpuThread.ps1" -SelfTest)
+	endif()
 	add_test(NAME submit_profile_enabled COMMAND $<TARGET_FILE:submit_profile_tests>)
 	set_tests_properties(submit_profile_enabled PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
+	add_test(NAME submit_profile_image_transfers COMMAND $<TARGET_FILE:submit_profile_tests> --outside-image-transfers)
+	set_tests_properties(submit_profile_image_transfers PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1;KYTY_READBACK_DETAIL=1")
 	add_test(NAME submit_profile_experiment_release
 	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-release)
 	add_test(NAME submit_profile_retired_buffer_dirty_query
@@ -722,6 +779,8 @@ if(BUILD_TESTING)
 	set_tests_properties(submit_profile_experiment_release submit_profile_experiment_retired submit_profile_retired_read_fault_clean submit_profile_retired_attrib_clean_read submit_profile_retired_srt_clean_read
 	                     PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
 	add_test(NAME submit_profile_runtime COMMAND $<TARGET_FILE:submit_profile_runtime_tests>)
+	add_test(NAME submit_profile_runtime_unprofiled
+		COMMAND $<TARGET_FILE:submit_profile_runtime_tests> --experiment-only)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
@@ -738,16 +797,69 @@ if(BUILD_TESTING)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME walker_control_gpu COMMAND $<TARGET_FILE:resource_materialization_tests> --walker-control-only)
 	add_test(NAME walker_control_gpu_combined COMMAND $<TARGET_FILE:resource_materialization_tests> --walker-control-combined-only)
+	add_test(NAME walker_control_gpu_disabled COMMAND $<TARGET_FILE:resource_materialization_tests> --walker-control-disabled-only)
+	add_test(NAME submit_profile_menu_diagnostics COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-menu)
+	set_tests_properties(submit_profile_menu_diagnostics PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
+	add_test(NAME submit_profile_no_gpu_timestamps
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-no-gpu-timestamps)
+	add_test(NAME submit_profile_retired_small_buffer_persistent
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired small-buffer-persistent)
+	add_test(NAME buffer_upload_profile
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --buffer-upload-profile)
+	add_test(NAME guest_host_import_registry
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --guest-host-import)
+	set_tests_properties(guest_host_import_registry PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
+	add_test(NAME guest_host_import_gpu
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --guest-host-import-only)
+	set_tests_properties(guest_host_import_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+	add_test(NAME guest_host_import_copy_gpu
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --guest-host-import-copy-only)
+	set_tests_properties(guest_host_import_copy_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+	add_test(NAME guest_cpu_fault_profile COMMAND $<TARGET_FILE:submit_profile_tests> --guest-cpu-profile)
+	add_test(NAME hot_unprotected_tracking COMMAND $<TARGET_FILE:memory_tracker_tests> --hot-unprotected)
+	add_test(NAME fault_coarsening_tracking COMMAND $<TARGET_FILE:memory_tracker_tests> --fault-coarsening)
+	add_test(NAME fault_coarsening_gpu COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fault-coarsening-only)
+	add_test(NAME fault_coarsening_copy_gpu COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fault-coarsening-copy-only)
+	set_tests_properties(fault_coarsening_gpu fault_coarsening_copy_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+	add_test(NAME hot_unprotected_gpu COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hot-unprotected-only)
+	add_test(NAME hot_unprotected_copy_gpu COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --hot-unprotected-copy-only)
+	set_tests_properties(hot_unprotected_gpu hot_unprotected_copy_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+	set_tests_properties(guest_cpu_fault_profile PROPERTIES SKIP_RETURN_CODE 77
+	    ENVIRONMENT "KYTY_WRITE_FAULT_PROFILE=1;KYTY_WRITE_FAULT_DETAIL_PERIOD=1;KYTY_WRITE_FAULT_ADDRESSES=1")
+	add_test(NAME buffer_upload_provenance
+	         COMMAND $<TARGET_FILE:memory_tracker_tests> --upload-provenance)
+	set_tests_properties(submit_profile_retired_small_buffer_persistent PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
+	set_tests_properties(submit_profile_no_gpu_timestamps PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
+	add_test(NAME submit_profile_retired_gpu_timestamps
+	         COMMAND $<TARGET_FILE:submit_profile_tests> --experiment-retired gpu-timestamps)
+	set_tests_properties(submit_profile_retired_gpu_timestamps PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1")
 	add_test(NAME walker_control_gpu_equivalence COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --walker-control-gpu-only)
 	add_test(NAME indirect_count_gpu COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-count-only)
 	add_test(NAME indirect_mesh_gpu COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-mesh-only)
 	set_tests_properties(indirect_mesh_gpu PROPERTIES SKIP_RETURN_CODE 77)
+	add_test(NAME indirect_menu_diagnostics COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-menu-diagnostics-only)
+	set_tests_properties(indirect_menu_diagnostics PROPERTIES SKIP_RETURN_CODE 77)
 	add_test(NAME resource_materialization_profile_enabled COMMAND $<TARGET_FILE:resource_materialization_tests>)
-	set_tests_properties(resource_materialization_profile_enabled PROPERTIES ENVIRONMENT "KYTY_RENDER_STAGE_PROFILE=1;KYTY_RENDER_STAGE_DETAIL=1")
+	set_tests_properties(resource_materialization_profile_enabled PROPERTIES ENVIRONMENT "KYTY_RENDER_STAGE_PROFILE=1;KYTY_RENDER_STAGE_DETAIL=1;KYTY_SUBMIT_PROFILE=1")
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
+	add_test(NAME stall_dump COMMAND $<TARGET_FILE:stall_dump_tests> enabled)
+	add_test(NAME bank_io_trace COMMAND $<TARGET_FILE:bank_io_trace_tests> enabled)
+	add_test(NAME bank_io_trace_disabled COMMAND $<TARGET_FILE:bank_io_trace_tests> disabled)
+	add_test(NAME frame_trace COMMAND $<TARGET_FILE:frame_trace_tests>)
+	add_test(NAME frame_trace_disabled COMMAND $<TARGET_FILE:frame_trace_tests> disabled)
+	add_test(NAME stall_dump_guest_log COMMAND $<TARGET_FILE:stall_dump_tests> guest)
+	add_test(NAME stall_dump_disabled COMMAND $<TARGET_FILE:stall_dump_tests> disabled)
+	add_test(NAME stall_dump_watchdog COMMAND $<TARGET_FILE:stall_dump_tests> watchdog)
+	add_test(NAME stall_dump_no_callback COMMAND $<TARGET_FILE:stall_dump_tests> no_callback)
+	add_test(NAME stall_dump_always COMMAND $<TARGET_FILE:stall_dump_tests> always)
+	set_tests_properties(stall_dump_watchdog stall_dump_no_callback PROPERTIES TIMEOUT 25
+		PASS_REGULAR_EXPRESSION "state=wait_call_pending op=watchdog-wait object=0x123")
+	set_tests_properties(stall_dump_always PROPERTIES TIMEOUT 45
+		PASS_REGULAR_EXPRESSION "\\[STALL\\] t_ms=[0-9]+ mode=always")
+	set_tests_properties(stall_dump stall_dump_guest_log stall_dump_disabled PROPERTIES TIMEOUT 30)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
@@ -798,12 +910,22 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
+	if (WIN32)
+		add_test(NAME guest_red_zone_tracker
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-tracker-only)
+	endif()
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
+	add_test(NAME guest_clock_shadow
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --guest-clock-shadow-only)
+	set_tests_properties(guest_clock_shadow PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1;KYTY_GUEST_CLOCK_PROFILE=1")
+	add_test(NAME guest_clock_publish
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --guest-clock-publish-only)
+	set_tests_properties(guest_clock_publish PROPERTIES ENVIRONMENT "KYTY_SUBMIT_PROFILE=1;KYTY_EXPERIMENT=no-gpu-timestamps")
 	add_test(NAME wait_until_safe_for_rendering
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wait-until-safe-for-rendering-only)
 	add_test(NAME pm4_flip
@@ -848,6 +970,8 @@ if(BUILD_TESTING)
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS
+		vk_recorder_tests
+		gpu_thread_sampler_tests
 		render_stage_profile_tests
 		submit_profile_tests
 		submit_profile_runtime_tests
@@ -869,6 +993,9 @@ if(BUILD_TESTING)
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests
+		stall_dump_tests
+		bank_io_trace_tests
+		frame_trace_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
@@ -887,7 +1014,7 @@ if(BUILD_TESTING)
 		http_uri_parse_tests
 	)
 	if(WIN32)
-		add_dependencies(kyty_tests windows_file_read_tests)
+		add_dependencies(kyty_tests windows_file_read_tests windows_long_path_tests)
 	endif()
 endif()
 

@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/SrtDescriptorProbe.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
@@ -16,15 +17,25 @@
 #include <functional>
 #include <numeric>
 #include <unordered_set>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 
+thread_local bool quiet_control_retry = false;
+
+struct ControlRetryDiagnostics {
+	bool previous;
+	explicit ControlRetryDiagnostics(bool retry): previous(std::exchange(quiet_control_retry, retry)) {}
+	~ControlRetryDiagnostics() { quiet_control_retry = previous; }
+};
+
 bool SpecializationFail(std::string_view message) {
-	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
-	             static_cast<int>(message.size()), message.data());
+	if (!quiet_control_retry)
+		std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
+		             static_cast<int>(message.size()), message.data());
 	return false;
 }
 
@@ -1752,19 +1763,68 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	}
 }
 
+// Counts each observed plan/site once per window, even when learning happened
+// before recording was enabled. A plan may enter and leave fallback in a window;
+// fallback_plans counts it once if it used fallback at any observation.
+static void ProfileWalkerControl(const ResourcePlan& program) {
+	using namespace Common::SubmitProfile;
+	if (!Recording() || program.walker_control_disabled.empty()) return;
+	auto& history = program.walker_control_history;
+	const auto generation = Detail::generation.load(std::memory_order_relaxed);
+	if (history.profile_generation != generation) {
+		history.profile_generation = generation;
+		history.profile_flags = 0;
+		history.profile_learned = 0;
+	}
+	if (!(history.profile_flags & 1u)) {
+		history.profile_flags |= 1u;
+		AddExtra(Extra::WalkerControlPlans);
+	}
+	if (history.learned_sites > history.profile_learned) {
+		AddExtra(Extra::WalkerControlLearnedSites, history.learned_sites - history.profile_learned);
+		history.profile_learned = history.learned_sites;
+	}
+	if (program.walker_control_rejected && !(history.profile_flags & 2u)) {
+		history.profile_flags |= 2u;
+		AddExtra(Extra::WalkerControlFallbackPlans);
+	}
+}
+
 template <bool Profile>
 static bool MaterializeWithControlFallback(const ResourcePlan& program, const SrtRuntime& runtime,
                                            ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
-	if (MaterializeResourcesImpl<Profile>(program, runtime, snapshot, specialization)) return true;
 	using namespace Common::SubmitProfile;
-	if (program.walker_control_rejected ||
-	    std::ranges::none_of(program.walker_control_disabled, [](uint8_t v) { return v != 0; })) return false;
-	// Conservatively keeping both branches may expose a descriptor that cannot be
-	// represented by the host. Retire adaptation for this plan and retry the exact
-	// original pruning, rather than closing a game which previously worked.
-	program.walker_control_rejected = true;
-	AddExtra(Extra::WalkerControlFallbacks);
-	return MaterializeResourcesImpl<Profile>(program, runtime, snapshot, specialization);
+	auto& history = program.walker_control_history;
+	bool retry = false;
+	const bool disabled = ExperimentActive(Experiment::NoWalkerControlGpu);
+	if (program.walker_control_rejected && !disabled) {
+		if (history.retry_remaining != 0) --history.retry_remaining;
+		else {
+			program.walker_control_rejected = false;
+			retry = true;
+			AddExtra(Extra::WalkerControlRetries);
+		}
+	}
+	bool success;
+	if (retry) {
+		// Repeated probes must not flood stderr. If original pruning also fails,
+		// that second attempt still emits the normal failure diagnostic.
+		ControlRetryDiagnostics diagnostic(true);
+		success = MaterializeResourcesImpl<Profile>(program, runtime, snapshot, specialization);
+	} else success = MaterializeResourcesImpl<Profile>(program, runtime, snapshot, specialization);
+	if (success && retry) AddExtra(Extra::WalkerControlRecoveries);
+	if (!success && !disabled && !program.walker_control_rejected && history.learned_sites != 0) {
+		// Expanded branches can expose provisional/unrepresentable descriptors.
+		// Preserve learned sites, use original pruning now, and retry in bounded
+		// materialization calls. No clocks, frame dependency or permanent blacklist.
+		program.walker_control_rejected = true;
+		history.retry_remaining = ResourcePlan::WalkerControlHistory::RetryInterval;
+		AddExtra(Extra::WalkerControlFallbacks);
+		success = MaterializeResourcesImpl<Profile>(program, runtime, snapshot, specialization);
+	}
+	ProfileWalkerControl(program);
+	if (success) SrtDescriptorProbe::Observe(program, snapshot);
+	return success;
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
@@ -2127,7 +2187,7 @@ template <class S, class P> void IoPlan(S& io, P& plan) {
 	       selector_groups, control_flow, control_phis, srt_reads, source_reads, capture_specialization_reads,
 	       srt_plan_complete, resource_tracking_complete, info, uniform_fill,
 	       // Derived on load.
-	       srt_code, walker_read_sites, walker_control_disabled, walker_control_rejected,
+	       srt_code, walker_read_sites, walker_control_disabled, walker_control_rejected, walker_control_history,
 	       srt_user_data, srt_captures, srt_scratch, material_keys,
 	       selector_keys] = plan;
 	IoValues(io, values, control_phis);

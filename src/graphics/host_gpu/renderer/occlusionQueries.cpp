@@ -1,3 +1,4 @@
+#include "common/gpuThreadSampler.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 
 #include "graphics/host_gpu/graphicContext.h"
@@ -19,6 +20,7 @@ OcclusionQueries::OcclusionQueries(GraphicContext& graphics, CommandScheduler& s
 	const vk::QueryPoolCreateInfo info {.queryType  = vk::QueryType::eOcclusion,
 	                                    .queryCount = QUERY_COUNT};
 	RequireVulkanSuccess(m_device.createQueryPool(&info, nullptr, &m_pool), "vkCreateQueryPool");
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	m_device.resetQueryPool(m_pool, 0, QUERY_COUNT);
 	m_results.resize(QUERY_COUNT);
 	if (graphics.occlusion_query_precise_enabled) {
@@ -32,14 +34,22 @@ OcclusionQueries::~OcclusionQueries() {
 	}
 }
 
-int32_t OcclusionQueries::BeginQuery(vk::CommandBuffer command) {
+int32_t OcclusionQueries::BeginQuery(const CommandBuffer& command) {
 	if (m_begun - m_read == QUERY_COUNT) {
 		m_uncounted++;
 		return -1;
 	}
 	const auto query = static_cast<uint32_t>(m_begun++ % QUERY_COUNT);
-	command.beginQuery(m_pool, query, m_control);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
+	command.BeginQuery(m_pool, query, m_control);
 	return static_cast<int32_t>(query);
+}
+
+void OcclusionQueries::End(const CommandBuffer& command, int32_t query) const {
+	if (query >= 0) {
+		Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
+		command.EndQuery(m_pool, static_cast<uint32_t>(query));
+	}
 }
 
 void OcclusionQueries::Dump(uint64_t address) {
@@ -65,6 +75,7 @@ void OcclusionQueries::PublishDumps() {
 				                             m_results.data() + first, sizeof(uint64_t),
 				                             vk::QueryResultFlagBits::e64),
 			    "vkGetQueryPoolResults");
+			Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 			m_device.resetQueryPool(m_pool, first, count);
 			read += count;
 		}

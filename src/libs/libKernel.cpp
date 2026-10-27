@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
+#include "common/stallDump.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/eventFlag.h"
@@ -2091,12 +2092,16 @@ static void LogExperimentalSyncOnAddress(std::atomic_bool& logged, const char* f
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWait(volatile uint32_t* address, uint32_t expected,
                                           const uint32_t* timeout_micros) {
+	Common::StallDump::Note("SyncWait.caller", reinterpret_cast<uintptr_t>(address),
+	                        reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
 	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
 }
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWait32(volatile uint32_t* address, uint32_t expected,
                                             const uint32_t* timeout_micros) {
+	Common::StallDump::Note("SyncWait32.caller", reinterpret_cast<uintptr_t>(address),
+	                        reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 	static std::atomic_bool logged {false};
 	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait32");
 	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
@@ -2105,6 +2110,8 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWait32(volatile uint32_t* address, uint32_t
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWait64(volatile uint64_t* address, uint64_t expected,
                                             const uint32_t* timeout_micros) {
+	Common::StallDump::Note("SyncWait64.caller", reinterpret_cast<uintptr_t>(address),
+	                        reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 	static std::atomic_bool logged {false};
 	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait64");
 	return LibKernel::SyncOnAddress::Wait64(address, expected, timeout_micros,
@@ -2124,6 +2131,8 @@ int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
 
 	switch (operation) {
 		case UMTX_OP_WAIT:
+			Common::StallDump::Note("UmtxWait.caller", reinterpret_cast<uintptr_t>(address),
+			                        reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 			if (timeout != nullptr) {
 				LibKernel::KernelTimespec duration {};
 				std::memcpy(&duration, timeout, sizeof(duration));

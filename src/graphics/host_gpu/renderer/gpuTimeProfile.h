@@ -1,12 +1,23 @@
 #pragma once
 
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "common/readbackProfile.h"
 #include <array>
 #include <cstdint>
 
 namespace Libs::Graphics {
 class CommandScheduler;
+class CommandBuffer;
 struct GraphicContext;
+struct ImageInfo;
+void RecordIndirectImageWorkImpl(Common::ReadbackProfile::DrawWork::Op op, const ImageInfo& info,
+                                 uint32_t flags, uint64_t bytes);
+inline void RecordIndirectImageWork(Common::ReadbackProfile::DrawWork::Op op, const ImageInfo& info,
+                                    uint32_t flags = 0, uint64_t bytes = 0) {
+	if ((Common::ReadbackProfile::DrawWork::record || Common::ReadbackProfile::DrawWork::watched_count ||
+	     Common::ReadbackProfile::DrawWork::IsImageTransfer(op)) &&
+	    Common::ReadbackProfile::Enabled()) RecordIndirectImageWorkImpl(op, info, flags, bytes);
+}
 
 // Opt-in GPU elapsed-time sampling with Vulkan timestamps, active only while SubmitProfile records.
 // One block of queries per command buffer of the owning scheduler: reset when the command buffer
@@ -17,7 +28,11 @@ struct GraphicContext;
 // exclusive costs nor a serial "work per frame".
 class GpuTimeProfile {
 public:
-	enum class Category : uint8_t { Detile, TextureUpload, DepthDetile, DepthConvert, DepthUpload, Count };
+	enum class Category : uint8_t {
+		Detile, TextureUpload, DepthDetile, DepthConvert, DepthUpload,
+		IndirectMeshConvert, IndirectMeshPrepare, IndirectMeshEmit,
+		IndirectPrechecks, IndirectDiscovery, Count
+	};
 
 	explicit GpuTimeProfile(GraphicContext& graphics);
 	~GpuTimeProfile();
@@ -26,18 +41,39 @@ public:
 
 	void SetOwner(CommandScheduler* owner) { m_owner = owner; }
 	// Right after the scheduler began a new command buffer.
-	void OnBegin(CommandScheduler& scheduler, vk::CommandBuffer command);
+	void OnBegin(CommandScheduler& scheduler, const CommandBuffer& command);
 	// Right before the scheduler ends the command buffer that will signal `tick`.
-	void OnSubmit(CommandScheduler& scheduler, vk::CommandBuffer command, uint64_t tick);
+	void OnSubmit(CommandScheduler& scheduler, const CommandBuffer& command, uint64_t tick);
 
 	struct Token {
 		uint32_t query      = UINT32_MAX;
 		uint64_t generation = 0; // Command buffer recording that wrote the begin timestamp.
 	};
-	Token Begin(CommandScheduler& scheduler, vk::CommandBuffer command);
-	void  End(CommandScheduler& scheduler, vk::CommandBuffer command, Token token, Category category);
+	Token Begin(CommandScheduler& scheduler, const CommandBuffer& command);
+	void  End(CommandScheduler& scheduler, const CommandBuffer& command, Token token, Category category);
+
+	// Shadow observations only: never publish a Vulkan clock into guest memory.
+	// CPU reference values and native GPU timestamps have different epochs.
+	static bool GuestClockRecording();
+	struct GuestClockSample {
+		uint64_t address = 0, cpu_reference = 0, submit = 0;
+		uint32_t frame = 0, bytes = 0, control = 0, event = 0;
+		int queue = 0;
+		bool release = false;
+	};
+	void ObserveGuestClock(CommandScheduler& scheduler, GuestClockSample sample);
 
 private:
+	friend struct GpuTimeProfileTestAccess;
+	static constexpr uint32_t GuestClockSlots = 256;
+	static constexpr uint32_t GuestClockLimit = 8192;
+	void InitializeGuestClock(const CommandBuffer& command);
+	vk::QueryPool m_clock_pool;
+	uint64_t m_clock_mask = 0, m_clock_window = UINT64_MAX, m_clock_sequence = 0;
+	uint64_t m_clock_completed = 0, m_clock_failed = 0;
+	uint32_t m_clock_attempts = 0, m_clock_capacity_drops = 0, m_clock_pending = 0;
+	bool m_clock_unavailable = false, m_clock_limit_reported = false;
+	double m_clock_period_ns = 0;
 	static constexpr uint32_t Blocks        = 512;
 	static constexpr uint32_t SlotsPerBlock = 32;
 	struct Block {
@@ -46,9 +82,17 @@ private:
 		uint64_t session    = 0; // Profile session (recording period) the block belongs to.
 		uint32_t used       = 0;
 		uint32_t ended      = 0; // Bit per pair after the first: closed in the same recording.
+		bool timeline = false;
+		uint64_t frame = 0, submission = 0;
 		std::array<uint8_t, SlotsPerBlock / 2> categories {};
 	};
 	void Poll(CommandScheduler& scheduler);
+	void CalibrateTimeline();
+	bool TimelineTime(uint64_t native, uint64_t& host) const;
+	bool m_timeline_calibration_tried = false, m_timeline_calibrated = false;
+	bool m_timeline_native_unavailable = false;
+	uint64_t m_timeline_native = 0, m_timeline_host = 0, m_timeline_frequency = 0;
+	uint32_t m_timeline_pending = 0;
 
 	GraphicContext&           m_graphics;
 	CommandScheduler*         m_owner = nullptr;

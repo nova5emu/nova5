@@ -33,6 +33,8 @@ public:
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
 	// Retries blocked submissions now instead of after the 100 ms stall timeout.
 	void               Wake();
+	// Native clock queries completed: harvest on the command lane, even while idle.
+	void               WakeClockCompletions();
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> commands);
@@ -64,6 +66,7 @@ private:
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id    = 0;
 		uint64_t                  profile_blocked_ns = 0; // SubmitProfile only.
+		uint64_t                  timeline_frame = 0, timeline_submission = 0;
 	};
 
 	void              Enqueue(Submission submission);
@@ -86,6 +89,7 @@ private:
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_wake_pending      = false;
+	bool                                           m_clock_completions = false;
 	bool                                           m_shutdown_complete = false;
 	// Completion callbacks can outlive GuestGpu during renderer shutdown.
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
@@ -95,6 +99,10 @@ private:
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
 	uint64_t        m_submit_id = 0;
+	// Diagnostic epochs are assigned under m_queue_mutex, not inferred from
+	// when a worker happens to observe the guest's frame counter.
+	std::atomic<uint64_t> m_timeline_frame {1};
+	uint64_t m_timeline_submission = 0;
 	std::atomic_int m_done_num  = 0;
 	std::jthread    m_thread;
 

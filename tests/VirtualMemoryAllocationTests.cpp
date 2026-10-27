@@ -1,9 +1,11 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/singleton.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/memoryTracker.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -197,6 +199,129 @@ void InitSubsystems() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void* g_red_zone_fault_page = nullptr;
+
+Libs::Graphics::MemoryTracker* g_red_zone_tracker = nullptr;
+uint64_t g_red_zone_tracker_address = 0;
+unsigned g_red_zone_tracker_faults = 0;
+uintptr_t g_red_zone_tracker_pc = 0;
+bool g_red_zone_inject_clobber = false;
+bool g_red_zone_unexpected_flush = false;
+
+LONG CALLBACK RedZoneTrackedWriteHandler(EXCEPTION_POINTERS* exception) {
+	if (exception == nullptr || exception->ExceptionRecord == nullptr ||
+	    exception->ContextRecord == nullptr || g_red_zone_tracker == nullptr ||
+	    exception->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+	    exception->ExceptionRecord->NumberParameters < 2 ||
+	    exception->ExceptionRecord->ExceptionInformation[0] != 1 ||
+	    exception->ExceptionRecord->ExceptionInformation[1] != g_red_zone_tracker_address) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	++g_red_zone_tracker_faults;
+	g_red_zone_tracker_pc = exception->ContextRecord->Rip;
+	// Separate real Windows delivery from the deterministic hostile-footprint
+	// case. Never use the injected case as evidence that Windows did the damage.
+	if (g_red_zone_inject_clobber) {
+		*reinterpret_cast<uint64_t*>(exception->ContextRecord->Rsp - 24) = 0;
+	}
+	g_red_zone_tracker->InvalidateRegion(g_red_zone_tracker_address, 8, []() noexcept {
+		g_red_zone_unexpected_flush = true;
+	});
+	return g_red_zone_unexpected_flush ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// Run in its own CTest process: initializes actual guest pthreads and their
+// guest stacks. No GPU/device is required; PageManager/MemoryTracker are real.
+void TestWindowsGuestRedZoneTrackedWrite() {
+	const char* test = "WindowsGuestRedZoneTrackedWrite";
+	using namespace Libs::Graphics;
+	using namespace Libs::LibKernel;
+	constexpr uint64_t code_size = 0x4000, trampoline_size = 0x4000, data_size = 0x4000;
+	constexpr uint64_t sentinel = 0x1122334455667700ull;
+	const auto mapping = Memory::AllocateProgramMemory(
+	    0x0000000902010000ull, code_size + trampoline_size + data_size,
+	    Common::VirtualMemory::Mode::ExecuteReadWrite, "red_zone_tracker_test");
+	Check(test, mapping != 0, "failed to allocate code/trampoline/tracked page");
+	const auto watched = mapping + code_size + trampoline_size;
+	Common::Singleton<Loader::RuntimeLinker>::Instance();
+	Libs::LibKernel::Initialize();
+	PthreadInitSelfForMainThread();
+	PageManager pages;
+	MemoryTracker tracker(pages);
+	g_red_zone_tracker = &tracker;
+	g_red_zone_tracker_address = watched;
+	g_red_zone_unexpected_flush = false;
+	auto* handler = AddVectoredExceptionHandler(1, RedZoneTrackedWriteHandler);
+	Check(test, handler != nullptr, "failed to install tracker fault handler");
+
+	Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+	for (int i = 0; i < 16; ++i) {
+		code.mov(code.rax, sentinel + i);
+		code.mov(code.qword[code.rsp - 8 * (i + 1)], code.rax);
+	}
+	code.mov(code.r11, watched);
+	const auto write_pc = reinterpret_cast<uintptr_t>(code.getCurr());
+	code.mov(code.qword[code.r11], 0x1234); // Real tracker-induced write fault.
+	for (int i = 0; i < 16; ++i) {
+		code.mov(code.rax, code.qword[code.rsp - 8 * (i + 1)]);
+		code.mov(code.qword[code.rdi + 8 * i], code.rax);
+	}
+	code.xor_(code.eax, code.eax);
+	code.ret();
+	Check(test, Xbyak::GetError() == 0 &&
+	            Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
+	      "failed to generate/flush guest function");
+
+	const auto run = [&](bool inject, bool patched) {
+		g_red_zone_inject_clobber = inject;
+		g_red_zone_tracker_faults = 0;
+		g_red_zone_tracker_pc = 0;
+		tracker.ForEachUploadRange(watched, 8, false,
+		    [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+		MEMORY_BASIC_INFORMATION memory {};
+		Check(test, VirtualQuery(reinterpret_cast<void*>(watched), &memory, sizeof(memory)) &&
+		                (memory.Protect & 0xff) == PAGE_READONLY,
+		      "tracker did not arm write protection");
+		std::array<uint64_t, 16> output {};
+		Pthread thread = nullptr;
+		CheckOk(test, PthreadCreate(&thread, nullptr, reinterpret_cast<pthread_entry_func_t>(mapping),
+		                           output.data(), "RedZoneTracker"), "create guest thread");
+		void* result = reinterpret_cast<void*>(1);
+		CheckOk(test, PthreadJoin(thread, &result), "join guest thread");
+		Check(test, result == nullptr && g_red_zone_tracker_faults == 1 &&
+		                !g_red_zone_unexpected_flush && tracker.IsRegionCpuModified(watched, 8) &&
+		                *reinterpret_cast<const uint64_t*>(watched) == 0x1234,
+		      "tracked write did not fault exactly once and complete");
+		Check(test, patched ? (g_red_zone_tracker_pc >= mapping + code_size &&
+		                      g_red_zone_tracker_pc < mapping + code_size + trampoline_size)
+		                    : g_red_zone_tracker_pc == write_pc,
+		      "fault occurred outside the expected original/protected instruction");
+		unsigned changed = 0;
+		for (size_t i = 0; i < output.size(); ++i) changed += output[i] != sentinel + i;
+		std::printf("[host]    red-zone tracker patched=%d injected=%d faults=%u changed_qwords=%u\n",
+		            patched, inject, g_red_zone_tracker_faults, changed);
+		return changed;
+	};
+	// Baseline is observational: Windows versions need not overwrite the same
+	// bytes. Only the injected baseline is required to reproduce corruption.
+	(void)run(false, false);
+	const bool reproduced = run(true, false) != 0;
+	Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), code_size,
+	    reinterpret_cast<void*>(mapping + code_size), trampoline_size);
+	const std::array<uintptr_t, 1> starts {static_cast<uintptr_t>(mapping)};
+	const auto patches = Loader::PatchGuestInstructions(mapping, code.getSize(), starts, true, false);
+	const bool actual_preserved = run(false, true) == 0;
+	const bool injected_preserved = run(true, true) == 0;
+	tracker.UntrackMemory(watched, data_size);
+	RemoveVectoredExceptionHandler(handler);
+	g_red_zone_tracker = nullptr;
+	Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
+	const bool freed = Memory::FreeGuestMemory(mapping, code_size + trampoline_size + data_size);
+	Check(test, reproduced && actual_preserved && injected_preserved && freed &&
+	                patches.patched_memory_instruction_count != 0 &&
+	                patches.unrelocatable_memory_instruction_count == 0,
+	      "protected tracker fault damaged red zone, or fixture was not covered");
+	std::printf("[host]    %-48s ok\n", test);
+}
 
 LONG CALLBACK RedZoneFaultHandler(EXCEPTION_POINTERS* exception) {
 	if (exception == nullptr || exception->ExceptionRecord == nullptr ||
@@ -4910,6 +5035,12 @@ void TestTlsStubsPreserveFlags() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--red-zone-tracker-only") == 0) {
+		RunTest(TestWindowsGuestRedZoneTrackedWrite);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 	if (argc == 2 && std::strcmp(argv[1], "--virtual-ranges-only") == 0) {
 		RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 		RunTest(TestFlexibleRangeEditsCoalesce);

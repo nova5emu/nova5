@@ -1,3 +1,4 @@
+#define KYTY_STALL_HLE
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -173,9 +174,13 @@ static int KYTY_SYSV_ABI SystemServiceReceiveEvent(SystemServiceEvent* event) {
 
 	std::scoped_lock lock(g_event_mutex);
 	if (g_events.empty()) {
+		Common::StallDump::Note("SystemService.no_event");
+		Common::StallDump::Observe("SystemService.no_event");
 		return SYSTEM_SERVICE_ERROR_NO_EVENT;
 	}
 	event->event_type = g_events.front();
+	Common::StallDump::Note("SystemService.event", 0, static_cast<uint32_t>(event->event_type));
+	Common::StallDump::Observe("SystemService.event", 0, static_cast<uint32_t>(event->event_type));
 	g_events.pop_front();
 	LOGF("\t SystemService event = 0x%08x\n", static_cast<uint32_t>(event->event_type));
 	return OK;
@@ -196,6 +201,14 @@ static int KYTY_SYSV_ABI SystemServiceGetStatus(SystemServiceStatus* status) {
 		std::scoped_lock lock(g_event_mutex);
 		status->event_num = static_cast<int32_t>(g_events.size());
 	}
+	Common::StallDump::Note("SystemService.status", 0,
+	                         uint64_t(status->is_system_ui_overlaid) |
+	                         (uint64_t(status->is_in_background_execution) << 1) |
+	                         (uint64_t(status->event_num) << 32));
+	Common::StallDump::Observe("SystemService.status", 0,
+	                           uint64_t(status->is_system_ui_overlaid) |
+	                               (uint64_t(status->is_in_background_execution) << 1) |
+	                               (uint64_t(status->event_num) << 32));
 
 	return OK;
 }

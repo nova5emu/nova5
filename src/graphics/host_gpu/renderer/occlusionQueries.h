@@ -1,3 +1,4 @@
+#include "common/gpuThreadSampler.h"
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_OCCLUSIONQUERIES_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_OCCLUSIONQUERIES_H_
 
@@ -10,6 +11,7 @@
 namespace Libs::Graphics {
 
 class CommandScheduler;
+class CommandBuffer;
 struct GraphicContext;
 
 // The guest's query results (16-byte aligned): a begin/end pair of running z-pass counters per DB,
@@ -38,14 +40,10 @@ public:
 	[[nodiscard]] bool Enabled() const { return m_pool != nullptr; }
 
 	// In the draw's rendering: the query that counts its samples, or -1.
-	[[nodiscard]] int32_t Begin(vk::CommandBuffer command) {
+	[[nodiscard]] int32_t Begin(const CommandBuffer& command) {
 		return m_open == 0 ? -1 : BeginQuery(command);
 	}
-	void End(vk::CommandBuffer command, int32_t query) const {
-		if (query >= 0) {
-			command.endQuery(m_pool, static_cast<uint32_t>(query));
-		}
-	}
+	void End(const CommandBuffer& command, int32_t query) const;
 
 	// A PIXEL_PIPE_STAT_DUMP to address, after the draws recorded so far.
 	void Dump(uint64_t address);
@@ -64,7 +62,7 @@ private:
 		uint64_t uncounted;
 	};
 
-	int32_t BeginQuery(vk::CommandBuffer command);
+	int32_t BeginQuery(const CommandBuffer& command);
 	void    PublishDumps();
 
 	CommandScheduler&        m_scheduler;

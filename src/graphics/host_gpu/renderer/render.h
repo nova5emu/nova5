@@ -6,9 +6,11 @@
 #include "common/common.h"
 #include "common/submitProfile.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/bindingEmission.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/nativeCommands.h"
 
 #include <array>
 #include <memory>
@@ -30,6 +32,8 @@ struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 class RenderContext;
 class CommandScheduler;
+struct DynamicState;
+namespace VkRecording { class Backend; }
 class Buffer;
 struct RenderExecutorTestAccess;
 struct IndirectCountClamp;
@@ -61,6 +65,10 @@ struct IndirectCountSnapshot {
 	uint64_t tick = 0;
 };
 IndirectCountSnapshot SnapshotIndirectCount(RenderContext& context, uint64_t address, uint32_t max_count);
+// Diagnostic snapshot: GPU-ordered, never reads guest arguments on the CPU.
+// Returns null for oversized diagnostics; legacy callers must then use CPU fallback.
+std::shared_ptr<Buffer> SnapshotIndirectIndexedArgs(RenderContext& context,
+    const DrawIndirectArgs& args, uint32_t index_limit, bool legacy_clamp);
 
 // 3 task-count dwords, 7 mesh parameters, status, then the 5 original draw dwords.
 // Exposed for the differential GPU tests; the buffer lives through its submission.
@@ -133,8 +141,37 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	void EmitBindings(const VkRecording::BindingEmission& emission) const;
+	// Typed emission boundary for clock/profile queries. Callers retain this
+	// facade, never a native handle across a preparation that can rotate it.
+	void ResetQueryPool(vk::QueryPool pool, uint32_t first, uint32_t count) const;
+	void WriteTimestamp(vk::PipelineStageFlagBits stage, vk::QueryPool pool, uint32_t query) const;
+	void BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline) const;
+	void PushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t offset,
+	                   uint32_t bytes, const void* data) const;
+	void BindVertexBuffers(uint32_t first, uint32_t count, const vk::Buffer* buffers,
+	                       const uint64_t* offsets, const uint64_t* sizes) const;
+	void BindIndexBuffer(vk::Buffer buffer, uint64_t offset, uint64_t size, vk::IndexType type, bool bounded) const;
+	void CommitDynamicState(DynamicState& state) const;
+	void Barrier(const vk::DependencyInfo& info) const;
+	void EmitMemoryBarrier(vk::PipelineStageFlags source, vk::PipelineStageFlags destination,
+	                   const vk::MemoryBarrier& barrier) const;
+	void Draw(uint32_t count, uint32_t instances, uint32_t first, uint32_t first_instance) const;
+	void DrawIndexed(uint32_t count, uint32_t instances, uint32_t first, int32_t vertex, uint32_t first_instance) const;
+	void DrawIndirect(vk::Buffer buffer, uint64_t offset, uint32_t count, uint32_t stride) const;
+	void DrawIndexedIndirect(vk::Buffer buffer, uint64_t offset, uint32_t count, uint32_t stride) const;
+	void DrawIndirectCount(vk::Buffer buffer, uint64_t offset, vk::Buffer counts, uint64_t count_offset, uint32_t count, uint32_t stride) const;
+	void DrawIndexedIndirectCount(vk::Buffer buffer, uint64_t offset, vk::Buffer counts, uint64_t count_offset, uint32_t count, uint32_t stride) const;
+	void DrawMeshTasks(uint32_t x, uint32_t y, uint32_t z) const;
+	void DrawMeshTasksIndirect(vk::Buffer buffer, uint64_t offset, uint32_t count, uint32_t stride) const;
+	void Dispatch(uint32_t x, uint32_t y, uint32_t z) const;
+	void DispatchBase(uint32_t bx, uint32_t by, uint32_t bz, uint32_t x, uint32_t y, uint32_t z) const;
+	void DispatchIndirect(vk::Buffer buffer, uint64_t offset) const;
+	void BeginQuery(vk::QueryPool pool, uint32_t query, vk::QueryControlFlags flags) const;
+	void EndQuery(vk::QueryPool pool, uint32_t query) const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	[[nodiscard]] NativeCommands Commands() const { return NativeCommands(*this); }
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -155,6 +192,9 @@ private:
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
 	vk::CommandBuffer   m_buffer          = nullptr;
+	// Non-null only while this facade represents an open worker command. No raw
+	// handle may escape in that state, even after a recording drain.
+	VkRecording::Backend* m_recorder = nullptr;
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
 	uint32_t            m_debug_arg0      = 0;
@@ -169,10 +209,13 @@ private:
 	HW::Shader*         m_shaders     = nullptr;
 
 	friend class CommandScheduler;
+	friend class NativeCommands;
+	friend struct GuestClockTestAccess;
 };
 
 class RenderExecutor {
 	friend IndirectCountSnapshot SnapshotIndirectCount(RenderContext&, uint64_t, uint32_t);
+	friend std::shared_ptr<Buffer> SnapshotIndirectIndexedArgs(RenderContext&, const DrawIndirectArgs&, uint32_t, bool);
 	friend std::shared_ptr<Buffer> ConvertIndirectMeshArgs(RenderContext&, uint64_t,
 	    const ShaderMeshInputInfo&, uint32_t, uint64_t, uint32_t, uint64_t, bool);
 public:
@@ -192,6 +235,12 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+	// Coherence, heap uploads, transitions and set allocation stay on the GPU
+	// producer. This may rotate the command buffer. Consume the returned view
+	// immediately; only BindingEmission::Enqueue may hand its copied bytes off.
+	[[nodiscard]] VkRecording::BindingEmission PrepareBindingEmission(
+	    CommandBuffer& buffer, vk::PipelineBindPoint point, const PipelineCache::Pipeline& pipeline,
+	    std::span<PreparedBindings* const> bindings);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 
@@ -256,6 +305,8 @@ private:
 	std::unique_ptr<ImageDescriptionCache> m_image_descriptions;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	std::array<vk::DescriptorBufferInfo, 2> m_address_descriptors;
+	ShaderRecompiler::IR::PushData m_binding_push_data;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

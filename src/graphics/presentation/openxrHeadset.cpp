@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/nativeCommands.h"
 #include "graphics/presentation/openxrHeadset.h"
 
 #include "common/emulatorConfig.h"
@@ -142,7 +143,7 @@ constexpr Access COLOR_ATTACHMENT {vk::PipelineStageFlagBits2::eColorAttachmentO
                                    vk::AccessFlagBits2::eColorAttachmentRead |
                                        vk::AccessFlagBits2::eColorAttachmentWrite};
 
-void Barrier(vk::CommandBuffer command, vk::Image image, vk::ImageLayout from, vk::ImageLayout to,
+void Barrier(Libs::Graphics::NativeCommands command, vk::Image image, vk::ImageLayout from, vk::ImageLayout to,
              uint32_t layers, Access src, Access dst) {
 	vk::ImageMemoryBarrier2 barrier {};
 	barrier.srcStageMask        = src.stage;
@@ -737,7 +738,7 @@ void OpenXrQueueEyeSource(CommandBuffer& command, const VulkanImage& source) {
 		index++;
 	}
 	auto&      slot       = g.staging[index];
-	const auto vk_command = command.Handle();
+	const auto vk_command = command.Commands();
 	Barrier(vk_command, slot.image.image, vk::ImageLayout::eUndefined,
 	        vk::ImageLayout::eTransferDstOptimal, 1, TRANSFER, TRANSFER_WRITE);
 	vk::ImageBlit blit {};

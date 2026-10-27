@@ -1,3 +1,5 @@
+#include "common/gpuThreadSampler.h"
+#include "common/frameTimeline.h"
 #include "common/renderStageProfile.h"
 #include "common/readbackProfile.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
@@ -55,6 +57,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		return;
 	}
 
+
+	Common::GpuThreadSampler::ImmediateScope boundary_immediate {Common::GpuThreadSampler::Boundary::TimelineWait};
+	Common::FrameTimeline::WaitScope timeline(Common::FrameTimeline::Kind::NativeWaitBegin,
+	    Common::FrameTimeline::Kind::NativeWaitEnd, tick);
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;
 	wait_info.pSemaphores    = &m_semaphore;

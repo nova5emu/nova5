@@ -9,6 +9,14 @@
 
 #include <fmt/format.h>
 
+// Selected subsystems opt in; do not trace clocks, TLS, or every hot HLE call.
+#ifdef KYTY_STALL_HLE
+#include "common/stallDump.h"
+#define STALL_HLE_SCOPE() Common::StallDump::Scope stall_hle_scope(__func__);
+#else
+#define STALL_HLE_SCOPE()
+#endif
+
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME_ENABLED g_print_name
 
@@ -50,6 +58,7 @@
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME()                                                                               \
+	STALL_HLE_SCOPE()                                                                               \
 	if (PRINT_NAME_ENABLED) {                                                                      \
 		Libs::PrintName(g_library, g_module, __func__);                                              \
 	}

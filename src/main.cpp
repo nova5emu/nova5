@@ -4,6 +4,7 @@
 #include "common/debug.h"
 #include "common/file.h"
 #include "common/stringUtils.h"
+#include "common/stallDump.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "emulator.h"
@@ -455,6 +456,7 @@ static int Main(int argc, char* argv[]) {
 		return 0;
 	}
 
+	Common::StallDump::Initialize();
 	Run(options);
 
 	return 0;

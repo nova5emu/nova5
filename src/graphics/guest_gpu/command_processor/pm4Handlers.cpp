@@ -1485,7 +1485,7 @@ KYTY_CP_OP_PARSER(CpOpCopyData) {
 			     " dst_sel=0x%02" PRIx32 " dst=0x%016" PRIx64 " size=%u\n",
 			     src_sel, dst_sel, dst, num_bytes);
 		}
-		cp.WriteReferenceClock(dst, num_bytes);
+		cp.WriteReferenceClock(dst, num_bytes, control);
 		return 5;
 	}
 	const auto dma_src = CopyDataSrcToDma(src_sel);
@@ -2054,7 +2054,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	cp.ReleaseMem(
 	    (buffer[1] >> 29u) & 0x7u, (buffer[1] >> 24u) & 0x7u,
 	    reinterpret_cast<void*>((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u)),
-	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu);
+	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu, buffer[0], buffer[1]);
 
 	return 7;
 }

@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_PRESENTATION_DDSIMAGE_H_
 #define EMULATOR_SRC_GRAPHICS_PRESENTATION_DDSIMAGE_H_
 
+#include "graphics/host_gpu/renderer/nativeCommands.h"
+
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
 
@@ -15,7 +17,7 @@ public:
 	KYTY_CLASS_NO_COPY(DdsImage);
 
 	bool                       Load(const std::filesystem::path& path);
-	void                       Upload(vk::CommandBuffer command);
+	void                       Upload(NativeCommands command);
 	[[nodiscard]] ImTextureRef Texture() const;
 
 private:

@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "common/submitProfile.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -618,6 +619,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	graphics.conditional_rendering_enabled =
 	    conditional_rendering_extension && conditional_rendering.conditionalRendering;
+	LOGF("Vulkan conditional rendering support: %s\n",
+	     graphics.conditional_rendering_enabled ? "true" : "false");
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
@@ -1116,6 +1119,19 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		if (Common::SubmitProfile::ExperimentSelected(Common::SubmitProfile::Experiment::GuestHostImport) &&
+		    HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+			graphic_ctx.guest_host_import_enabled = true;
+			vk::PhysicalDeviceExternalMemoryHostPropertiesEXT host {};
+			vk::PhysicalDeviceProperties2 props {}; props.pNext = &host;
+			graphic_ctx.physical_device.getProperties2(&props);
+			graphic_ctx.host_import_alignment = host.minImportedHostPointerAlignment;
+		}
+		if (HasExtension(available_extensions, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+			graphic_ctx.calibrated_timestamps_enabled = true;
 		}
 		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME, VK_KHR_MAINTENANCE_5_EXTENSION_NAME,
 		                             VK_KHR_SHADER_CLOCK_EXTENSION_NAME,

@@ -1,3 +1,4 @@
+#include "common/gpuThreadSampler.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 
 #include "common/assert.h"
@@ -149,7 +150,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	const auto destination_view  = destination.FindView(destination_view_info);
 
 	auto& command_buffer = m_scheduler.Current();
-	auto  command        = command_buffer.Handle();
+	auto  command        = command_buffer.Commands();
 	source.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
 	               command);
 	destination.Transit(ColorToMsDepthLayout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {},
@@ -166,6 +167,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	rendering.renderArea.extent = {destination_info.extent.width, destination_info.extent.height};
 	rendering.layerCount        = 1;
 	rendering.pDepthAttachment  = &depth_attachment;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.beginRendering(&rendering);
 
 	vk::DescriptorImageInfo descriptor_image {};
@@ -176,8 +178,10 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	descriptor_write.descriptorCount = 1;
 	descriptor_write.descriptorType  = vk::DescriptorType::eSampledImage;
 	descriptor_write.pImageInfo      = &descriptor_image;
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_pipeline_layout, 0, 1,
 	                             &descriptor_write);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics,
 	                     GetPipeline({destination_info.samples, destination_info.pixel_format}));
 
@@ -191,7 +195,9 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	                            {destination_info.extent.width, destination_info.extent.height}};
 	command.setViewport(0, 1, &viewport);
 	command.setScissor(0, 1, &scissor);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.draw(3, 1, 0, 0);
+	Common::GpuThreadSampler::NativeBoundary(Common::GpuThreadSampler::Boundary::OtherNative);
 	command.endRendering();
 	// The helper pipeline has static state that invalidates the guest draw's dynamic state.
 	m_scheduler.GetDynamicState().Invalidate();

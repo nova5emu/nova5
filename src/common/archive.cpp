@@ -1,3 +1,4 @@
+#include "common/hostPath.h"
 #include "common/archive.h"
 
 #include "common/stringUtils.h"
@@ -83,7 +84,7 @@ private:
 };
 
 std::shared_ptr<ArchiveReader> OpenZArchive(const std::filesystem::path& path) {
-	auto reader = std::unique_ptr<ZArchiveReader>(ZArchiveReader::OpenFromFile(path));
+	auto reader = std::unique_ptr<ZArchiveReader>(ZArchiveReader::OpenFromFile(NativeHostPath(path)));
 	return reader ? std::make_shared<ZArchiveReaderBackend>(std::move(reader)) : nullptr;
 }
 

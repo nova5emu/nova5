@@ -3,6 +3,8 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/submitProfile.h"
+#include <memory>
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
@@ -40,6 +42,9 @@ public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
 	~Buffer();
+	static std::unique_ptr<Buffer> ImportHost(GraphicContext& graphics, CommandScheduler& scheduler,
+	    uint64_t address, void* pointer, uint64_t size, Common::SubmitProfile::Extra& failure);
+	static void ProbeHostImport(GraphicContext& graphics, CommandScheduler& scheduler);
 	KYTY_CLASS_NO_COPY(Buffer);
 
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
@@ -72,12 +77,20 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	uint64_t import_observed_frame = UINT64_MAX, import_retry_frame = 0;
+	uint32_t import_observations = 0;
+	bool ever_imported = false;
+	uint64_t import_diag_frame = UINT64_MAX, import_diag_epoch = UINT64_MAX;
+	uint32_t import_diag_mask = 0, import_trace_mask = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
 	[[nodiscard]] CommandScheduler& Scheduler() const noexcept { return *m_scheduler; }
 
 private:
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t address, uint64_t size);
+	vk::DeviceMemory m_import_memory = nullptr;
+	bool m_host_import = false;
 	[[nodiscard]] vk::BufferMemoryBarrier Barrier(uint64_t offset, uint64_t size,
 	                                              vk::AccessFlags source,
 	                                              vk::AccessFlags destination) const;
