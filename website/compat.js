@@ -10,7 +10,7 @@
     'doesnt-boot': { label: 'No arranca', css: 'bad' },
   };
   // Tested on Nova5 by us; these override the community status when we know better.
-  // `playable` games also appear in the "100% jugables" section, in this order.
+  // `playable` games form the "100% jugables" category.
   const NOVA5 = {
     PPSA28997: { status: 'in-game', playable: true, title: 'God of War Sons of Sparta',
       note: 'Gameplay a 60 FPS estables, con sonido y control (Nova5 0.5.0 o posterior).' },
@@ -18,7 +18,6 @@
     PPSA03671: { note: 'Ya no se cierra al iniciar: Nova5 analiza sus shaders grandes sin desbordarse. Pendiente de jugar.' },
   };
 
-  const playableGrid = document.getElementById('playable-grid');
   const grid = document.getElementById('compat-grid');
   const more = document.getElementById('compat-more');
   const search = document.getElementById('compat-search');
@@ -33,7 +32,7 @@
   function visible() {
     const q = norm(search.value.trim());
     return games.filter((g) =>
-      (filter === 'all' || g.status === filter) &&
+      (filter === 'all' || (filter === 'playable' ? g.playable : g.status === filter)) &&
       (!q || norm(g.title).includes(q) || g.ids.some((id) => id.toLowerCase().includes(q))));
   }
 
@@ -59,20 +58,8 @@
     more.hidden = list.length <= shown;
   }
 
-  // The playable list comes from our own data, so it shows even if the community index fails.
-  function renderPlayable() {
-    const known = new Map(games.map((g) => [g.titleId, g]));
-    playableGrid.innerHTML = '';
-    for (const [titleId, ours] of Object.entries(NOVA5).filter(([, o]) => o.playable)) {
-      const g = known.get(titleId) ?? games.find((x) => x.ids.includes(titleId));
-      playableGrid.appendChild(card(g ?? { title: ours.title, titleId, ids: [titleId], status: ours.status,
-        nova5: true, playable: true, note: ours.note }));
-    }
-  }
-  renderPlayable();
-
   function count() {
-    const counts = { all: games.length };
+    const counts = { all: games.length, playable: games.filter((g) => g.playable).length };
     for (const g of games) counts[g.status] = (counts[g.status] ?? 0) + 1;
     document.querySelectorAll('[data-count]').forEach((el) => { el.textContent = counts[el.dataset.count] ?? 0; });
   }
@@ -101,7 +88,6 @@
         a.title.localeCompare(b.title, 'es'));
       count();
       render();
-      renderPlayable();
     })
     .catch(() => {
       grid.innerHTML = '<p class="fine">No se pudo cargar la lista ahora mismo. Consúltala en <a href="https://kytyps5.github.io/compatibility">kytyps5.github.io</a>.</p>';
