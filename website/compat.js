@@ -10,12 +10,27 @@
     'doesnt-boot': { label: 'No arranca', css: 'bad' },
   };
   // Tested on Nova5 by us; these override the community status when we know better.
-  // `playable` games form the "100% jugables" category.
+  // `playable` games form the "100% jugables" category. `community` ones were reported fully
+  // playable by the KytyPS5 community (issue number in the note) but not yet checked on Nova5.
+  const report = (n) => `Informe de la comunidad KytyPS5 #${n}`;
   const NOVA5 = {
     PPSA28997: { status: 'in-game', playable: true, title: 'God of War Sons of Sparta',
       note: 'Gameplay a 60 FPS estables, con sonido y control (Nova5 0.5.0 o posterior).' },
     PPSA21564: { status: 'in-game', note: 'Jugable a unos 16–17 FPS en el aterrizaje de Sky Garden (RTX + CPU Intel).' },
     PPSA03671: { note: 'Ya no se cierra al iniciar: Nova5 analiza sus shaders grandes sin desbordarse. Pendiente de jugar.' },
+    PPSA14053: { status: 'in-game', playable: true, community: true, title: 'Afterimage', note: `60 FPS perfectos, audio correcto y sin fallos gráficos. ${report(529)}.` },
+    PPSA20052: { status: 'in-game', playable: true, community: true, title: 'Worms Armageddon: Anniversary Edition', note: `60 FPS sólidos, sin fallos de audio ni gráficos. ${report(514)}.` },
+    PPSA24643: { status: 'in-game', playable: true, community: true, title: 'The Messenger', note: `Unos 60 FPS; imagen, controles y audio correctos. ${report(311)}.` },
+    PPSA15065: { status: 'in-game', playable: true, community: true, title: 'Cat Quest III', note: `Unos 60 FPS, sin fallos de imagen ni de audio. ${report(309)}.` },
+    PPSA34959: { status: 'in-game', playable: true, community: true, title: 'The King is Watching', note: `Totalmente jugable a 60 FPS. ${report(1459)}.` },
+    PPSA17837: { status: 'in-game', playable: true, community: true, title: 'Ib', note: `Funciona perfectamente, con FPS estables. ${report(1921)}.` },
+    PPSA09076: { status: 'in-game', playable: true, community: true, title: 'DREDGE', note: `Funciona perfectamente, con FPS altos y estables. ${report(1607)}.` },
+    PPSA03733: { status: 'in-game', playable: true, community: true, title: 'Doki Doki Literature Club Plus!', note: `Todo funciona, hasta 60 FPS; audio y logros correctos. ${report(1889)}.` },
+    PPSA25872: { status: 'in-game', playable: true, community: true, title: 'Terminator 2D: NO FATE', note: `Partida nueva y se juega perfectamente. ${report(216)}.` },
+    PPSA08576: { status: 'in-game', playable: true, community: true, title: 'Asterix & Obelix Slap them All!', note: `Entra en juego sin problemas y con rendimiento estable. ${report(568)}.` },
+    PPSA28068: { status: 'in-game', playable: true, community: true, title: 'Mortal Kombat: Legacy Kollection', note: `Funciona perfectamente, sin problemas. ${report(623)}.` },
+    PPSA03469: { status: 'in-game', playable: true, community: true, title: 'Blackwind', note: `Funciona bien, con todos los sonidos y a 60 FPS. ${report(263)}.` },
+    PPSA30703: { status: 'in-game', playable: true, community: true, title: 'Vampire Crawlers', note: `Va fluido, con FPS estables. ${report(1616)}.` },
   };
 
   const grid = document.getElementById('compat-grid');
@@ -44,7 +59,7 @@
       `<div class="cover">${g.cover ? `<img loading="lazy" src="${text(g.cover)}" alt="">` : `<span>${text(g.title.slice(0, 1))}</span>`}</div>` +
       `<div class="info"><h3>${text(g.title)}</h3><p class="id">${text(g.titleId)}</p>` +
       `<p class="tags">${g.playable ? '<b class="tag full">100% jugable</b>' : `<b class="tag ${s.css}">${s.label}</b>`}` +
-      `${g.nova5 ? '<b class="tag nova">Probado en Nova5</b>' : ''}</p>` +
+      `${g.community ? '<b class="tag comm">Jugable según la comunidad</b>' : g.nova5 ? '<b class="tag nova">Probado en Nova5</b>' : ''}</p>` +
       `${g.note ? `<p class="note">${text(g.note)}</p>` : ''}</div>`;
     return el;
   }
@@ -77,15 +92,26 @@
     .then((r) => { if (!r.ok) throw new Error(r.status); return r.json(); })
     .then((data) => {
       const rank = { 'in-game': 0, 'main-menu': 1, 'logo': 2, 'doesnt-boot': 3 };
+      const matched = new Set();
       games = (data.games ?? []).map((g) => {
-        const ours = NOVA5[g.titleId] ?? (g.allTitleIds ?? []).map((id) => NOVA5[id]).find(Boolean);
+        const id = [g.titleId, ...(g.allTitleIds ?? [])].find((i) => NOVA5[i]);
+        const ours = id && NOVA5[id];
+        if (id) matched.add(id);
         return {
           title: g.title ?? g.titleId, titleId: g.titleId, ids: g.allTitleIds ?? [g.titleId],
           cover: g.cover, status: ours?.status ?? g.overall, nova5: Boolean(ours), playable: Boolean(ours?.playable),
-          note: ours?.note,
+          community: Boolean(ours?.community), note: ours?.note,
         };
-      }).sort((a, b) => (b.playable - a.playable) || (b.nova5 - a.nova5) || (rank[a.status] - rank[b.status]) ||
-        a.title.localeCompare(b.title, 'es'));
+      });
+      // Our playable entries that the community index does not list yet.
+      for (const [titleId, ours] of Object.entries(NOVA5)) {
+        if (!ours.playable || matched.has(titleId)) continue;
+        games.push({ title: ours.title, titleId, ids: [titleId], status: ours.status, nova5: true, playable: true,
+          community: Boolean(ours.community), note: ours.note });
+      }
+      // Our own tests first, then community-playable games, then the rest.
+      games.sort((a, b) => (b.playable - a.playable) || ((b.nova5 && !b.community) - (a.nova5 && !a.community)) ||
+        (rank[a.status] - rank[b.status]) || a.title.localeCompare(b.title, 'es'));
       count();
       render();
     })

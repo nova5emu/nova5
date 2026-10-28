@@ -142,6 +142,7 @@ details p { color: var(--muted); margin: 0 0 20px; }
 .tag.nova { color: #081022; background: var(--aurora); border: none; font-weight: 600; }
 .downloads { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
 .downloads b { color: var(--aurora-a); font-weight: 700; }
+.tag.comm { color: #c4b5fd; background: rgba(139, 92, 246, .12); border: 1px solid rgba(139, 92, 246, .45); }
 .tag.full { color: #081022; background: #5eead4; border: none; font-weight: 700; }
 .compat-stats { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
 .stat-chip { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 120px; padding: 14px 18px; border-radius: 16px; cursor: pointer;
