@@ -166,3 +166,11 @@ details p { color: var(--muted); margin: 0 0 20px; }
 .compat-card .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
 .compat-more { display: flex; justify-content: center; margin-top: 22px; }
 [hidden] { display: none !important; }
+
+/* Gameplay page */
+.gameplay h2 { margin: 0; }
+.videos { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr)); gap: 32px; align-items: start; }
+.video { background: rgba(255, 255, 255, .04); border: 1px solid var(--line); border-radius: 20px; padding: 22px; min-width: 0; }
+.video h3 { margin: 0 0 14px; font-size: 18px; font-weight: 600; }
+.video .twitter-tweet { margin: 0 auto !important; }
+.links a[aria-current="page"] { color: var(--text); }
