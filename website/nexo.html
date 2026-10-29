@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nexo · Todas tus consolas en un solo lugar</title>
+<meta name="description" content="Nexo es un lanzador gratuito para Windows y Android que reúne tus consolas, emuladores y juegos en una biblioteca de estilo consola.">
+<link rel="canonical" href="https://nova5emu.github.io/nova5/nexo.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Nova5">
+<meta property="og:title" content="Nexo · Todas tus consolas en un solo lugar">
+<meta property="og:description" content="Un lanzador para Windows y Android que instala emuladores oficiales, prepara mandos y muestra tus juegos en una estantería de consola.">
+<meta property="og:url" content="https://nova5emu.github.io/nova5/nexo.html">
+<meta property="og:image" content="https://nova5emu.github.io/nova5/assets/nexo/ps5.webp">
+<meta property="og:locale" content="es_ES">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="assets/nexo/nexo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700&family=Unbounded:wght@500;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="nexo.css">
+</head>
+<body class="nexo-page">
+<div class="progress" aria-hidden="true"></div>
+
+<header class="nav">
+  <a class="brand" href="./" aria-label="Nova5, inicio">
+    <img src="assets/nova5.svg" alt="" width="40" height="40">
+    <span>Nova5</span>
+  </a>
+  <nav class="links" id="menu" aria-label="Secciones">
+    <a href="./">Inicio</a>
+    <a href="gameplay.html">Gameplay</a>
+    <a href="./#compatibilidad">Compatibilidad</a>
+    <a href="nexo.html" aria-current="page">Nexo</a>
+    <a data-donate href="https://ko-fi.com/nova5emu" target="_blank" rel="noopener">Donar</a>
+  </nav>
+  <a class="btn small" href="#descargar-nexo">Descargar Nexo</a>
+  <button class="menu-toggle" type="button" aria-controls="menu" aria-expanded="false" aria-label="Abrir menú">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+  </button>
+</header>
+
+<main>
+
+  <section class="nx-hero">
+    <div class="nx-hero-text">
+      <p class="nx-mark"><img src="assets/nexo/nexo.svg" alt="" width="44" height="44"> Nexo</p>
+      <h1>Todas tus consolas en un solo lugar.</h1>
+      <p class="nx-lead">Nexo instala los emuladores oficiales, prepara el mando y ordena tus juegos en una estantería como la de una consola. Elige una consola, elige un juego y a jugar.</p>
+      <div class="cta" id="descargar-nexo">
+        <a class="btn primary nx-primary" data-nexo="windows" href="#">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0-5-5m5 5 5-5M4 19h16"/></svg>
+          Descargar para Windows
+        </a>
+        <a class="btn ghost" data-nexo="android" href="#">Descargar para Android</a>
+        <a class="btn ghost" data-nexo="source" href="#">Ver el código</a>
+        <a class="btn ghost" data-donate href="https://ko-fi.com/nova5emu" target="_blank" rel="noopener">Donar en Ko-fi</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="nx-stage-wrap" aria-labelledby="demo-title">
+    <h2 id="demo-title" class="sr-only">Prueba el carrusel de Nexo</h2>
+    <div class="nx-stage" id="stage" data-accent="#7CF4FF" tabindex="0"
+         role="region" aria-roledescription="carrusel" aria-label="Consolas de Nexo. Usa las flechas izquierda y derecha.">
+      <div class="nx-topbar" aria-hidden="true">
+        <span class="nx-topbar-logo"><img src="assets/nexo/nexo.svg" alt="" width="22" height="22"> Nexo</span>
+        <span class="nx-pad">
+          <svg viewBox="0 0 24 24"><path d="M6 11h4M8 9v4M15 12h.01M18 10h.01"/><path d="M17.3 5H6.7a4 4 0 0 0-4 3.6l-.7 6.9A3 3 0 0 0 5 19c1 0 1.9-.5 2.5-1.3L9 16h6l1.5 1.7c.6.8 1.5 1.3 2.5 1.3a3 3 0 0 0 3-3.5l-.7-6.9A4 4 0 0 0 17.3 5Z"/></svg>
+          Mando conectado
+        </span>
+        <span class="nx-clock" data-clock>--:--</span>
+      </div>
+
+      <div class="nx-carousel" id="carousel"></div>
+
+      <div class="nx-info" aria-live="polite">
+        <h3 class="nx-name" data-name>PS5</h3>
+        <p class="nx-emu" data-emu>Nova5</p>
+        <p class="nx-formats" data-formats></p>
+      </div>
+
+      <div class="nx-shelf" data-shelf aria-hidden="true"></div>
+
+      <div class="nx-controls">
+        <button class="nx-arrow" type="button" data-step="-1" aria-label="Consola anterior">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 6-6 6 6 6"/></svg>
+        </button>
+        <div class="nx-dots" role="group" aria-label="Elegir consola" data-dots></div>
+        <button class="nx-arrow" type="button" data-step="1" aria-label="Consola siguiente">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+        </button>
+      </div>
+    </div>
+    <p class="nx-hint">Así se ve Nexo. Pruébalo con las flechas del teclado, arrastrando o deslizando el dedo. Las ilustraciones son las de la propia app, sin logotipos.</p>
+  </section>
+
+  <section class="section nx-section" id="funciones-nexo">
+    <h2 data-reveal>Lo que Nexo hace por ti</h2>
+    <p class="section-lead" data-reveal>Lo tedioso de emular lo resuelve Nexo, sin que tengas que tocar la configuración de cada programa.</p>
+    <ul class="nx-features" data-stagger>
+      <li>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0-4-4m4 4 4-4"/><path d="M5 17v2a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-2"/></svg>
+        <div><h3>Instala los emuladores</h3><p>Los descarga de sus publicaciones oficiales y comprueba cada archivo antes de usarlo.</p></div>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 11h4M8 9v4M15 12h.01M18 10h.01"/><path d="M17.3 5H6.7a4 4 0 0 0-4 3.6l-.7 6.9A3 3 0 0 0 5 19c1 0 1.9-.5 2.5-1.3L9 16h6l1.5 1.7c.6.8 1.5 1.3 2.5 1.3a3 3 0 0 0 3-3.5l-.7-6.9A4 4 0 0 0 17.3 5Z"/></svg>
+        <div><h3>Configura el mando</h3><p>Lo prepara en cada emulador, incluso el Wiimote con Nunchuk emulado en un mando normal.</p></div>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m3 16 5-5 4 4 3-3 6 6"/><circle cx="16" cy="9" r="1.5"/></svg>
+        <div><h3>Pone portadas y fondos</h3><p>Busca la carátula y el fondo de cada juego y los guarda para que también funcione sin conexión.</p></div>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 8v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8"/><path d="M1 3h22v5H1zM10 12h4"/></svg>
+        <div><h3>Abre juegos comprimidos</h3><p>Reconoce ZIP, 7z y RAR, instala paquetes de PS4 y avisa si un volcado está incompleto.</p></div>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>
+        <div><h3>Revisa lo que falta</h3><p>Importa y valida BIOS, firmware y claves de tu consola, y te avisa antes de abrir un juego si falta algo.</p></div>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        <div><h3>Ajusta los gráficos</h3><p>Elige motor gráfico y resolución según tu tarjeta y tu monitor, y respeta lo que cambies a mano.</p></div>
+      </li>
+    </ul>
+  </section>
+
+  <section class="section nx-section" id="consolas">
+    <h2 data-reveal>Doce consolas, cada una con su emulador</h2>
+    <p class="section-lead" data-reveal>Pulsa una consola para ver qué emulador usa Nexo, qué juegos reconoce y qué tienes que aportar tú.</p>
+    <div class="nx-systems" data-systems data-reveal></div>
+  </section>
+
+  <section class="section nx-section" id="plataformas">
+    <h2 data-reveal>En el PC y en el móvil</h2>
+    <div class="nx-tabs" data-reveal>
+      <div class="nx-tablist" role="tablist" aria-label="Plataforma">
+        <button role="tab" id="tab-win" aria-controls="panel-win" aria-selected="true">Windows</button>
+        <button role="tab" id="tab-and" aria-controls="panel-and" aria-selected="false" tabindex="-1">Android</button>
+        <span class="nx-tab-ink" aria-hidden="true"></span>
+      </div>
+      <div class="nx-panel" role="tabpanel" id="panel-win" aria-labelledby="tab-win">
+        <ul>
+          <li>Aplicación nativa para Windows 10 y 11. No usa navegador, servidor ni puertos.</li>
+          <li>Se instala con un clic; la biblioteca y la configuración viven en su carpeta.</li>
+          <li>Se actualiza sola: cuando sale una versión nueva, Nexo la descarga e instala.</li>
+          <li>Se maneja con mando, teclado o ratón, y abre cada juego a pantalla completa.</li>
+          <li>Instala y abre Nova5 para los juegos de PS5.</li>
+          <li>Al desinstalar no borra tus juegos ni tus emuladores sin preguntar, y lo que borra va a la Papelera.</li>
+        </ul>
+      </div>
+      <div class="nx-panel" role="tabpanel" id="panel-and" aria-labelledby="tab-and" hidden>
+        <ul>
+          <li>El mismo carrusel y la misma estantería, pensados para jugar con mando.</li>
+          <li>Tu biblioteca vive en la carpeta que elijas con el selector de Android.</li>
+          <li>Instala los APK oficiales de los emuladores y copia a cada uno su BIOS o firmware.</li>
+          <li>Descomprime ZIP, 7z y RAR y abre cada juego en su emulador.</li>
+          <li>Avisa cuando hay una versión nueva y la descarga; tú solo confirmas la instalación.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section nx-section" id="empezar-nexo">
+    <h2 data-reveal>Empezar</h2>
+    <ol class="steps" data-stagger>
+      <li><span>1</span><div><h3>Instala Nexo</h3><p>En Windows, abre «Instalar-Nexo.exe» y elige una carpeta. En Android, instala el APK.</p></div></li>
+      <li><span>2</span><div><h3>Añade tus juegos</h3><p>Copia tus juegos en la carpeta de cada consola. Nexo los encuentra y les pone portada.</p></div></li>
+      <li><span>3</span><div><h3>Instala el emulador y juega</h3><p>Con un botón, Nexo descarga el emulador oficial y lo deja listo con tu mando.</p></div></li>
+    </ol>
+  </section>
+
+  <section class="section nx-section" id="preguntas-nexo">
+    <h2 data-reveal>Preguntas frecuentes</h2>
+    <div class="faq" data-stagger>
+      <details><summary>¿Nexo incluye juegos, BIOS o claves?</summary><p>No. Nexo no incluye ni descarga juegos, BIOS, firmware ni claves. Los emuladores sí los descarga, siempre desde su fuente oficial. Lo demás tienes que obtenerlo de tus propias consolas y copias.</p></details>
+      <details><summary>¿Cuánto cuesta?</summary><p>Nada. Nexo es gratis y de código abierto.</p></details>
+      <details><summary>¿Qué necesita mi PC?</summary><p>Windows 10 u 11 con .NET Framework 4.8, que ya viene con Windows actualizado. Cada emulador tiene además sus propios requisitos de tarjeta gráfica y procesador.</p></details>
+      <details><summary>¿Por qué Windows avisa de que "protegió el PC"?</summary><p>El instalador todavía no tiene firma digital de pago. Pulsa "Más información" y luego "Ejecutar de todas formas". Puedes revisar el código para ver qué hace.</p></details>
+      <details><summary>¿Detectar un emulador significa que va a funcionar?</summary><p>No siempre. Nexo prepara lo que puede, pero cada emulador y cada juego tiene su propia compatibilidad. Los marcados como experimentales todavía están en desarrollo.</p></details>
+    </div>
+  </section>
+
+  <section class="final nx-final" data-reveal>
+    <img src="assets/nexo/nexo.svg" alt="" width="72" height="72">
+    <h2>Tu biblioteca de juegos, ordenada.</h2>
+    <div class="cta">
+      <a class="btn primary nx-primary" data-nexo="windows" href="#">Descargar para Windows</a>
+      <a class="btn ghost" data-nexo="android" href="#">Descargar para Android</a>
+      <a class="btn ghost" data-donate href="https://ko-fi.com/nova5emu" target="_blank" rel="noopener">Donar en Ko-fi</a>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <p><strong>Nexo</strong>. Software libre con licencia MIT. <a data-nexo="source" href="#">Código fuente</a>. <a data-donate href="https://ko-fi.com/nova5emu">Donar en Ko-fi</a>.</p>
+  <p>Nexo no está afiliado, respaldado ni patrocinado por Sony, Microsoft ni Nintendo. PlayStation, Xbox, Nintendo, Switch y el resto de marcas pertenecen a sus dueños. Los emuladores son proyectos independientes con sus propias licencias.</p>
+</footer>
+
+<script src="site.js" defer></script>
+<script src="nexo.js" defer></script>
+</body>
+</html>

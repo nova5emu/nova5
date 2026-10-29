@@ -23,21 +23,26 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<div class="progress" aria-hidden="true"></div>
 
 <header class="nav">
   <a class="brand" href="#inicio" aria-label="Nova5, inicio">
     <img src="assets/nova5.svg" alt="" width="40" height="40">
     <span>Nova5</span>
   </a>
-  <nav class="links" aria-label="Secciones">
+  <nav class="links" id="menu" aria-label="Secciones">
     <a href="#funciones">Funciones</a>
     <a href="gameplay.html">Gameplay</a>
     <a href="#compatibilidad">Compatibilidad</a>
+    <a href="nexo.html">Nexo<span class="badge-new">Nuevo</span></a>
     <a href="#empezar">Empezar</a>
     <a href="#preguntas">Preguntas</a>
     <a data-donate href="https://ko-fi.com/nova5emu" target="_blank" rel="noopener">Donar</a>
   </nav>
   <a class="btn small" href="#descargar">Descargar</a>
+  <button class="menu-toggle" type="button" aria-controls="menu" aria-expanded="false" aria-label="Abrir menú">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+  </button>
 </header>
 
 <main id="inicio">
@@ -45,7 +50,7 @@
   <section class="hero">
     <div class="glow a" aria-hidden="true"></div>
     <div class="glow b" aria-hidden="true"></div>
-    <div class="hero-text">
+    <div class="hero-text" data-reveal>
       <p class="eyebrow">Código abierto · Gratis · Para Windows</p>
       <h1>Tus juegos de PS5,<br><span class="aurora-text">con alma de consola.</span></h1>
       <p class="lead">Nova5 es un emulador de PS5 para PC con un lanzador pensado para el sofá: carátulas y fondos de cada juego, su música de menú al seleccionarlo y control total con mando.</p>
@@ -62,8 +67,8 @@
       <p class="downloads" data-downloads hidden><b data-download-count></b> descargas</p>
     </div>
 
-    <figure class="screen" aria-label="Vista del lanzador de Nova5">
-      <div class="tv">
+    <figure class="screen" aria-label="Vista del lanzador de Nova5" data-reveal style="--d:120ms">
+      <div class="tv" data-tilt>
         <img class="ui" src="assets/nova5-launcher.jpg" width="1600" height="900"
              alt="Lanzador de Nova5 con Astro Bot seleccionado: carátulas de Astro Bot y Marvel's Wolverine, botón Jugar y panel con el tiempo jugado y la caché de shaders">
       </div>
@@ -72,9 +77,9 @@
   </section>
 
   <section id="funciones" class="section">
-    <h2>Todo lo que esperas al encender una consola</h2>
+    <h2 data-reveal>Todo lo que esperas al encender una consola</h2>
     <p class="section-lead">Nova5 combina el emulador KytyPS5, con mejoras de rendimiento propias, y un lanzador hecho desde cero.</p>
-    <div class="grid features">
+    <div class="grid features" data-stagger>
       <article class="card">
         <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
         <h3>Interfaz de consola</h3>
@@ -109,7 +114,7 @@
   </section>
 
   <section id="compatibilidad" class="section">
-    <h2>Compatibilidad</h2>
+    <h2 data-reveal>Compatibilidad</h2>
     <p class="section-lead">Nova5 usa el núcleo de KytyPS5 con mejoras propias, así que los juegos que funcionan allí deberían ir igual o mejor aquí. La lista se carga en directo desde los informes de la comunidad de KytyPS5; los marcados <b class="tag nova">Probado en Nova5</b> los hemos comprobado nosotros, y los <b class="tag comm">Jugable según la comunidad</b> son juegos que los informes de KytyPS5 describen como jugables de principio a fin, todavía sin comprobar en Nova5.</p>
     <div class="compat-stats" id="compat-stats" aria-live="polite">
       <button class="stat-chip on" data-filter="all"><b data-count="all">—</b><span>Probados</span></button>
@@ -128,13 +133,13 @@
   </section>
 
   <section id="empezar" class="section">
-    <h2>Empezar en tres pasos</h2>
-    <ol class="steps">
+    <h2 data-reveal>Empezar en tres pasos</h2>
+    <ol class="steps" data-stagger>
       <li><span>1</span><div><h3>Instala Nova5</h3><p>Descarga el instalador y ejecútalo. No necesita permisos de administrador ni programas adicionales.</p></div></li>
       <li><span>2</span><div><h3>Añade tus juegos</h3><p>Pulsa el botón + y elige la carpeta con tus juegos de PS5 extraídos de copias que poseas.</p></div></li>
       <li><span>3</span><div><h3>Juega</h3><p>Elige un juego con el mando y pulsa A. Nova5 se aparta mientras juegas y vuelve al terminar.</p></div></li>
     </ol>
-    <div class="reqs">
+    <div class="reqs" data-reveal>
       <h3>Requisitos</h3>
       <ul>
         <li>Windows 10 u 11 de 64 bits</li>
@@ -146,8 +151,8 @@
   </section>
 
   <section id="preguntas" class="section">
-    <h2>Preguntas frecuentes</h2>
-    <div class="faq">
+    <h2 data-reveal>Preguntas frecuentes</h2>
+    <div class="faq" data-stagger>
       <details><summary>¿Nova5 incluye juegos?</summary><p>No. Nova5 no incluye ni descarga juegos, firmware ni claves. Solo funciona con juegos que hayas extraído de copias que poseas legalmente.</p></details>
       <details><summary>¿Es legal usar un emulador?</summary><p>Desarrollar y usar emuladores es legal en muchos países. Lo que no es legal es descargar juegos que no te pertenecen. Consulta la legislación de tu país.</p></details>
       <details><summary>¿Por qué Windows dice que "protegió el PC" al instalar?</summary><p>El instalador todavía no tiene firma digital de pago. Pulsa "Más información" y luego "Ejecutar de todas formas". Puedes revisar el código fuente para comprobar qué hace.</p></details>
@@ -156,7 +161,7 @@
     </div>
   </section>
 
-  <section class="final">
+  <section class="final" data-reveal>
     <img src="assets/nova5.svg" alt="" width="72" height="72">
     <h2>Pruébalo hoy</h2>
     <a class="btn primary" data-download href="#">Descargar Nova5 para Windows</a>
@@ -170,6 +175,7 @@
   <p>Nova5 no está afiliado, respaldado ni patrocinado por Sony Interactive Entertainment. "PlayStation" y "PS5" son marcas de sus respectivos dueños.</p>
 </footer>
 
+<script src="site.js" defer></script>
 <script src="compat.js" defer></script>
 <script>
   // Release and repository links; the version must match the latest GitHub release.
@@ -186,7 +192,7 @@
     .then(r => r.ok ? r.json() : Promise.reject(r.status))
     .then(releases => {
       const total = releases.flatMap(r => r.assets ?? []).reduce((sum, a) => sum + (a.download_count ?? 0), 0);
-      document.querySelectorAll('[data-download-count]').forEach(e => e.textContent = total.toLocaleString('es-ES'));
+      document.querySelectorAll('[data-download-count]').forEach(e => { e.dataset.countup = total; (window.nova5CountUp ?? (x => x.textContent = total.toLocaleString('es-ES')))(e); });
       document.querySelectorAll('[data-downloads]').forEach(e => e.hidden = false);
     })
     .catch(() => {});

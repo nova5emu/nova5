@@ -21,19 +21,24 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<div class="progress" aria-hidden="true"></div>
 
 <header class="nav">
   <a class="brand" href="./" aria-label="Nova5, inicio">
     <img src="assets/nova5.svg" alt="" width="40" height="40">
     <span>Nova5</span>
   </a>
-  <nav class="links" aria-label="Secciones">
+  <nav class="links" id="menu" aria-label="Secciones">
     <a href="./">Inicio</a>
     <a href="gameplay.html" aria-current="page">Gameplay</a>
     <a href="./#compatibilidad">Compatibilidad</a>
+    <a href="nexo.html">Nexo<span class="badge-new">Nuevo</span></a>
     <a data-donate href="https://ko-fi.com/nova5emu" target="_blank" rel="noopener">Donar</a>
   </nav>
   <a class="btn small" href="./#descargar">Descargar</a>
+  <button class="menu-toggle" type="button" aria-controls="menu" aria-expanded="false" aria-label="Abrir menú">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+  </button>
 </header>
 
 <main>
@@ -42,7 +47,7 @@
     <h2>Gameplay real</h2>
     <p class="section-lead">Vídeos sin editar del juego funcionando en Nova5, con el contador de FPS visible. Para verlos se cargan desde nuestra cuenta de X, <a href="https://x.com/nova5emu" target="_blank" rel="noopener">@nova5emu</a>.</p>
 
-    <div class="videos">
+    <div class="videos" data-stagger>
       <article class="video">
         <h3>ASTRO BOT · del aterrizaje al despegue</h3>
         <blockquote class="twitter-tweet" data-theme="dark" data-dnt="true" data-media-max-width="960" data-conversation="none">
@@ -74,5 +79,6 @@
 </footer>
 
 <script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>
+<script src="site.js" defer></script>
 </body>
 </html>
