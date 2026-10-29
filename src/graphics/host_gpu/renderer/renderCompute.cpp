@@ -217,6 +217,65 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	return true;
 }
 
+// ds-linear-copy, adapted from chenxiao07/KytyPS5 (dc02d902a0b2c3aec412c853a841ee8c72c55bd2,
+// src/graphics/host_gpu/renderer/demonsSouls.cpp, GPL-2.0). Demon's Souls' cs_memset32 compute shader
+// (01.007.000, and 01.005.000 with the period in another SGPR) computes dst[i] = src[i % period] for
+// i < count. Only its linear subset (period >= count) with the exact observed descriptor controls is
+// replaced by CopyBuffer: when both ranges are CPU-owned it copies on the CPU, so the destination (the
+// constants and descriptor tables later draws read) never becomes GPU-written and needs no readback.
+static bool TryConsumeLinearCopy(RenderContext& context, const HW::ComputeShaderInfo& cs,
+                                 const ShaderComputeInputInfo& input, uint32_t x, uint32_t y,
+                                 uint32_t z, uint32_t mode) {
+	namespace Profile = Common::SubmitProfile;
+	using Extra       = Profile::Extra;
+	constexpr std::array<uint64_t, 2> shaders {0xeb7456322124ecc7ULL, 0x81bb2b1b9c751ecaULL};
+	if (!Profile::ExperimentActive(Profile::Experiment::DsLinearCopy) ||
+	    std::ranges::find(shaders, input.stage.module->info.shader_hash) == shaders.end()) return false;
+	Profile::AddExtra(Extra::LinearCopyCandidates);
+	const auto reject = [](Extra reason) { Profile::AddExtra(reason); return false; };
+	if (cs.cs_regs.user_sgpr != 12 || input.dispatch_thread_dimensions || mode != 0x41u ||
+	    input.threads_num[0] != 64 || input.threads_num[1] != 1 || input.threads_num[2] != 1 ||
+	    !input.group_id[0] || input.group_id[1] || input.group_id[2] || input.thread_ids_num != 1 ||
+	    input.workgroup_register != 12 || input.tg_size_en || x == 0 || y != 1 || z != 1)
+		return reject(Extra::LinearCopyRejectShape);
+	ShaderBufferResource source, destination, parameters;
+	std::memcpy(source.fields, cs.cs_user_sgpr.value, 16);
+	std::memcpy(destination.fields, cs.cs_user_sgpr.value + 4, 16);
+	std::memcpy(parameters.fields, cs.cs_user_sgpr.value + 8, 16);
+	for (const auto* d: {&source, &destination}) {
+		// Exact control bits observed for idxen format_x UInt32; every other
+		// format/swizzle/out-of-bounds/cache/addressing variation keeps the shader.
+		if (d->fields[3] != 0x00014004u || (d->fields[1] & 0xffff0000u) != 0x00040000u ||
+		    d->Base48() == 0 || (d->Base48() & 3u) != 0) return reject(Extra::LinearCopyRejectDescriptor);
+	}
+	if (parameters.fields[3] != 0x0004dfacu || (parameters.fields[1] & 0xffff0000u) != 0x00100000u ||
+	    parameters.NumRecords() != 1 || (parameters.Base48() & 3u) != 0)
+		return reject(Extra::LinearCopyRejectDescriptor);
+	std::array<uint32_t, 2> controls {};
+	if (!LibKernel::Memory::TryReadCpuOwnedBacking(parameters.Base48(), controls.data(), sizeof(controls)))
+		return reject(Extra::LinearCopyRejectParameters);
+	const uint64_t count = controls[0], period = controls[1], bytes = count * 4;
+	if (count == 0 || period < count || count > source.NumRecords() || count > destination.NumRecords() ||
+	    x != (count + 63) / 64 || bytes > 16ull * 1024 * 1024)
+		return reject(Extra::LinearCopyRejectCount);
+	const auto src = source.Base48(), dst = destination.Base48(), params = parameters.Base48();
+	if ((src < dst + bytes && dst < src + bytes) || (params < dst + bytes && dst < params + 16))
+		return reject(Extra::LinearCopyRejectOverlap);
+	if (!context.IsMapped(src, bytes) || !context.IsMapped(dst, bytes) ||
+	    !LibKernel::Memory::IsUniqueGuestBackingRange(src, bytes) ||
+	    !LibKernel::Memory::IsUniqueGuestBackingRange(dst, bytes) ||
+	    !LibKernel::Memory::IsUniqueGuestBackingRange(params, 16))
+		return reject(Extra::LinearCopyRejectAlias);
+	auto& buffers = context.GetBufferCache();
+	// Counted with CopyBuffer's own CPU-path condition; CopyBuffer decides again.
+	const bool cpu = !buffers.IsRegionGpuModified(dst, bytes) && !buffers.IsRegionGpuModified(src, bytes) &&
+	                 !context.GetTextureCache().FindImageFromRange(src, bytes, false);
+	buffers.CopyBuffer(dst, src, bytes, false, false);
+	Profile::AddExtra(cpu ? Extra::LinearCopyCpu : Extra::LinearCopyGpu);
+	Profile::AddExtra(Extra::LinearCopyBytes, bytes);
+	return true;
+}
+
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
 	if (input.stage.module->info.bindings.descriptor_counts[
@@ -326,6 +385,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = input_info.stage.module->info;
 	const auto& resources = *input_info.stage.resources;
+	if (TryConsumeLinearCopy(m_context, cs_regs, input_info, thread_group_x, thread_group_y,
+	                         thread_group_z, mode)) {
+		ResetBindings();
+		return;
+	}
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,

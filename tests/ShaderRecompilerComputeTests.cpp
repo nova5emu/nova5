@@ -177,6 +177,13 @@ static_assert(BlitHelper::ColorToMsDepthLayout ==
               vk::ImageLayout::eDepthStencilAttachmentOptimal);
 
 struct BufferCacheTestAccess {
+	static GuestRange AheadRange(BufferCache& cache, const Buffer& owner, uint64_t fault, bool write) {
+		return cache.FaultReadbackRange(owner, fault, write);
+	}
+	static void FinishAsyncOwnership(BufferCache& cache, uint64_t address, uint64_t size) {
+		EXIT_IF(cache.HasUnpublishedDownloads() || cache.HasGpuDirtyBytes(address, size));
+		cache.m_memory_tracker.UnmarkRegionAsGpuModified(address, size);
+	}
 	static bool HotSelected(const BufferCache& cache) { return cache.m_hot_selected; }
 	static void EnableRetiredHotTest(BufferCache& cache) { cache.m_hot_selected = true; }
 	static bool Coarsening(const BufferCache& cache, uint64_t base) {
@@ -4614,6 +4621,180 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckFaultReadbackAhead(bool read_fault) {
+    const char* name = read_fault ? "ReadReadbackAhead" : "WriteReadbackAhead";
+    constexpr uint64_t base = 0x0000000200700000ull;
+    constexpr uint64_t allocation_size = 0x20000;
+    constexpr uint64_t page_size = 4096;
+    namespace Profile = Common::SubmitProfile;
+    using Cause = Common::BufferUploadProfile::Cause;
+    const auto pages = read_fault ? Common::ReadbackAhead::ReadPages() : Common::ReadbackAhead::WritePages();
+    const auto batches = read_fault ? Profile::Extra::ReadAheadBatches : Profile::Extra::WriteAheadBatches;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto& scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "allocate", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+        0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size, 0x10000,
+        0, &direct_offset) == 0, "allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", Libs::LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+        mapped == reinterpret_cast<void*>(base), "mapping failed");
+    context.MapMemory(base, allocation_size);
+    context.GetGpu().SendCommandSync([&] {
+      auto& cache = context.GetBufferCache();
+      auto& owner = cache.GetBuffer(cache.FindBuffer(base, std::max(pages + 1, 5u) * page_size));
+      const auto extra = [](Profile::Extra counter) {
+        return Profile::Detail::window.extra[static_cast<size_t>(counter)].load();
+      };
+      const auto recover = [&] {
+        if (read_fault) cache.ReadMemory(base + 128, 1, false, Profile::WaitSite::ReadbackCpuReadFault);
+        else cache.InvalidateMemory(base + 128, 1, Cause::CpuWriteFault);
+      };
+      const auto fill_gpu = [&](uint64_t address, uint64_t size, uint32_t value) {
+        auto [buffer, offset] = cache.ObtainBuffer(address, size, true, false);
+        Require(name, "stable owner", buffer == &owner, "fixture unexpectedly merged its owner");
+        buffer->Fill(offset, size, value);
+      };
+      const auto read_word = [&](uint64_t address) {
+        uint32_t value = 0;
+        Require(name, "read backing", Libs::LibKernel::Memory::TryReadBacking(
+            address, &value, sizeof(value)), "backing unavailable");
+        return value;
+      };
+      unsigned iteration = 0;
+      for (const bool active : {false, true, false}) {
+        Profile::SetExperiment(!active); // The gate opens "no-readback-ahead".
+        const uint32_t seed = 0x12340000u + (++iteration << 8);
+        for (unsigned page = 0; page <= pages; ++page)
+          fill_gpu(base + page * page_size, page_size, seed + page);
+        const auto tick = scheduler.CurrentTick();
+        const auto before = extra(batches);
+        const auto other = read_fault ? Profile::Extra::WriteAheadBatches : Profile::Extra::ReadAheadBatches;
+        const auto other_before = extra(other);
+        const auto limit_hits = read_fault ? Profile::Extra::ReadAheadLimitHits : Profile::Extra::WriteAheadLimitHits;
+        const auto hits_before = extra(limit_hits);
+        recover();
+        Require(name, "one wait", scheduler.CurrentTick() == tick + 1,
+                "fault recovery did not use one submission");
+        Require(name, "gate", extra(batches) == before + (active ? 1u : 0u) &&
+            extra(limit_hits) == hits_before + (active ? 1u : 0u) && extra(other) == other_before,
+                "batch ignored the A/B/A gate or never entered");
+        for (unsigned page = 0; page <= pages; ++page) {
+          const bool downloaded = page == 0 || (active && page < pages);
+          Require(name, "bounded ownership",
+              cache.HasGpuDirtyBytes(base + page * page_size, page_size) != downloaded &&
+              cache.IsRegionGpuModified(base + page * page_size, page_size) != downloaded &&
+              cache.IsRegionCpuModified(base + page * page_size, page_size) == (page == 0 && !read_fault),
+              "prefetch exceeded its limit or made neighboring/read pages CPU-dirty");
+          if (downloaded) Require(name, "fresh GPU values",
+              read_word(base + page * page_size) == seed + page,
+              "prefetch reused old bytes instead of waiting for the GPU");
+        }
+        // Execute the original partial CPU store after recovery. Every other
+        // byte must retain the new GPU data, including the rest of its page.
+        const uint32_t cpu = seed ^ 0xfedcba98u;
+        if (read_fault) cache.InvalidateMemory(base + 128, 1, Cause::CpuWriteFault);
+        Libs::LibKernel::Memory::WriteBacking(base + 128, &cpu, sizeof(cpu));
+        if (active) {
+          const auto prefetched_tick = scheduler.CurrentTick();
+          cache.ReadMemory(base + page_size + 128, 1, false, Profile::WaitSite::ReadbackCpuReadFault);
+          Require(name, "prefetched read needs no submit", scheduler.CurrentTick() == prefetched_tick,
+                  "reading a prefetched page submitted another download");
+          cache.InvalidateMemory(base + page_size + 128, 1, Cause::CpuWriteFault);
+          Require(name, "prefetched write needs no submit",
+              scheduler.CurrentTick() == prefetched_tick && cache.IsRegionCpuModified(base + page_size, page_size),
+              "prefetch lost write tracking or still needed another download");
+          Libs::LibKernel::Memory::WriteBacking(base + page_size + 128, &cpu, sizeof(cpu));
+        }
+        cache.ReadMemory(base, (pages + 1) * page_size);
+        Require(name, "preserve CPU store and GPU neighbors",
+            read_word(base + 128) == cpu && read_word(base + 124) == seed &&
+            read_word(base + 132) == seed && read_word(base + pages * page_size) == seed + pages &&
+            (!active || read_word(base + page_size + 128) == cpu),
+            "later publication overwrote CPU data or lost GPU neighbors");
+        // Upload the modified page, then read back its exact store range.
+        (void)cache.ObtainBuffer(base + 128, sizeof(cpu), true, false);
+        cache.ReadMemory(base + 128, sizeof(cpu));
+        Require(name, "subsequent GPU use", read_word(base + 128) == cpu,
+                "CPU update was lost on the next buffer upload");
+      }
+      Profile::SetExperiment(false); // Readback-ahead on: the "no-readback-ahead" gate stays closed.
+      // An ordinary explicit readback is not a fault and must keep its span.
+      fill_gpu(base, 2 * page_size, 0x11223344u);
+      const auto explicit_before = extra(batches);
+      cache.ReadMemory(base + 128, 1);
+      Require(name, "explicit read is not prefetched", extra(batches) == explicit_before &&
+          cache.HasGpuDirtyBytes(base + page_size, page_size), "explicit read widened its request");
+      cache.ReadMemory(base + page_size, page_size);
+
+      fill_gpu(base, page_size, 0x11223344u);
+      fill_gpu(base + page_size, 4, 0xaabbccddu);
+      const uint32_t clean = 0x56789abcu;
+      Libs::LibKernel::Memory::WriteBacking(base + page_size + 4, &clean, sizeof(clean));
+      const auto tick = scheduler.CurrentTick();
+      Require(name, "sparse neighbor fallback",
+          BufferCacheTestAccess::AheadRange(cache, owner, base + 128, !read_fault) == GuestRange{base + 128, 1} &&
+          scheduler.CurrentTick() == tick && cache.HasGpuDirtyBytes(base + page_size, 4),
+          "sparse neighbor widened the readback or the selector had side effects");
+      recover();
+      Require(name, "sparse neighbor retained", cache.HasGpuDirtyBytes(base + page_size, 4),
+              "fallback consumed a neighboring label");
+      cache.ReadMemory(base + page_size, 4);
+      Require(name, "clean bytes retained", read_word(base + page_size + 4) == clean,
+              "sparse readback overwrote clean bytes");
+
+      fill_gpu(base, 4, 0xaabbccddu);
+      fill_gpu(base + page_size, page_size, 0x55667788u);
+      const auto first_reject = read_fault ? Profile::Extra::ReadAheadRejectFirstPage : Profile::Extra::WriteAheadRejectFirstPage;
+      const auto first_before = extra(first_reject);
+      recover();
+      Require(name, "sparse fault page distinguished", extra(first_reject) == first_before + 1 &&
+          cache.HasGpuDirtyBytes(base + page_size, page_size), "partial fault page was not rejected separately");
+      cache.ReadMemory(base + page_size, page_size);
+
+      // A second page is not a candidate while an asynchronous publication is
+      // pending, even when that publication targets a different page.
+      fill_gpu(base, 2 * page_size, 0x55667788u);
+      fill_gpu(base + 4 * page_size, page_size, 0xabcdef01u);
+      Require(name, "asynchronous fixture", BufferCacheTestAccess::DownloadAsync(
+          cache, base + 4 * page_size, page_size) && cache.HasUnpublishedDownloads(),
+          "fixture did not leave an unpublished download");
+      Require(name, "pending publication fallback",
+          BufferCacheTestAccess::AheadRange(cache, owner, base + 128, !read_fault) == GuestRange{base + 128, 1},
+          "prefetch entered with an unpublished download");
+      recover();
+      Require(name, "fallback keeps second page dirty", cache.HasGpuDirtyBytes(base + page_size, page_size),
+              "pending-download fallback widened the request");
+      BufferCacheTestAccess::FinishAsyncOwnership(cache, base + 4 * page_size, page_size);
+      cache.ReadMemory(base, owner.Size());
+      Require(name, "publication drained", !cache.HasUnpublishedDownloads() &&
+          read_word(base + 4 * page_size) == 0xabcdef01u, "older publication was lost");
+
+      const auto last_page = owner.CpuAddress() + owner.Size() - page_size;
+      fill_gpu(last_page, page_size, 0x87654321u);
+      Require(name, "owner boundary fallback",
+          BufferCacheTestAccess::AheadRange(cache, owner, last_page, !read_fault) == GuestRange{last_page, 1},
+          "prefetch crossed its existing owner");
+      cache.ReadMemory(last_page, page_size);
+      Profile::SetExperiment(false);
+    });
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    context.ShutdownGpu();
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -5527,6 +5708,51 @@ public:
               sparse_callback_ran && sparse_callback_clean,
               "readback drained a deferred callback before clearing page ownership");
       CheckSparseOwner(0);
+
+      // SRT batch: two dirty pages of the SAME existing owner, one synchronous
+      // download, fresh GPU bytes on every invocation, exact dirty publication.
+      resources.GetGpu().SendCommandSync([&] {
+        constexpr uint64_t batch = base + sparse_offset + 0xff8;
+        const std::array<uint32_t, 4> clean{0x12345678u, 0u, 0u, 0x87654321u};
+        for (const uint32_t value : {0xa1b2c3d4u, 0x56789abcu}) {
+          Libs::LibKernel::Memory::WriteBacking(batch, clean.data(), sizeof(clean));
+          const auto left = cache.ObtainBuffer(batch + 4, 4, true, false);
+          const auto right = cache.ObtainBuffer(batch + 8, 4, true, false);
+          Require(name, "SRT batch owner", left.first && left.first == right.first,
+                  "cross-page SRT fixture did not share an owner");
+          // Native clean neighbors deliberately differ from host backing.
+          left.first->Fill(left.first->Offset(batch), sizeof(clean), value);
+          const auto tick = scheduler.CurrentTick();
+          Require(name, "SRT batch guards",
+                  !cache.TryReadSrtBatch(batch + 4, batch + 4, 4) &&
+                      !cache.TryReadSrtBatch(batch + 4, batch + 4, 4100) &&
+                      !cache.TryReadSrtBatch(batch, batch + 4, 8) &&
+                      !cache.TryReadSrtBatch(batch + 5, batch + 4, 8) &&
+                      scheduler.CurrentTick() == tick &&
+                      cache.HasGpuDirtyBytes(batch + 4, 8),
+                  "rejected SRT batch submitted work or consumed dirty bytes");
+          Require(name, "SRT batch single submission",
+                  cache.TryReadSrtBatch(batch + 8, batch + 4, 8) &&
+                      scheduler.CurrentTick() == tick + 1,
+                  "two dirty SRT pages did not share one submission");
+          std::array<uint32_t, 4> published{};
+          const std::array<uint32_t, 4> expected{clean[0], value, value, clean[3]};
+          Require(name, "SRT batch fresh publication",
+                  Libs::LibKernel::Memory::TryReadBacking(batch, published.data(), sizeof(published)) &&
+                      published == expected && !cache.HasGpuDirtyBytes(batch + 4, 8) &&
+                      !cache.IsRegionGpuModified(batch + 4, 8) &&
+                      !cache.TryReadSrtBatch(batch + 8, batch + 4, 8),
+                  "SRT batch lost GPU data, reused stale data or overwrote clean neighbors");
+        }
+        const auto left = cache.ObtainBuffer(batch + 4, 4, true, false);
+        left.first->Fill(left.first->Offset(batch + 4), 4, 0x11223344u);
+        const auto tick = scheduler.CurrentTick();
+        Require(name, "SRT batch one-dirty-page fallback",
+                !cache.TryReadSrtBatch(batch + 4, batch + 4, 8) &&
+                    scheduler.CurrentTick() == tick && cache.HasGpuDirtyBytes(batch + 4, 4),
+                "one-page SRT fault unnecessarily took the batch route");
+        cache.ReadMemory(batch + 4, 4);
+      });
 
       FillSparseOwner(0);
       FillSparseOwner(1);
@@ -8058,6 +8284,112 @@ OpFunctionEnd
       Profile::SetRecording(false);
       context.UnmapMemory(base, size);
       scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0, "release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // guest-clean-reads: a host (guest) thread load of clean bytes on a GPU-dirty page is
+  // served on the GPU thread without a readback; dirty, pending and unaligned loads are not.
+  void CheckGuestCleanReads() {
+    constexpr const char* name = "GuestCleanReads";
+    constexpr uint64_t base = 0x0000000205800000ull, size = 0x10000;
+    constexpr uint64_t clean = base + 0x40, neighbor = base + 0xc0, table = base + 0x100;
+    namespace Profile = Common::SubmitProfile;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0, "allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 3, 0x10, physical, size) == 0 &&
+        mapped == reinterpret_cast<void*>(base), "mapping failed");
+    std::memset(mapped, 0, size);
+    constexpr uint32_t clean_value = 0x5a5a1234u;
+    std::memcpy(reinterpret_cast<void*>(clean), &clean_value, 4);
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto& cache = context.GetBufferCache();
+    auto& scheduler = context.GetCommandScheduler();
+    auto on_gpu = [&](auto&& body) { context.GetGpu().SendCommandSync([&] { body(); }); };
+    auto write_gpu = [&](uint64_t address, uint32_t value) {
+      auto [buffer, offset] = cache.ObtainBuffer(address, 4, true);
+      buffer->Fill(offset, 4, value);
+    };
+    auto extra = [&](Profile::Extra counter) { return Profile::Detail::window.extra[static_cast<size_t>(counter)].load(); };
+    auto protected_page = [&] {
+      MEMORY_BASIC_INFORMATION memory {};
+      return VirtualQuery(reinterpret_cast<void*>(clean), &memory, sizeof(memory)) != 0 &&
+             (memory.Protect & 0xff) == PAGE_NOACCESS;
+    };
+    // This thread is not GuestGpu: it stands for a game thread taking the fault.
+    auto load = [](uint64_t address) { return *reinterpret_cast<const volatile uint32_t*>(address); };
+    std::unique_ptr<CommandProcessor> processor;
+    on_gpu([&] {
+      processor = std::make_unique<CommandProcessor>(context, 0);
+      processor->BufferInit();
+      context.MapMemory(base, size);
+      Profile::Reset(); Profile::SetRecording(true);
+      Require(name, "selected", Profile::ExperimentSelected(Profile::Experiment::GuestCleanReads), "experiment not selected");
+      Profile::SetExperiment(true);
+      write_gpu(neighbor, 7);
+      scheduler.Finish();
+    });
+    uint64_t tick = 0, faults = 0;
+    on_gpu([&] { tick = scheduler.CurrentTick(); faults = extra(Profile::Extra::TrackedReadFaults); });
+    Require(name, "clean value", load(clean) == clean_value, "clean guest load returned wrong data");
+    on_gpu([&] {
+      Require(name, "clean served", extra(Profile::Extra::GuestCleanServed) == 1 &&
+              extra(Profile::Extra::TrackedReadFaults) == faults + 1 && scheduler.CurrentTick() == tick &&
+              cache.HasGpuDirtyBytes(neighbor, 4) && protected_page(),
+              "clean load downloaded, submitted, or changed ownership/protection");
+    });
+    // The page's budget is spent: the next load recovers normally in the same request.
+    Require(name, "budget value", load(clean) == clean_value, "budget fallback returned wrong data");
+    on_gpu([&] {
+      Require(name, "budget fallback", extra(Profile::Extra::GuestCleanServed) == 1 &&
+              extra(Profile::Extra::GuestCleanRejectBudget) == 1 && extra(Profile::Extra::GuestCleanRecovered) == 1 &&
+              !cache.HasGpuDirtyBytes(neighbor, 4) && !protected_page(), "spent budget did not take normal recovery");
+      write_gpu(neighbor, 8); // A new GPU-dirty episode renews the budget.
+    });
+    Require(name, "renewed value", load(clean) == clean_value, "renewed clean load returned wrong data");
+    on_gpu([&] {
+      Require(name, "budget renewed", extra(Profile::Extra::GuestCleanServed) == 2 &&
+              cache.HasGpuDirtyBytes(neighbor, 4) && protected_page(), "download did not renew the page budget");
+    });
+    // Dirty bytes take the normal readback and observe the GPU value.
+    const auto before_dirty = extra(Profile::Extra::GuestCleanRejectDirty);
+    Require(name, "dirty value", load(neighbor) == 8, "dirty guest load missed the GPU value");
+    on_gpu([&] {
+      Require(name, "dirty fallback", extra(Profile::Extra::GuestCleanRejectDirty) == before_dirty + 1 &&
+              !cache.HasGpuDirtyBytes(neighbor, 4), "dirty load was served from stale backing");
+      // Pending publication: the interval is gone but its backing is still old.
+      write_gpu(table, 48);
+      Require(name, "async download", BufferCacheTestAccess::DownloadAsync(cache, table, 4), "no async copy");
+      write_gpu(neighbor, 9);
+      Require(name, "pending fixture", cache.HasUnpublishedDownloads() && !cache.HasGpuDirtyBytes(table, 4) &&
+              protected_page(), "publication window was not established");
+    });
+    const auto before_pending = extra(Profile::Extra::GuestCleanRejectPending);
+    Require(name, "pending value", load(table) == 48, "pending publication exposed stale backing");
+    on_gpu([&] {
+      Require(name, "pending fallback", extra(Profile::Extra::GuestCleanRejectPending) == before_pending + 1 &&
+              !cache.HasUnpublishedDownloads(), "pending download was not rejected");
+      write_gpu(neighbor, 10);
+    });
+    // An unaligned load is refused by width and still reads correctly.
+    const auto before_width = extra(Profile::Extra::GuestCleanRejectWidth);
+    Require(name, "unaligned value", load(clean + 2) == ((clean_value >> 16) & 0xffffu), "unaligned load wrong");
+    on_gpu([&] {
+      Require(name, "unaligned fallback", extra(Profile::Extra::GuestCleanRejectWidth) == before_width + 1,
+              "unaligned load was emulated");
+      Profile::SetExperiment(false);
+      Profile::SetRecording(false);
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+      processor.reset();
     });
     LibKernel::Memory::InstallGpuResources(nullptr);
     context.ShutdownGpu();
@@ -54029,6 +54361,34 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  // These tests record into the scheduler's native command buffer; the recorder tests enable it by hand.
+  Common::SubmitProfile::SetVkRecorderManaged(false);
+  if ((argc == 2 || argc == 3) && (std::strcmp(argv[1], "--write-readback-ahead-only") == 0 ||
+                                  std::strcmp(argv[1], "--read-readback-ahead-only") == 0)) {
+    const bool read_fault = std::strcmp(argv[1], "--read-readback-ahead-only") == 0;
+    const auto* experiment = "no-readback-ahead";
+    const auto* pages = argc == 3 ? argv[2] : "4";
+#if defined(_WIN32)
+    _putenv_s("KYTY_EXPERIMENT", experiment);
+    _putenv_s("KYTY_WRITE_READBACK_AHEAD_PAGES", pages);
+    _putenv_s("KYTY_READ_READBACK_AHEAD_PAGES", pages);
+    _putenv_s("KYTY_SUBMIT_PROFILE", "1");
+    _putenv_s("KYTY_SUBMIT_PROFILE_GATE", "");
+    _putenv_s("KYTY_EXPERIMENT_GATE", "");
+#else
+    setenv("KYTY_EXPERIMENT", experiment, 1);
+    setenv("KYTY_WRITE_READBACK_AHEAD_PAGES", pages, 1);
+    setenv("KYTY_READ_READBACK_AHEAD_PAGES", pages, 1);
+    setenv("KYTY_SUBMIT_PROFILE", "1", 1);
+    unsetenv("KYTY_SUBMIT_PROFILE_GATE");
+    unsetenv("KYTY_EXPERIMENT_GATE");
+#endif
+    Common::SubmitProfile::SetRecording(true);
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    vulkan.CheckFaultReadbackAhead(read_fault);
+    return 0;
+  }
   if (argc == 2 && (std::strcmp(argv[1], "--fault-coarsening-only") == 0 ||
                     std::strcmp(argv[1], "--fault-coarsening-copy-only") == 0)) {
     const bool copy = std::strcmp(argv[1], "--fault-coarsening-copy-only") == 0;
@@ -54150,6 +54510,14 @@ int main(int argc, char **argv) {
     EnsureConfigInitialized();
     VulkanHarness vulkan;
     vulkan.CheckCleanReads();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--guest-clean-reads-only") == 0) {
+    _putenv_s("KYTY_EXPERIMENT", "guest-clean-reads");
+    _putenv_s("KYTY_SUBMIT_PROFILE", "1");
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    vulkan.CheckGuestCleanReads();
     return 0;
   }
 #endif

@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/submitProfileRuntime.h"
 
+#include "common/readbackProfile.h"
 #include "common/submitProfile.h"
 
 #include <atomic>
@@ -86,6 +87,10 @@ void Event(const char* text) {
 }
 
 void Report(State& state, uint64_t now) {
+	// Tick and Shutdown run on the GPU thread, outside readback WaitScopes.
+	// Drain TLS histograms while recording and the old generation are still live.
+	Common::ReadbackProfile::FlushCurrentThread(now);
+	if (auto* hook = Common::SubmitProfile::Detail::window_close_hook.load(std::memory_order_acquire)) hook();
 	if (state.window_start_ns != 0 && now > state.window_start_ns && state.reports < MaxReports) {
 		++state.reports;
 		Common::SubmitProfile::WriteReport(Output(), (now - state.window_start_ns) / 1e6,

@@ -103,6 +103,93 @@ Libs::Graphics::ShaderRecompiler::IR::Program SrtProgram(uint64_t address) {
   return program;
 }
 
+void TestSrtReadbackBatchRange() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  constexpr uint64_t base = 0x20000fc0ull;
+  auto program = SrtProgram(base);
+  program.shader_hash = 0x09c7784d7b18346cull;
+  program.memory_info[0].offset = 32;
+  auto &block = *program.blocks[0];
+  // Distinct handles with identical operands occur in the captured compute plan.
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+      {Value(static_cast<uint32_t>(base)), Value(static_cast<uint32_t>(base >> 32))});
+  for (const uint32_t offset : {272u, 300u}) {
+    auto memory = program.memory_info[0];
+    memory.offset = offset;
+    const auto index = static_cast<uint32_t>(program.memory_info.size());
+    program.memory_info.push_back(memory);
+    auto &raw = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(0u), Value(0u), Value(true)});
+    raw.SetFlags(MemoryFlags{.index = index});
+    program.srt_reads.push_back({Value(&raw), index});
+  }
+  auto plan = Extract(program);
+  auto *current = plan.srt_reads[1].value.Instruction();
+  ResourcePlan::WalkerReadSite site;
+  site.uses = 6;
+  site.inst = current;
+  uint64_t address = 0, bytes = 0;
+  const auto before = SaveResourcePlan(plan);
+  Check(SrtReadbackBatchRange(plan, site, base + 272, address, bytes) &&
+            address == base + 32 && bytes == 272 && SaveResourcePlan(plan) == before,
+        "mandatory two-page SRT range was lost or changed the cached plan");
+  Check(SrtReadbackBatchRange(plan, site, base + 0x10000 + 272, address, bytes) &&
+            address == base + 0x10000 + 32 && bytes == 272,
+        "SRT batch reused a prior runtime address");
+  // Same captured plan shape, different placement between the probe and A/B/A.
+  Check(SrtReadbackBatchRange(plan, site, 0x207b1c0d0ull, address, bytes) &&
+            address == 0x207b1bfe0ull && bytes == 272,
+        "probe capture's cross-page placement was rejected");
+  const auto rejected = [&](uint64_t fault = 0x200010d0ull) {
+    address = 0x1234;
+    bytes = 0x5678;
+    Check(!SrtReadbackBatchRange(plan, site, fault, address, bytes) &&
+              address == 0x1234 && bytes == 0x5678,
+          "unsafe/non-beneficial SRT batch was accepted or changed outputs");
+  };
+  rejected(base + 273); // A partial/unaligned fault cannot identify the load's base.
+  rejected(4); // Offset underflow.
+  rejected(uint64_t{1} << 48);
+  rejected((uint64_t{1} << 48) - 4); // Peer at +300 would leave the guest address domain.
+  rejected(0x20000000 + 272); // Same page: normal recovery already coalesces it.
+  rejected(0x207b0ee60ull); // run-ds-srt.log: [0x207b0ed70, 0x207b0ee80), one page.
+  plan.shader_hash = 123;
+  rejected();
+  plan.shader_hash = 0xfbb1e69b2c2c0abdull;
+  Check(SrtReadbackBatchRange(plan, site, base + 272, address, bytes),
+        "second target hash rejected an otherwise proven batch");
+  plan.control_flow.emplace_back();
+  rejected();
+  plan.control_flow.clear();
+  site.uses = 1;
+  rejected();
+  site.uses = 6;
+  auto &memory = plan.memory_info[current->Flags<MemoryFlags>().index];
+  memory.planning_only = false;
+  rejected();
+  memory.planning_only = true;
+  memory.coherent = true;
+  rejected();
+  memory.coherent = false;
+  memory.offset = UINT32_MAX - 3; // Negative signed scalar offset is outside this proof.
+  rejected();
+  memory.offset = 272;
+  current->SetArg(1, Value(4u));
+  rejected();
+  current->SetArg(1, Value(0u));
+  current->SetArg(3, Value(false));
+  rejected();
+  current->SetArg(3, Value(true));
+  auto *first_handle = plan.srt_reads[0].value.Instruction()->Arg(0).Instruction();
+  const auto original_low = first_handle->Arg(0);
+  first_handle->SetArg(0, Value(0u)); // Other page no longer has the same base.
+  rejected();
+  first_handle->SetArg(0, original_low);
+  site.inst = program.srt_reads[1].value.Instruction(); // Not a mandatory root in this plan.
+  rejected();
+  std::puts("SrtReadbackBatchRange: all cases passed");
+}
+
 void TestSrtDescriptorProbe() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using namespace SrtDescriptorProbe;
@@ -1765,6 +1852,10 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--srt-readback-batch-only") {
+    TestSrtReadbackBatchRange();
+    return 0;
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--srt-descriptor-probe-only") {
     TestSrtDescriptorProbe();
     return 0;
@@ -1833,6 +1924,36 @@ int main(int argc, char** argv) {
     reader = {.kind = Kind::Fault, .tid = 9, .role = 1, .rip = 0x9073a9fce,
               .address = 0x1080, .fault_address = 0x1080};
     Common::SubmitProfile::SetRecording(true);
+    {
+      Origin fault = FaultOrigin({}, 0x900123450, 0x1080);
+      fault.kind = Kind::WriteFault;
+      fault.tid = 77; fault.role = 1;
+      const auto request = WriteRequestOrigin(fault, 0x1080, 1, 2);
+      Check(request.kind == Kind::WriteFault && request.rip == fault.rip && request.tid == 77 &&
+                request.role == 1 && request.bytes == 0 && request.request_bytes == 1,
+            "write request lost guest origin or mistook fault size for store width");
+      const auto unrelated = WriteRequestOrigin(fault, 0x4000, 4096, 1);
+      Check(unrelated.kind == Kind::WriteInvalidate && unrelated.rip == 0 &&
+                unrelated.address == 0x4000 && unrelated.request_bytes == 4096 && unrelated.bytes == 0 &&
+                !Same(request, unrelated),
+            "explicit invalidation inherited an unrelated write fault");
+      auto writes = std::make_unique<State>();
+      OriginScope scope(request);
+      Common::SubmitProfile::WaitSiteScope site(Common::SubmitProfile::WaitSite::ReadbackCpuWriteInvalidate);
+      RecordDownload(0x1080, 0x1084);
+      RecordDownload(0x1100, 0x1104);
+      Check(origin.downloads.count == 2 && origin.downloads.bytes == 8 && origin.downloads.fault_dirty &&
+                !origin.downloads.read_dirty && !origin.downloads.FalseShared(0x1080, 0, 0x1000),
+            "write diagnostic lost dirty intervals or invented a full-store overlap proof");
+      const auto old_calls = state->calls;
+      state->writers.Add({.address = 0x1080, .bytes = 4, .hash = 99});
+      Add(*writes, origin, 42, 11, false, &state->writers);
+      Check(writes->calls == 1 && writes->ns == 42 && state->calls == old_calls &&
+                writes->entries[0].writer.hash == 99 && writes->entries[0].request_min == 0x1080 &&
+                writes->entries[0].request_end_max == 0x1081 && writes->entries[0].download_bytes == 8,
+            "write diagnostic consumed read histogram capacity");
+      Report(*writes, 5'000'000'001ull, true);
+    }
     {
       OriginScope scope(reader);
       Common::SubmitProfile::WaitSiteScope site(Common::SubmitProfile::WaitSite::ReadbackCpuReadFault);
@@ -1907,6 +2028,7 @@ int main(int argc, char** argv) {
     return 0;
   }
   TestSrtDescriptorProbe();
+  TestSrtReadbackBatchRange();
   TestWalkerLoadsBypassSpecializationReader();
   TestIdentityResolutionPreservesTerminalValue();
   TestNativeNestedSrtRefresh();

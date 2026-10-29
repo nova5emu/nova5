@@ -1,6 +1,7 @@
 // Drives the real gate/timer runtime through A -> B -> A with trigger files and checks the
 // reports it writes to stderr: one per window, timer state never mixed, no bogus intervals.
 #include "common/submitProfile.h"
+#include "common/readbackProfile.h"
 #include "graphics/guest_gpu/submitProfileRuntime.h"
 #include <chrono>
 #include <cstdio>
@@ -14,6 +15,7 @@
 
 namespace Profile = Common::SubmitProfile;
 namespace Runtime = Libs::Graphics::SubmitProfileRuntime;
+namespace Readback = Common::ReadbackProfile;
 void Check(bool ok) { if (!ok) std::abort(); }
 
 void SetEnv(const char* name, const std::string& value) {
@@ -32,6 +34,26 @@ void Poll() {
 	Runtime::Tick();
 }
 
+// Exercise the real TLS scopes in this TU and the runtime's flush in another TU.
+// Every window is shorter than the former independent five-second report timer.
+void RecordReadbacks(unsigned count, bool unknown_write = false) {
+	Readback::RecordWriter({.address = 0x1000, .bytes = 16, .hash = count});
+	for (unsigned i = 0; i < count; ++i) {
+		{
+			Readback::OriginScope origin({.kind = Readback::Kind::Fault, .address = 0x1000, .bytes = 4});
+			Profile::WaitSiteScope site(Profile::WaitSite::ReadbackCpuReadFault);
+			Readback::WaitScope wait(i + 1);
+		}
+		{
+			Readback::OriginScope origin({.kind = unknown_write ? Readback::Kind::Unknown : Readback::Kind::WriteInvalidate,
+			                              .address = 0x1000});
+			Profile::WaitSiteScope site(Profile::WaitSite::ReadbackCpuWriteInvalidate);
+			Readback::WaitScope wait(i + 1);
+		}
+	}
+	Check(Readback::state.calls == count && Readback::WriteState() && Readback::WriteState()->calls == count);
+}
+
 int main(int argc, char** argv) {
 	const bool experiment_only = argc == 2 && std::string(argv[1]) == "--experiment-only";
 	const auto dir = std::filesystem::temp_directory_path() /
@@ -43,6 +65,7 @@ int main(int argc, char** argv) {
 	const auto log          = dir / "stderr.log";
 	// Configure before the first call: the runtime caches the environment.
 	SetEnv("KYTY_SUBMIT_PROFILE", experiment_only ? "0" : "1");
+	SetEnv("KYTY_READBACK_DETAIL", "1");
 	SetEnv("KYTY_SUBMIT_PROFILE_GATE", profile_gate.string());
 	SetEnv("KYTY_SUBMIT_PROFILE_FILE", ""); // Ignore a profiling log inherited from the shell.
 	if (experiment_only) {
@@ -84,6 +107,8 @@ int main(int argc, char** argv) {
 
 	Runtime::Tick();
 	Check(!Profile::Recording()); // Gate closed: nothing recorded yet.
+	Readback::FlushCurrentThread(Profile::NowNs());
+	Check(!Readback::WriteState()); // Flushing never allocates the write histogram.
 	Profile::RecordSubmit(99);
 
 	Touch(profile_gate);
@@ -93,13 +118,16 @@ int main(int argc, char** argv) {
 		Profile::ReasonScope reason {Profile::Reason::GfxComplete};
 		Profile::RecordSubmit(1); // Window A.
 	}
+	RecordReadbacks(1);
 	Touch(timer_gate);
 	Poll(); // A closes with timer off; B opens with timer on.
+	Check(Readback::state.calls == 0 && Readback::WriteState()->calls == 0);
 	{
 		Profile::ReasonScope reason {Profile::Reason::GfxComplete};
 		Profile::RecordSubmit(2);
 		Profile::RecordSubmit(2); // Window B.
 	}
+	RecordReadbacks(2);
 	std::filesystem::remove(timer_gate);
 	Poll(); // B closes with timer on; A' opens with timer off.
 	{
@@ -108,9 +136,11 @@ int main(int argc, char** argv) {
 		Profile::RecordSubmit(3);
 		Profile::RecordSubmit(3); // Window A'.
 	}
+	RecordReadbacks(3, true); // Unknown origin must still report waits, without invented ranges.
 	std::filesystem::remove(profile_gate);
 	Poll(); // A' closes; recording stops.
 	Check(!Profile::Recording());
+	Check(Readback::state.calls == 0 && Readback::WriteState()->calls == 0);
 	Runtime::Tick(); // Nothing further is reported while closed.
 	Touch(experiment_gate);
 	Poll();
@@ -119,21 +149,36 @@ int main(int argc, char** argv) {
 	std::filesystem::remove(experiment_gate);
 	Poll();
 	Check(!Profile::ExperimentActive());
+	Touch(profile_gate);
+	Poll(); // Reopening must not leak the preceding generation.
+	Check(Profile::Recording());
+	{
+		Profile::ReasonScope reason {Profile::Reason::GfxComplete};
+		for (unsigned i = 0; i < 4; ++i) Profile::RecordSubmit(4);
+	}
+	RecordReadbacks(4);
 	Runtime::Shutdown();
+	Check(!Profile::Recording() && Readback::state.calls == 0 && Readback::WriteState()->calls == 0);
+	Runtime::Shutdown(); // No duplicate or empty reports.
 	std::fflush(stderr);
 
 	std::ifstream input(log);
 	std::vector<std::string> reports;
+	std::vector<std::string> read_reports, write_reports, write_origins;
 	std::string events;
 	for (std::string line; std::getline(input, line);) {
 		if (line.rfind("[SUBMIT_PROFILE] {", 0) == 0) reports.push_back(line);
+		if (line.rfind("[READBACK_ORIGINS] {", 0) == 0) read_reports.push_back(line);
+		if (line.rfind("[WRITEBACK_ORIGINS] {", 0) == 0) write_reports.push_back(line);
+		if (line.rfind("[WRITEBACK_ORIGIN] {", 0) == 0) write_origins.push_back(line);
 		if (line.rfind("[SUBMIT_PROFILE_EVENT] ", 0) == 0) events += line.substr(23) + ";";
 	}
-	Check(events == "recording on;timer_1ms on;timer_1ms off;recording off;experiment on;experiment off;");
-	Check(reports.size() == 3);
-	const char* timers[] = {"\"timer_1ms\":false", "\"timer_1ms\":true", "\"timer_1ms\":false"};
-	const char* counts[] = {"\"count\":1,", "\"count\":2,", "\"count\":3,"};
-	const char* tids[]   = {"\"tid\":1,", "\"tid\":2,", "\"tid\":3,"};
+	Check(events == "recording on;timer_1ms on;timer_1ms off;recording off;experiment on;experiment off;recording on;");
+	Check(reports.size() == 4 && read_reports.size() == 4 && write_reports.size() == 4 && write_origins.size() == 4);
+	Check(write_origins[2].find("\"kind\":\"unknown\"") != std::string::npos);
+	const char* timers[] = {"\"timer_1ms\":false", "\"timer_1ms\":true", "\"timer_1ms\":false", "\"timer_1ms\":false"};
+	const char* counts[] = {"\"count\":1,", "\"count\":2,", "\"count\":3,", "\"count\":4,"};
+	const char* tids[]   = {"\"tid\":1,", "\"tid\":2,", "\"tid\":3,", "\"tid\":4,"};
 	for (size_t i = 0; i < reports.size(); ++i) {
 		const auto& r = reports[i];
 		Check(r.find(timers[i]) != std::string::npos);
@@ -141,6 +186,11 @@ int main(int argc, char** argv) {
 		Check(r.find("\"tid\":99") == std::string::npos); // Gate-closed work never reported.
 		const auto interval = std::strtod(r.c_str() + r.find("\"interval_ms\":") + 14, nullptr);
 		Check(interval > 0.0 && interval < 5000.0); // No underflowed or stale windows.
+		for (const auto* detail : {&read_reports[i], &write_reports[i]}) {
+			Check(detail->find("\"calls\":" + std::to_string(i + 1) + ",") != std::string::npos);
+			const auto detail_interval = std::strtod(detail->c_str() + detail->find("\"interval_ms\":") + 14, nullptr);
+			Check(detail_interval >= 0.0 && detail_interval < 5000.0);
+		}
 	}
 	std::error_code ignored;
 	std::filesystem::remove_all(dir, ignored);

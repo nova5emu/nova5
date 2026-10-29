@@ -35,8 +35,12 @@ La emulación de PS5 es experimental. Juegos comprobados por nosotros:
 
 | Juego | Estado | Notas |
 |---|---|---|
-| Astro Bot | En juego | Unos 10 FPS en una RTX con CPU Intel; el vuelo inicial pasó de 4–5 a más de 9 FPS con nuestras mejoras. |
+| God of War Sons of Sparta | Jugable | Completo a 60 FPS. |
+| Astro Bot | En juego | Casi siempre 55–60 FPS en el inicio y el primer nivel (i9-14900KF y RTX 4070 SUPER). |
+| Demon's Souls | En juego | Unos 6–7 FPS en el túnel del tutorial; a veces se cierra al cargarlo. |
 | Marvel's Wolverine | Arranca | Ya no se cierra al iniciar (análisis de shaders sin recursión). |
+
+Vídeos de gameplay real en la [web](https://nova5emu.github.io/nova5/gameplay.html).
 
 ## Requisitos
 

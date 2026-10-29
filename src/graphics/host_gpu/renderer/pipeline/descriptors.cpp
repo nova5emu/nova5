@@ -29,6 +29,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <bit>
+#include <cstdio>
 #include <optional>
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -665,6 +666,17 @@ TextureBinding RenderExecutor::ResolveTextureImpl(const ShaderRecompiler::IR::Im
 		auto validate = [&](const ImageInfo& info) {
 			[[maybe_unused]] Scope validation {Stage::ImageValidate};
 			const auto alignment = info.DataAlignment();
+			if (info.data.size == 0 || alignment == 0 ||
+			    (descriptor.Base40() & (static_cast<uint64_t>(alignment) - 1u)) != 0) {
+				// Rare in Demon's Souls: tell an unwritten, stale or half-written descriptor apart.
+				std::fprintf(stderr, "[BAD_TEXTURE_DESCRIPTOR] base=0x%llx size=0x%llx alignment=0x%x heap=%u written=%u mapped=%u dwords=%u:",
+				    static_cast<unsigned long long>(descriptor.Base40()), static_cast<unsigned long long>(info.data.size),
+				    static_cast<unsigned>(alignment), unsigned(resource.heap), unsigned(resource.written),
+				    unsigned(info.data.size != 0 && m_context.IsMapped(descriptor.Base40(), info.data.size)), value.dword_count);
+				for (uint32_t i = 0; i < value.dword_count && i < value.dwords.size(); ++i) std::fprintf(stderr, " %08x", value.dwords[i]);
+				std::fprintf(stderr, " program=0x%llx resource=%u\n", static_cast<unsigned long long>(description_program),
+				    description_resource);
+			}
 			EXIT_NOT_IMPLEMENTED(info.data.size == 0 || alignment == 0 ||
 			                     (descriptor.Base40() & (static_cast<uint64_t>(alignment) - 1u)) != 0);
 			// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.

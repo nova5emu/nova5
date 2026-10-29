@@ -1606,6 +1606,63 @@ bool NoteSrtControlReadback(uint64_t rip) {
 	return true;
 }
 
+bool SrtReadbackBatchRange(const ResourcePlan& plan, const ResourcePlan::WalkerReadSite& site,
+                           uint64_t fault, uint64_t& address, uint64_t& bytes) {
+	if ((plan.shader_hash != 0xfbb1e69b2c2c0abdull && plan.shader_hash != 0x09c7784d7b18346cull) ||
+	    !plan.control_flow.empty() || !(site.uses & 2u) || (fault & 3u) || fault >= (uint64_t {1} << 48u)) return false;
+	// The captured plans use raw scalar loads with zero dynamic offset. Match
+	// this shape explicitly; do not speculate through a predicate or pointer load.
+	const auto load = [&](const Inst* inst, uint32_t& offset) -> const Inst* {
+		if (!inst || inst->GetOpcode() != ValueOpcode::LoadAddressU32 || inst->NumArgs() != 4 ||
+		    inst->Arg(1) != Value(0u) || inst->Arg(2) != Value(0u) || inst->Arg(3) != Value(true)) return nullptr;
+		const auto index = inst->Flags<MemoryFlags>().index;
+		if (index >= plan.memory_info.size()) return nullptr;
+		const auto& memory = plan.memory_info[index];
+		if (memory.kind != ResourceKind::ScalarAddress || !memory.planning_only || memory.coherent ||
+		    memory.data_bits != 32 || memory.data_dwords != 1 || memory.offset > 4092 || (memory.offset & 3u)) return nullptr;
+		const auto* handle = inst->Arg(0).TryInstruction();
+		if (!handle || handle->GetOpcode() != ValueOpcode::GetAddressResource || handle->NumArgs() != 2) return nullptr;
+		offset = memory.offset;
+		return handle;
+	};
+	uint32_t current = 0;
+	const auto* base = load(site.inst, current);
+	if (!base || fault < current) return false;
+	bool root_found = false;
+	uint32_t first = current, last = current;
+	for (const auto& root: plan.srt_reads) {
+		const auto* inst = root.value.TryInstruction();
+		root_found |= inst == site.inst;
+		uint32_t offset = 0;
+		const auto* other = load(inst, offset);
+		if (!other || other->Arg(0) != base->Arg(0) || other->Arg(1) != base->Arg(1)) continue;
+		first = std::min(first, offset);
+		last = std::max(last, offset);
+	}
+	if (!root_found || first == last) return false;
+	const uint64_t resolved_base = fault - current;
+	const uint64_t begin = resolved_base + first, end = resolved_base + last + 4;
+	if (end > (uint64_t {1} << 48u) || (begin >> 12u) == ((end - 1) >> 12u)) return false;
+	// At most 4096 bytes crossing two pages. A single-page fault already downloads
+	// that page's dirty intervals; batching it would only add host work.
+	address = begin;
+	bytes = end - begin;
+	return true;
+}
+
+bool RunningSrtReadbackBatchRange(uint64_t rip, uint64_t fault, uint64_t& address, uint64_t& bytes) {
+	using namespace Common::SubmitProfile;
+	if (!ExperimentActive(Experiment::SrtReadbackBatch) || !SrtWalkerLoadLength(rip)) return false;
+	const auto& plan = *t_running_walker;
+	const auto offset = rip - reinterpret_cast<uint64_t>(plan.srt_code->getCode());
+	const auto site = std::lower_bound(plan.walker_read_sites.begin(), plan.walker_read_sites.end(), offset,
+	    [](const ResourcePlan::WalkerReadSite& entry, uint64_t key) { return entry.offset < key; });
+	if (site == plan.walker_read_sites.end() || site->offset != offset ||
+	    !SrtReadbackBatchRange(plan, *site, fault, address, bytes)) return false;
+	AddExtra(Extra::SrtBatchCandidates);
+	return true;
+}
+
 bool DescribeSrtWalkerRead(uint64_t rip, Common::ReadbackProfile::Origin& origin) {
 	if (!SrtWalkerLoadLength(rip)) return false;
 	const auto& plan = *t_running_walker;

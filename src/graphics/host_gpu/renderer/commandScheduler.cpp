@@ -106,13 +106,11 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
-	if (Common::SubmitProfile::ExperimentSelected(Common::SubmitProfile::Experiment::VkRecorder)) {
-		static const bool announced = [] {
-			std::fprintf(stderr, "[VK_RECORDER] phase=1 gameplay_supported=1 gate=command_boundary counters=cumulative\n");
-			return true;
-		}();
-		(void)announced;
-	}
+	static const bool announced = [] {
+		std::fprintf(stderr, "[VK_RECORDER] phase=1 gameplay_supported=1 default=1 gate=command_boundary counters=cumulative\n");
+		return true;
+	}();
+	(void)announced;
 }
 
 CommandScheduler::~CommandScheduler() {
@@ -435,9 +433,10 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	// direct; their queue operations keep the existing semaphore dependencies.
 	// BufferCache also calls this during RenderContext construction, before
 	// its m_gpu member exists. Use the producer's TLS, never HasGpu() there.
-	if (!m_recorder_shutdown && Common::SubmitProfile::ExperimentSelected(Common::SubmitProfile::Experiment::VkRecorder) &&
-	    GuestGpu::IsGpuThread() && this == &m_context.GetCommandScheduler()) {
-		SetRecorderEnabled(Common::SubmitProfile::ExperimentActive(Common::SubmitProfile::Experiment::VkRecorder));
+	if (!m_recorder_shutdown && Common::SubmitProfile::VkRecorderManaged() && GuestGpu::IsGpuThread() &&
+	    this == &m_context.GetCommandScheduler()) {
+		const bool enabled = Common::SubmitProfile::VkRecorderEnabled();
+		if (enabled != (m_recorder && m_recorder->Enabled())) SetRecorderEnabled(enabled);
 	}
 	if (m_recorder && m_recorder->Enabled()) {
 		m_command.m_recorder = m_recorder.get();

@@ -175,15 +175,100 @@ inline std::string Report(const ResourcePlan& plan, const ResourceSnapshot& snap
 	return out;
 }
 
+// Distinct values per profile window, compared on every dword (no hash collisions).
+// Once full, further new values are counted as unclassified, never as distinct.
+struct ValueTable {
+	static constexpr size_t Capacity = 64;
+	std::vector<std::pair<std::vector<uint32_t>, uint64_t>> values;
+	std::vector<uint32_t> last;
+	uint64_t observations = 0, repeats = 0, unclassified = 0;
+
+	void Add(std::vector<uint32_t> value) {
+		if (observations++ && value == last) ++repeats;
+		last = value;
+		for (auto& [seen, count]: values) if (seen == value) { ++count; return; }
+		if (values.size() == Capacity) { ++unclassified; return; }
+		values.emplace_back(std::move(value), 1);
+	}
+	std::string Json() const {
+		std::string out = fmt::format("{{\"observations\":{},\"repeats_last\":{},\"changes\":{},\"distinct\":{},"
+		    "\"unclassified\":{},\"values\":[", observations, repeats, observations ? observations - 1 - repeats : 0,
+		    values.size(), unclassified);
+		for (size_t i = 0; i < values.size(); ++i) {
+			out += fmt::format("{}{{\"calls\":{},\"dwords\":\"", i ? "," : "", values[i].second);
+			for (size_t w = 0; w < values[i].first.size(); ++w) out += fmt::format("{}{:08x}", w ? " " : "", values[i].first[w]);
+			out += "\"}";
+		}
+		return out + "]}";
+	}
+};
+
+// How many distinct image/sampler descriptors (and remaining flattened SRT values) a
+// target shader materializes per profile window. Diagnostic only; reads no guest memory.
+struct Variety {
+	uint64_t generation = 0, materializations = 0;
+	uint32_t stage = 0;
+	ValueTable images, samplers, pairs, flat;
+
+	void Flush(uint64_t hash) {
+		if (!materializations) return;
+		std::fprintf(stderr, "[SRT_DESCRIPTOR_VARIETY] {\"hash\":\"0x%016llx\",\"stage\":%u,\"generation\":%llu,"
+		    "\"materializations\":%llu,\"images\":%s,\"samplers\":%s,\"image_sampler_pairs\":%s,\"flat_srt\":%s}\n",
+		    (unsigned long long)hash, stage, (unsigned long long)generation, (unsigned long long)materializations,
+		    images.Json().c_str(), samplers.Json().c_str(), pairs.Json().c_str(), flat.Json().c_str());
+		*this = {};
+	}
+};
+
+template <typename Descriptors>
+std::vector<uint32_t> DescriptorWords(const Descriptors& descriptors) {
+	std::vector<uint32_t> words;
+	for (const auto& descriptor: descriptors)
+		words.insert(words.end(), descriptor.dwords.begin(), descriptor.dwords.begin() + descriptor.dword_count);
+	return words;
+}
+
+struct Shared {
+	std::mutex mutex;
+	Budget budget;
+	std::array<Variety, Targets.size()> variety;
+};
+inline Shared& State() {
+	static Shared shared;
+	return shared;
+}
+
+// Emit and reset the open windows (called when submit-profile closes a window).
+inline void FlushVariety() {
+	if (!Enabled()) return;
+	auto& shared = State();
+	std::lock_guard lock(shared.mutex);
+	for (size_t i = 0; i < Targets.size(); ++i) shared.variety[i].Flush(Targets[i]);
+}
+
 inline void Observe(const ResourcePlan& plan, const ResourceSnapshot& snapshot) {
 	if (!Enabled() || Target(plan.shader_hash) == Targets.size() || !Common::SubmitProfile::Recording()) return;
-	static std::mutex mutex;
-	static Budget budget;
+	auto& shared = State();
+	Common::SubmitProfile::Detail::window_close_hook.store(&FlushVariety, std::memory_order_release);
 	const auto generation = Common::SubmitProfile::Detail::generation.load(std::memory_order_relaxed);
 	uint32_t sample;
 	{
-		std::lock_guard lock(mutex);
-		sample = budget.Claim(plan.shader_hash, generation, true, true);
+		std::lock_guard lock(shared.mutex);
+		// Counted before the sample budget: the budget limits the IR dump, not this count.
+		auto& stats = shared.variety[Target(plan.shader_hash)];
+		if (stats.materializations && stats.generation != generation) stats.Flush(plan.shader_hash);
+		stats.generation = generation;
+		stats.stage = static_cast<uint32_t>(plan.stage);
+		++stats.materializations;
+		auto images = DescriptorWords(snapshot.images);
+		auto samplers = DescriptorWords(snapshot.samplers);
+		auto pair = images;
+		pair.insert(pair.end(), samplers.begin(), samplers.end());
+		stats.images.Add(std::move(images));
+		stats.samplers.Add(std::move(samplers));
+		stats.pairs.Add(std::move(pair));
+		stats.flat.Add({snapshot.flattened_srt.begin(), snapshot.flattened_srt.end()});
+		sample = shared.budget.Claim(plan.shader_hash, generation, true, true);
 	}
 	if (!sample) return;
 	const auto report = Report(plan, snapshot, generation, sample);

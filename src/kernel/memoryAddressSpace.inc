@@ -265,6 +265,57 @@ public:
 		return changed;
 	}
 
+	// True when [vaddr, vaddr+size) is fully mapped and none of its backing bytes is also
+	// mapped at another guest address (a CPU write there could bypass that alias's tracking).
+	bool IsUniqueRange(uint64_t vaddr, uint64_t size) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) return false;
+		std::shared_lock lock(m_mutex);
+		const auto end = vaddr + size;
+		auto mapping = m_maps.upper_bound(vaddr);
+		if (mapping == m_maps.begin()) return false;
+		--mapping;
+		for (auto current = vaddr; current < end; ++mapping) {
+			if (mapping == m_maps.end() || current < mapping->second.vaddr ||
+			    current >= mapping->second.vaddr + mapping->second.size) return false;
+			const auto& entry = mapping->second;
+			const auto bytes = std::min(end, entry.vaddr + entry.size) - current;
+			const auto physical = entry.backing_offset + current - entry.vaddr;
+			for (const auto& [other_vaddr, other]: m_maps) {
+				if (other_vaddr != mapping->first && physical < other.backing_offset + other.size &&
+				    other.backing_offset < physical + bytes) return false;
+			}
+			current += bytes;
+		}
+		return true;
+	}
+
+	// One naturally aligned 1/2/4/8-byte load from a single mapping, performed at the
+	// access width (never split like memcpy), so it matches the emulated guest load.
+	bool TryLoadBackingAligned(uint64_t vaddr, void* data, uint64_t size) {
+		if (!IsAvailable() || data == nullptr || (size != 1 && size != 2 && size != 4 && size != 8) ||
+		    (vaddr & (size - 1)) != 0 || UINT64_MAX - vaddr < size) return false;
+		std::shared_lock lock(m_mutex);
+		auto mapping = m_maps.upper_bound(vaddr);
+		if (mapping == m_maps.begin()) return false;
+		--mapping;
+		const auto& entry = mapping->second;
+		if (vaddr < entry.vaddr || vaddr + size > entry.vaddr + entry.size) return false;
+		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
+		if ((offset & (size - 1)) != 0 || !RangeOk(offset, size)) return false;
+		auto* source = m_backing_base + offset;
+		const auto load = [&]<typename T>() {
+			const T value = std::atomic_ref<T>(*reinterpret_cast<T*>(source)).load(std::memory_order_relaxed);
+			std::memcpy(data, &value, sizeof(T));
+		};
+		switch (size) {
+			case 1: load.template operator()<uint8_t>(); break;
+			case 2: load.template operator()<uint16_t>(); break;
+			case 4: load.template operator()<uint32_t>(); break;
+			default: load.template operator()<uint64_t>(); break;
+		}
+		return true;
+	}
+
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -825,6 +876,16 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	bool TryLoadBackingAligned(uint64_t vaddr, void* data, uint64_t size) {
+		return m_backing->TryLoadBackingAligned(vaddr, data, size);
+	}
+
+	bool IsUniqueBackingRange(uint64_t vaddr, uint64_t size) {
+		if (!Owns(vaddr, size)) return false;
+		std::shared_lock lock(m_mutex);
+		return !OverlapsPrivateUnlocked(vaddr, size) && m_backing->IsUniqueRange(vaddr, size);
 	}
 
 	bool TryCompareExchangeBacking64(uint64_t vaddr, uint64_t expected, uint64_t value) {

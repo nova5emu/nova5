@@ -487,6 +487,22 @@ int main(int argc, char** argv) {
 #endif
 	Check(ParseExperiment("") == Experiment::None && ParseExperiment("typo") == Experiment::None);
 	Check(ParseExperiment("release-mem") == Experiment::ReleaseMem);
+	Check(ParseExperiment("srt-readback-batch") == Experiment::SrtReadbackBatch);
+	Check(ParseExperiment("srt-readback-batch-extra") == Experiment::None);
+	Check(ParseExperiment("write-readback-ahead") == Experiment::WriteReadbackAhead);
+	Check(ParseExperiment("write-readback-ahead-extra") == Experiment::None);
+	Check(ParseExperiment("read-readback-ahead") == Experiment::ReadReadbackAhead);
+	Check(ParseExperiment("read-readback-ahead-extra") == Experiment::None);
+	Check(static_cast<uint32_t>(ParseExperiment("write-readback-ahead,read-readback-ahead")) == 6144);
+	Check(ParseExperiment("no-readback-ahead") == Experiment::NoReadbackAhead);
+	Check(ParseExperiment("readback-ahead-sparse") == Experiment::ReadbackAheadSparse);
+	Check(ParseExperiment("no-vk-recorder") == Experiment::NoVkRecorder);
+	for (const auto pages : {2u, 4u, 8u, 16u})
+		Check(Common::ReadbackAhead::ParsePages(std::to_string(pages)) == pages);
+	for (const auto* invalid : {"", "0", "1", "17", "-8", "+8", "8pages", " 8", "8 ", "999999999999999999999"})
+		Check(Common::ReadbackAhead::ParsePages(invalid) == Common::ReadbackAhead::DefaultPages);
+	Check(static_cast<uint32_t>(ParseExperiment("write-readback-ahead,srt-readback-batch")) == 3072);
+	Check(static_cast<uint32_t>(ParseExperiment("srt-readback-batch,vk-recorder")) == 1536);
 	Check(ParseExperiment("image-resolve-reuse") == Experiment::None);
 	Check(ParseExperiment("host-cached-stream") == Experiment::None);
 	Check(ParseExperiment("small-buffer-persistent") == Experiment::None);
@@ -685,6 +701,9 @@ int main(int argc, char** argv) {
 
 	// One JSON line with every section; the report starts a new window.
 	const auto text = Capture(true, 5000);
+	Check(text.find("\"readback_ahead_config\":{\"write_pages\":" +
+	    std::to_string(Common::ReadbackAhead::WritePages()) + ",\"read_pages\":" +
+	    std::to_string(Common::ReadbackAhead::ReadPages()) + "}") != std::string::npos);
 	Check(text.rfind("[SUBMIT_PROFILE] {", 0) == 0 && text.back() == '\n');
 	Check(Contains(text, "\"timer_1ms\":true"));
 	Check(Contains(text, "{\"reason\":\"gfx_suspended\",\"origin\":\"gfx_pm4\",\"count\":2,"

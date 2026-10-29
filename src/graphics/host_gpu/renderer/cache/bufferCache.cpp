@@ -231,6 +231,10 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 		    ForgetColorMetadataChecks(address, bytes);
+		    if (!m_clean_read_pages.empty()) {
+			    for (auto page = address & ~uint64_t {4095}; page < address + bytes; page += 4096)
+				    m_clean_read_pages.erase(page);
+		    }
 	    });
 	if constexpr (!async) {
 		// Payload bytes only: total_size also counts the 64-byte packing of each range.
@@ -475,24 +479,117 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write,
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, site, cause] {
+	const auto read = [this, vaddr, size, is_write, site, cause] {
 		Common::SubmitProfile::WaitSiteScope profile_site(site);
 		Common::SubmitProfile::RecordReadbackBytes(size, 0); // Every request, including early returns.
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		if (site == Common::SubmitProfile::WaitSite::ReadbackCpuWriteInvalidate && Common::ReadbackProfile::Enabled()) {
+			Common::ReadbackProfile::origin.owner_address = buffer.CpuAddress();
+			Common::ReadbackProfile::origin.owner_bytes = buffer.Size();
+		}
 
-		const bool downloaded = DownloadBufferMemory<false>(buffer, vaddr, size);
+		GuestRange download {vaddr, size};
+		using Experiment = Common::SubmitProfile::Experiment;
+		using Extra = Common::SubmitProfile::Extra;
+		if (size == 1 &&
+		    ((is_write && cause == Common::BufferUploadProfile::Cause::CpuWriteFault &&
+		      site == Common::SubmitProfile::WaitSite::ReadbackCpuWriteInvalidate &&
+		      Common::SubmitProfile::ReadbackAheadEnabled()) ||
+		     (!is_write && site == Common::SubmitProfile::WaitSite::ReadbackCpuReadFault &&
+		      Common::SubmitProfile::ReadbackAheadEnabled()))) {
+			download = FaultReadbackRange(buffer, vaddr, is_write);
+		}
+		const bool downloaded = DownloadBufferMemory<false>(buffer, download.address, download.size);
 		if (downloaded) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+			m_memory_tracker.UnmarkRegionAsGpuModified(download.address, download.size);
+			if (download.size > size) {
+				Common::SubmitProfile::AddExtra(is_write ? Extra::WriteAheadBatches : Extra::ReadAheadBatches);
+				Common::SubmitProfile::AddExtra(is_write ? Extra::WriteAheadPages : Extra::ReadAheadPages, download.size / TRACKER_PAGE_SIZE);
+				Common::SubmitProfile::AddExtra(is_write ? Extra::WriteAheadExtraBytes : Extra::ReadAheadExtraBytes, download.size - TRACKER_PAGE_SIZE);
+			}
 		}
 		if (is_write) {
+			// Only the fault's page becomes CPU-dirty/writable. Prefetched pages
+			// retain write tracking; a subsequent GPU writer protects them again.
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size,
 			    downloaded ? Common::BufferUploadProfile::AfterDownload(cause) : cause);
 			QueueBdaSync(vaddr, size);
 		}
-	});
+	};
+	if (site == Common::SubmitProfile::WaitSite::ReadbackCpuWriteInvalidate && Common::ReadbackProfile::Enabled()) {
+		const auto request = Common::ReadbackProfile::WriteRequestOrigin(
+		    Common::ReadbackProfile::origin, vaddr, size, static_cast<uint32_t>(cause));
+		m_scheduler.Context().GetGpu().SendCommandSync([read, request] {
+			Common::ReadbackProfile::OriginScope attribution(request);
+			read();
+		});
+	} else {
+		m_scheduler.Context().GetGpu().SendCommandSync(read);
+	}
+}
+
+bool BufferCache::ConsumeCleanReadBudget(uint64_t page) {
+	// Bounded: when full, pages take normal recovery; nothing is evicted, so a
+	// repeatedly read page can never regain its budget without being downloaded.
+	constexpr size_t capacity = 4096;
+	if (m_clean_read_pages.contains(page) || m_clean_read_pages.size() >= capacity) return false;
+	m_clean_read_pages.insert(page);
+	return true;
+}
+
+GuestRange BufferCache::FaultReadbackRange(const Buffer& buffer, uint64_t fault, bool write) {
+	using Extra = Common::SubmitProfile::Extra;
+	const auto limit = write ? Common::ReadbackAhead::WritePages() : Common::ReadbackAhead::ReadPages();
+	const auto sparse = write ? Extra::WriteAheadRejectSparse : Extra::ReadAheadRejectSparse;
+	const auto range = write ? Extra::WriteAheadRejectRange : Extra::ReadAheadRejectRange;
+	Common::SubmitProfile::AddExtra(write ? Extra::WriteAheadAttempts : Extra::ReadAheadAttempts);
+	const GuestRange original {fault, 1};
+	const auto reject = [&](Extra reason) {
+		Common::SubmitProfile::AddExtra(reason);
+		return original;
+	};
+	if (!GuestGpu::IsGpuThread()) return reject(range);
+	if (HasUnpublishedDownloads()) return reject(write ? Extra::WriteAheadRejectPending : Extra::ReadAheadRejectPending);
+	// No import lifecycle changes or backing writes into live imported memory.
+	if (Common::GuestHostImport::retained_bytes.load(std::memory_order_relaxed))
+		return reject(write ? Extra::WriteAheadRejectImport : Extra::ReadAheadRejectImport);
+	const auto first = fault & ~(TRACKER_PAGE_SIZE - 1);
+	// Candidate: also accept pages with only some GPU-dirty bytes. The download still copies
+	// just the GPU-modified intervals of each page (as the single-page path does), and pages
+	// with CPU data pending upload stay excluded, so no CPU bytes are overwritten.
+	const bool partial_pages = Common::SubmitProfile::ExperimentActive(
+	    Common::SubmitProfile::Experiment::ReadbackAheadSparse);
+	uint64_t bytes = 0;
+	Extra stop = sparse;
+	for (unsigned page = 0; page < limit; ++page) {
+		const auto address = first + page * TRACKER_PAGE_SIZE;
+		if (!GuestRange {address, TRACKER_PAGE_SIZE}.Valid() ||
+		    !buffer.IsInBounds(address, TRACKER_PAGE_SIZE) ||
+		    !m_scheduler.Context().IsMapped(address, TRACKER_PAGE_SIZE)) {
+			stop = range;
+			break;
+		}
+		// Full conservative dirty coverage, not just a bound resource or one
+		// dirty byte in a page. Stop at holes, sparse labels and CPU-owned pages.
+		if (!(partial_pages ? m_gpu_modified_ranges.Intersects(address, TRACKER_PAGE_SIZE)
+		                    : m_gpu_modified_ranges.Contains(address, TRACKER_PAGE_SIZE)) ||
+		    !m_memory_tracker.IsRegionGpuModified(address, TRACKER_PAGE_SIZE) ||
+		    m_memory_tracker.IsRegionCpuModified(address, TRACKER_PAGE_SIZE)) {
+			if (page == 0) Common::SubmitProfile::AddExtra(
+			    write ? Extra::WriteAheadRejectFirstPage : Extra::ReadAheadRejectFirstPage);
+			break;
+		}
+		bytes += TRACKER_PAGE_SIZE;
+	}
+	if (bytes < 2 * TRACKER_PAGE_SIZE) return reject(stop);
+	if (bytes == limit * TRACKER_PAGE_SIZE)
+		Common::SubmitProfile::AddExtra(write ? Extra::WriteAheadLimitHits : Extra::ReadAheadLimitHits);
+	// No owner creation/merge, discarded GPU data or predicted CPU store widths.
+	// DownloadBufferMemory uses the normal copy, timeline and publication ordering.
+	return {first, bytes};
 }
 
 uint64_t BufferCache::ContiguousRegisteredSize(uint64_t vaddr, uint64_t limit) const {
@@ -508,6 +605,23 @@ uint64_t BufferCache::ContiguousRegisteredSize(uint64_t vaddr, uint64_t limit) c
 		if (buffer_end > end) end = std::min(stop, buffer_end);
 	}
 	return end - vaddr;
+}
+
+bool BufferCache::TryReadSrtBatch(uint64_t fault, uint64_t address, uint64_t bytes) {
+	if (!GuestGpu::IsGpuThread() || bytes < 8 || bytes > 4096 || (address & 3u) || (bytes & 3u) ||
+	    !GuestRange {address, bytes}.Valid() || fault < address || fault - address > bytes - 4 ||
+	    (fault & 3u) || HasUnpublishedDownloads() || !m_scheduler.Context().IsMapped(address, bytes)) return false;
+	const auto first_page = address & ~uint64_t {4095};
+	const auto last_page = (address + bytes - 1) & ~uint64_t {4095};
+	if (last_page != first_page + 4096 || !HasGpuDirtyBytes(fault, 4) ||
+	    !HasGpuDirtyBytes(first_page, 4096) || !HasGpuDirtyBytes(last_page, 4096)) return false;
+	// Never create or merge cache buffers to widen a readback in a fault handler.
+	const auto* owner = m_page_table.Find(address >> PageTable::kPageBits);
+	if (!owner || !*owner || !m_slot_buffers[*owner].IsInBounds(address, bytes)) return false;
+	ReadMemory(address, bytes, false, Common::SubmitProfile::WaitSite::ReadbackCpuReadFault);
+	Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::SrtBatchReadbacks);
+	Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::SrtBatchRequestedBytes, bytes);
+	return true;
 }
 
 bool BufferCache::TouchRegisteredRange(uint64_t vaddr, uint64_t size) {

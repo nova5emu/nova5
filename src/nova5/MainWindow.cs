@@ -138,6 +138,14 @@ public sealed class MainWindow : Window
 		brand.Children.Add(Logo(52));
 		brand.Children.Add(Text("Nova5", 34, FontWeight.Bold));
 		brand.Children.Add(new TextBlock { Text = "EMULADOR", FontSize = 18, FontWeight = FontWeight.Light, Foreground = Palette.Brush(Palette.Muted), LetterSpacing = 3, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 4, 0, 0) });
+		// Opens the Ko-fi page straight away (also listed in Settings for controller users).
+		var donate = Pill(Text("☕ Donar", 18, FontWeight.SemiBold, Palette.AuroraA));
+		donate.BorderBrush       = Palette.Aurora();
+		donate.Cursor            = new Cursor(StandardCursorType.Hand);
+		donate.VerticalAlignment = VerticalAlignment.Center;
+		donate.Margin            = new Thickness(12, 4, 0, 0);
+		donate.PointerPressed += (_, _) => Process.Start(new ProcessStartInfo("https://ko-fi.com/nova5emu") { UseShellExecute = true });
+		brand.Children.Add(donate);
 		Place(stage, brand, 72, 34);
 
 		var status = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 28, VerticalAlignment = VerticalAlignment.Center };
@@ -740,6 +748,8 @@ public sealed class MainWindow : Window
 		new(_update is null ? $"Buscar actualizaciones (tienes la {Updates.Current})" : $"Actualizar a Nova5 {_update.Version}",
 		    () => _updating ? "Actualizando…" : "", _ => { if (_update is null) CheckUpdates(true); else StartUpdate(); }),
 		new("Añadir carpeta de juegos", () => "", _ => AddFolder()),
+		new("Donar a Nova5 en Ko-fi ☕", () => "ko-fi.com/nova5emu",
+		    _ => Process.Start(new ProcessStartInfo("https://ko-fi.com/nova5emu") { UseShellExecute = true })),
 		new("Salir de Nova5", () => "", _ => ShowPrompt(true)),
 	};
 

@@ -21,6 +21,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/elf.h"
+#include "loader/demonsSoulsGpuPages.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
@@ -652,6 +653,16 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Distinguishes an instruction TryEmulateRead refused from a refusal by the reader.
+// The reader may also run normal recovery in the same GPU-thread request.
+static thread_local bool guest_clean_reader_called = false, guest_clean_recovered = false;
+static thread_local uint64_t guest_clean_fault = 0;
+static bool GuestCleanRead(uint64_t address, void* destination, uint64_t size) {
+	guest_clean_reader_called = true;
+	return Libs::LibKernel::Memory::TryLoadCleanGuestRead(guest_clean_fault, address, destination, size,
+	                                                      guest_clean_recovered);
+}
+
 bool HandleGpuAccessFault(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -670,10 +681,13 @@ bool HandleGpuAccessFault(const Common::HostException::ExceptionInfo& exception_
 		{
 			namespace Attribution = Common::ReadbackProfile;
 			std::optional<Attribution::OriginScope> reader_scope;
-			if (Attribution::Enabled() && access == GpuAccess::Read) {
+			if (Attribution::Enabled() && (access == GpuAccess::Read || access == GpuAccess::Write)) {
 				auto reader = Attribution::FaultOrigin(Attribution::origin, info->exception_address,
 				                                      info->access_violation_vaddr);
-				Libs::Graphics::ShaderRecompiler::IR::DescribeSrtWalkerRead(info->exception_address, reader);
+				if (access == GpuAccess::Write) {
+					reader = Attribution::FaultOrigin({}, info->exception_address, info->access_violation_vaddr);
+					reader.kind = Attribution::Kind::WriteFault;
+				} else Libs::Graphics::ShaderRecompiler::IR::DescribeSrtWalkerRead(info->exception_address, reader);
 				reader_scope.emplace(reader);
 			}
 			Common::SubmitProfile::Diagnostics::FaultScope profile(access == GpuAccess::Write);
@@ -704,8 +718,34 @@ bool HandleGpuAccessFault(const Common::HostException::ExceptionInfo& exception_
 					}
 				}
 			}
+			if (!handled && !walker_load && access == GpuAccess::Read &&
+			    Common::SubmitProfile::ExperimentActive(Common::SubmitProfile::Experiment::GuestCleanReads)) {
+				// Clean bytes on a GPU-dirty page: load them without a readback; the page
+				// stays protected. Rejections at any step fall through to normal recovery.
+				const auto bytes = std::min<uint64_t>(15, 4096 - (info->exception_address & 4095));
+				guest_clean_reader_called = guest_clean_recovered = false;
+				guest_clean_fault = info->access_violation_vaddr;
+				if (IsReadableRange(info->exception_address, bytes) &&
+				    Loader::X64InstructionEmulator::TryEmulateRead(
+				        {reinterpret_cast<const uint8_t*>(info->exception_address), static_cast<size_t>(bytes)},
+				        *info, GuestCleanRead)) {
+					handled = true;
+					read_profile.ServedClean();
+				} else if (guest_clean_recovered) {
+					handled = true; // Recovered inside the request: retry the original instruction.
+				} else if (!guest_clean_reader_called) {
+					Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::GuestCleanRejectInstruction);
+				}
+			}
 			if (!handled) {
-				handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+				uint64_t batch_address = 0, batch_bytes = 0;
+				if (walker_load && IR::RunningSrtReadbackBatchRange(info->exception_address,
+				        info->access_violation_vaddr, batch_address, batch_bytes)) {
+					handled = Libs::LibKernel::Memory::TryReadSrtBatch(
+					    info->access_violation_vaddr, batch_address, batch_bytes);
+					if (!handled) Common::SubmitProfile::AddExtra(Common::SubmitProfile::Extra::SrtBatchFallbacks);
+				}
+				if (!handled) handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
 				// Learn on the originating walker thread after synchronous recovery,
 				// including delegated readbacks. Independent of diagnostic gates and
 				// temporary control fallback; clean alias service above is not a readback.
@@ -1370,6 +1410,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
+	DemonsSoulsGpuPages::Install(m_programs.empty() ? nullptr : m_programs.front());
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}
@@ -1400,6 +1441,7 @@ void RuntimeLinker::Clear() {
 
 	Common::LockGuard lock(m_mutex);
 	GamePatch::Clear();
+	DemonsSoulsGpuPages::Clear();
 
 	for (auto* p: m_programs) {
 		DeleteProgram(p);

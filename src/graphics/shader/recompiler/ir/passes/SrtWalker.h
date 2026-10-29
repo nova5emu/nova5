@@ -91,6 +91,12 @@ bool WalkedActive(const ResourcePlan& plan, uint32_t source);
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
 bool DescribeSrtWalkerRead(uint64_t rip, Common::ReadbackProfile::Origin& origin);
+// Pure proof of a bounded span of unconditional scalar roots sharing the exact
+// base operands. No guest reads, value caching, or assumption of immutability.
+bool SrtReadbackBatchRange(const ResourcePlan& plan, const ResourcePlan::WalkerReadSite& site,
+                           uint64_t fault, uint64_t& address, uint64_t& bytes);
+// Looks up the fault in the running walker, only while the A/B gate is active.
+bool RunningSrtReadbackBatchRange(uint64_t rip, uint64_t fault, uint64_t& address, uint64_t& bytes);
 // Called only after a real tracked read fault was handled, never for a clean-read bypass.
 // Remains enabled during fallback. Call on the originating walker thread AFTER
 // synchronous fault recovery returns, including recovery delegated to GuestGpu.

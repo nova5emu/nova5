@@ -795,6 +795,7 @@ if(BUILD_TESTING)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
+	add_test(NAME readback_origins COMMAND $<TARGET_FILE:resource_materialization_tests> --readback-origins-only)
 	add_test(NAME walker_control_gpu COMMAND $<TARGET_FILE:resource_materialization_tests> --walker-control-only)
 	add_test(NAME walker_control_gpu_combined COMMAND $<TARGET_FILE:resource_materialization_tests> --walker-control-combined-only)
 	add_test(NAME walker_control_gpu_disabled COMMAND $<TARGET_FILE:resource_materialization_tests> --walker-control-disabled-only)
@@ -955,6 +956,16 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME buffer_cache_write_readback_ahead
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --write-readback-ahead-only)
+	foreach(pages IN ITEMS 8 16)
+		add_test(NAME buffer_cache_write_readback_ahead_${pages}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --write-readback-ahead-only ${pages})
+	endforeach()
+	foreach(pages IN ITEMS 4 8 16)
+		add_test(NAME buffer_cache_read_readback_ahead_${pages}
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --read-readback-ahead-only ${pages})
+	endforeach()
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
@@ -967,6 +978,8 @@ if(BUILD_TESTING)
 	if(WIN32)
 		add_test(NAME gpu_clean_reads
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --clean-reads-only)
+		add_test(NAME gpu_guest_clean_reads
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --guest-clean-reads-only)
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS

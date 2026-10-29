@@ -3,6 +3,8 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "common/readbackProfile.h"
+#include "common/submitProfile.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -908,6 +910,64 @@ bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr && g_guest_address_space->IsUniqueBackingRange(vaddr, size);
+}
+
+bool TryReadCpuOwnedBacking(uint64_t vaddr, void* data, uint64_t size) {
+	// GPU thread only: bytes no GPU write or pending publication owns, from any page,
+	// without a fault or readback. Image-backed ranges are left to the normal path.
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() || data == nullptr ||
+	    size == 0 || !IsGpuAddressRange(vaddr, size) || !GetGpuResources().IsMapped(vaddr, size)) return false;
+	auto& buffers = GetGpuResources().GetBufferCache();
+	if (buffers.HasUnpublishedDownloads() || buffers.HasGpuDirtyBytes(vaddr, size) ||
+	    GetGpuResources().GetTextureCache().FindImageFromRange(vaddr, size, false)) return false;
+	return TryReadBacking(vaddr, data, size);
+}
+
+bool TryLoadCleanGuestRead(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size, bool& recovered) {
+	// A guest load that faulted on a GPU-dirty page but reads only clean bytes. Ownership
+	// is checked and the value loaded in one GuestGpu command, with nothing in between.
+	// Any rejection inside that command runs the normal read recovery right there
+	// (recovered=true: retry the instruction), so a rejection never costs a second trip.
+	using Common::SubmitProfile::AddExtra;
+	using Extra = Common::SubmitProfile::Extra;
+	constexpr uint64_t page_size = 4096;
+	recovered = false;
+	if (g_gpu_resources == nullptr || g_guest_address_space == nullptr || data == nullptr ||
+	    (size != 1 && size != 2 && size != 4 && size != 8) || (vaddr & (size - 1)) != 0) {
+		AddExtra(Extra::GuestCleanRejectWidth);
+		return false;
+	}
+	if (!IsGpuAddressRange(vaddr, size)) {
+		AddExtra(Extra::GuestCleanRejectBacking);
+		return false;
+	}
+	bool loaded = false;
+	const auto origin = Common::ReadbackProfile::origin;
+	const auto load = [&] {
+		const auto page = vaddr & ~(page_size - 1);
+		auto& buffers = GetGpuResources().GetBufferCache();
+		const auto reject = [&](Extra reason) {
+			AddExtra(reason);
+			Common::ReadbackProfile::OriginScope scope(origin);
+			recovered = GetGpuResources().HandleFault(Graphics::PageFaultAccess::Read, fault_vaddr);
+			if (recovered) AddExtra(Extra::GuestCleanRecovered);
+		};
+		if (!GetGpuResources().IsMapped(vaddr, size)) return reject(Extra::GuestCleanRejectBacking);
+		if (buffers.HasUnpublishedDownloads()) return reject(Extra::GuestCleanRejectPending);
+		if (!buffers.IsRegionGpuModified(page, page_size) || !buffers.HasGpuDirtyBytes(page, page_size) ||
+		    buffers.HasGpuDirtyBytes(vaddr, size)) return reject(Extra::GuestCleanRejectDirty);
+		if (!buffers.ConsumeCleanReadBudget(page)) return reject(Extra::GuestCleanRejectBudget);
+		loaded = g_guest_address_space->TryLoadBackingAligned(vaddr, data, size);
+		if (loaded) AddExtra(Extra::GuestCleanServed);
+		else reject(Extra::GuestCleanRejectBacking);
+	};
+	if (Graphics::GuestGpu::IsGpuThread()) load();
+	else GetGpuResources().GetGpu().SendCommandSync([&] { load(); });
+	return loaded;
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
@@ -947,6 +1007,11 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
+}
+
+bool TryReadSrtBatch(uint64_t fault, uint64_t address, uint64_t bytes) {
+	return g_gpu_resources != nullptr && IsGpuAddressRange(address, bytes) &&
+	       g_gpu_resources->GetBufferCache().TryReadSrtBatch(fault, address, bytes);
 }
 
 struct PrtAperture {

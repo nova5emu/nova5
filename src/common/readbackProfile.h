@@ -2,6 +2,7 @@
 
 #include "common/submitProfile.h"
 
+#include <memory>
 #include <utility>
 
 // Opt-in cold-read attribution, independent of render-stage clocks. No values,
@@ -135,8 +136,8 @@ private:
     Phase previous_phase;
 };
 } // namespace DrawWork
-enum class Kind { Unknown, Fault, IndirectCount, IndirectRecords, Walker, IndirectInstances };
-inline constexpr std::array KindNames {"unknown", "fault", "indirect_count", "indirect_records", "walker", "indirect_instances"};
+enum class Kind { Unknown, Fault, IndirectCount, IndirectRecords, Walker, IndirectInstances, WriteFault, WriteInvalidate };
+inline constexpr std::array KindNames {"unknown", "fault", "indirect_count", "indirect_records", "walker", "indirect_instances", "write_fault", "write_invalidate"};
 inline bool Overlaps(uint64_t a, uint64_t n, uint64_t b, uint64_t m) {
 	return n && m && (a <= b ? b - a < n : a - b < m);
 }
@@ -174,6 +175,10 @@ struct Origin {
 	uint32_t record_index = 0, record_stride = 0, record_count = 0;
 	uint32_t vertex_register = 0, instance_register = 0, index_register = 0;
 	bool indexed = false;
+	// Write invalidation requests are NOT decoded CPU store extents. A fault
+	// commonly requests one byte while recovery downloads dirty page intervals.
+	uint64_t request_address = 0, request_bytes = 0, owner_address = 0, owner_bytes = 0;
+	uint32_t write_cause = 0;
 };
 // Preserve an explicit annotation only for the load it describes. An unrelated
 // nested fault (e.g. shader preparation) must retain its own attribution.
@@ -189,6 +194,20 @@ inline Origin FaultOrigin(Origin reader, uint64_t rip, uint64_t fault) {
 	return reader;
 }
 inline thread_local Origin origin;
+inline Origin WriteRequestOrigin(Origin value, uint64_t address, uint64_t bytes, uint32_t cause) {
+	if (value.kind != Kind::WriteFault || !Overlaps(address, bytes, value.fault_address, 1)) {
+		value = {};
+		value.kind = Kind::WriteInvalidate;
+		value.address = address;
+		value.tid = SubmitProfile::Diagnostics::ThreadId();
+		value.role = static_cast<uint32_t>(SubmitProfile::Diagnostics::role);
+	}
+	value.bytes = 0; // Neither the OS fault nor InvalidateMemory proves a store width.
+	value.downloads = {};
+	value.request_address = address; value.request_bytes = bytes; value.write_cause = cause;
+	value.owner_address = value.owner_bytes = 0;
+	return value;
+}
 class OriginScope {
 public:
 	explicit OriginScope(Origin value): previous(origin) { origin = value; }
@@ -232,27 +251,49 @@ struct Entry {
 	Writer writer;
 	uint64_t calls = 0, ns = 0, tick = 0;
 	uint64_t unknown_width = 0, dirty_fault_byte = 0, dirty_read = 0, false_shared = 0;
+	uint64_t request_min = UINT64_MAX, request_end_max = 0, download_bytes = 0;
 	bool local_fault_scope = false;
+};
+// Same waits keyed by the reader's semantics only (no rip/JIT offset/address), so
+// one shader read site stays one row however its code is reached.
+struct KeyEntry {
+	Kind kind = Kind::Unknown;
+	uint32_t role = 0, stage = 0, memory = UINT32_MAX, descriptor = UINT32_MAX, flat_slot = UINT32_MAX, uses = 0;
+	uint64_t hash = 0, calls = 0, ns = 0, download_bytes = 0, false_shared = 0, false_shared_ns = 0;
+	bool Matches(const Origin& r) const {
+		return kind == r.kind && role == r.role && stage == r.stage && memory == r.memory &&
+		       descriptor == r.descriptor && flat_slot == r.flat_slot && uses == r.uses && hash == r.hash;
+	}
 };
 struct State {
 	std::array<Entry, 64> entries {};
+	std::array<KeyEntry, 256> keys {};
 	Writers writers;
-	uint64_t generation = UINT64_MAX, start = 0, calls = 0, ns = 0, overflow = 0, reports = 0;
+	uint64_t generation = UINT64_MAX, start = 0, calls = 0, ns = 0, overflow = 0, key_overflow = 0, reports = 0;
 };
 inline thread_local State state;
+// Allocated only when an attributed write invalidation actually waits. Separate
+// capacity prevents reads from evicting write sites (or changing read reports).
+// A function-local thread_local: lld cannot link an inline thread_local with a destructor.
+inline std::unique_ptr<State>& WriteState() {
+	static thread_local std::unique_ptr<State> write_state;
+	return write_state;
+}
 inline void RecordDownload(uint64_t start, uint64_t end) {
+	const auto site = SubmitProfile::CurrentWaitSite();
 	if (!Enabled() || origin.kind == Kind::Unknown ||
-	    SubmitProfile::CurrentWaitSite() != SubmitProfile::WaitSite::ReadbackCpuReadFault) return;
-	if (end > start) DrawWork::Record(DrawWork::Op::BufferReadback, start, end - start, 0, 0, 0, 0,
+	    (site != SubmitProfile::WaitSite::ReadbackCpuReadFault &&
+	     site != SubmitProfile::WaitSite::ReadbackCpuWriteInvalidate)) return;
+	if (end > start && site == SubmitProfile::WaitSite::ReadbackCpuReadFault) DrawWork::Record(DrawWork::Op::BufferReadback, start, end - start, 0, 0, 0, 0,
 	    static_cast<uint32_t>(SubmitProfile::Diagnostics::role), end - start);
 	origin.downloads.Observe(origin.address, origin.bytes, origin.fault_address, origin.rip != 0, start, end);
 }
 inline bool Same(const Origin& a, const Origin& b) {
 	return a.kind == b.kind && a.rip == b.rip && a.hash == b.hash && a.memory == b.memory &&
-	       a.jit_offset == b.jit_offset && a.tid == b.tid && a.role == b.role;
+	       a.jit_offset == b.jit_offset && a.tid == b.tid && a.role == b.role && a.write_cause == b.write_cause;
 }
 inline void ResetWindow(State& s, uint64_t now, uint64_t generation) {
-	s.entries = {}; s.calls = s.ns = s.overflow = 0; s.start = now; s.generation = generation;
+	s.entries = {}; s.keys = {}; s.calls = s.ns = s.overflow = s.key_overflow = 0; s.start = now; s.generation = generation;
 }
 inline void RecordWriter(Writer writer) {
 	if (!Enabled() || !writer.bytes) return;
@@ -263,13 +304,35 @@ inline void RecordWriter(Writer writer) {
 	}
 	state.writers.Add(writer);
 }
-inline void Add(State& s, Origin reader, uint64_t elapsed, uint64_t tick, bool local) {
+inline void AddKey(State& s, const Origin& reader, uint64_t elapsed) {
+	for (auto& k: s.keys) {
+		if (k.calls && !k.Matches(reader)) continue;
+		if (!k.calls) {
+			k.kind = reader.kind; k.role = reader.role; k.stage = reader.stage; k.memory = reader.memory;
+			k.descriptor = reader.descriptor; k.flat_slot = reader.flat_slot; k.uses = reader.uses; k.hash = reader.hash;
+		}
+		++k.calls; k.ns += elapsed; k.download_bytes += reader.downloads.bytes;
+		if (reader.downloads.FalseShared(reader.address, reader.bytes,
+		        (reader.rip ? reader.fault_address : reader.address) & ~uint64_t{4095})) {
+			++k.false_shared; k.false_shared_ns += elapsed;
+		}
+		return;
+	}
+	++s.key_overflow;
+}
+inline void Add(State& s, Origin reader, uint64_t elapsed, uint64_t tick, bool local, const Writers* writers = nullptr) {
 	++s.calls; s.ns += elapsed;
+	AddKey(s, reader, elapsed);
 	for (auto& e: s.entries) {
 		if (!e.calls || (Same(e.last, reader) && e.local_fault_scope == local)) {
 			e.last = reader; ++e.calls; e.ns += elapsed; e.tick = tick;
+			e.download_bytes += reader.downloads.bytes;
+			if (reader.request_bytes) {
+				e.request_min = std::min(e.request_min, reader.request_address);
+				e.request_end_max = std::max(e.request_end_max, reader.request_address + reader.request_bytes);
+			}
 			e.local_fault_scope = local;
-			e.writer = s.writers.Find(reader.address, reader.bytes ? reader.bytes : (reader.rip ? 1u : 0u));
+			e.writer = (writers ? *writers : s.writers).Find(reader.address, reader.bytes ? reader.bytes : (reader.rip ? 1u : 0u));
 			e.unknown_width += reader.bytes == 0;
 			e.dirty_fault_byte += reader.downloads.fault_dirty;
 			e.dirty_read += reader.downloads.read_dirty;
@@ -280,30 +343,31 @@ inline void Add(State& s, Origin reader, uint64_t elapsed, uint64_t tick, bool l
 	}
 	++s.overflow;
 }
-inline void Report(State& s, uint64_t now) {
-	if (now - s.start < 5'000'000'000ull) return;
+inline void Report(State& s, uint64_t now, bool write = false) {
+	if (!s.calls || now <= s.start) return;
 	if (s.reports++ < 240) {
 		const auto tid = SubmitProfile::Diagnostics::ThreadId();
-		std::fprintf(stderr, "[READBACK_ORIGINS] {\"tid\":%u,\"end_ns\":%llu,\"interval_ms\":%.3f,"
+		std::fprintf(stderr, "[%s] {\"tid\":%u,\"end_ns\":%llu,\"interval_ms\":%.3f,"
 		    "\"calls\":%llu,\"wait_ns\":%llu,\"overflow\":%llu,\"writer_sequence\":%llu,\"writer_capacity\":2048}\n",
-		    tid, (unsigned long long)now, (now - s.start) / 1e6, (unsigned long long)s.calls,
-		    (unsigned long long)s.ns, (unsigned long long)s.overflow, (unsigned long long)s.writers.sequence);
+		    write ? "WRITEBACK_ORIGINS" : "READBACK_ORIGINS", tid, (unsigned long long)now, (now - s.start) / 1e6, (unsigned long long)s.calls,
+		    (unsigned long long)s.ns, (unsigned long long)s.overflow,
+		    (unsigned long long)(write && state.generation == s.generation ? state.writers.sequence : s.writers.sequence));
 		std::sort(s.entries.begin(), s.entries.end(), [](const Entry& a, const Entry& b) { return a.ns > b.ns; });
 		for (const auto& e: s.entries) {
 			if (!e.calls) break;
 			const auto& r = e.last;
 			const auto& w = e.writer;
-			std::fprintf(stderr, "[READBACK_ORIGIN] {\"tid\":%u,\"end_ns\":%llu,\"kind\":\"%s\","
+			std::fprintf(stderr, "[%s] {\"tid\":%u,\"end_ns\":%llu,\"kind\":\"%s\","
 			    "\"request_tid\":%u,\"request_role\":%u,\"local_fault_scope\":%s,\"calls\":%llu,\"wait_ns\":%llu,"
-			    "\"rip\":\"0x%llx\",\"last_address\":\"0x%llx\",\"read_bytes\":%llu,\"reader_hash\":\"0x%llx\","
+			    "\"rip\":\"0x%llx\",\"last_address\":\"0x%llx\",\"%s\":%llu,\"reader_hash\":\"0x%llx\","
 			    "\"stage\":%u,\"jit_offset\":%u,\"pc\":%u,\"ir\":\"%s\",\"memory\":%u,\"resource\":%u,"
 			    "\"uses\":%u,\"flat_slot\":%u,\"descriptor\":%u,\"memory_kind\":%u,\"immediate\":%u,"
 			    "\"planning_only\":%s,\"wait_tick\":%llu,"
 			    "\"bound_writer\":{\"sequence\":%llu,\"tick\":%llu,\"hash\":\"0x%llx\",\"module\":\"0x%llx\","
 			    "\"stage\":%u,\"resource\":%u,\"atomic\":%s,\"address\":\"0x%llx\",\"bytes\":%llu},",
-			    tid, (unsigned long long)now, KindNames[static_cast<size_t>(r.kind)], r.tid, r.role,
+			    write ? "WRITEBACK_ORIGIN" : "READBACK_ORIGIN", tid, (unsigned long long)now, KindNames[static_cast<size_t>(r.kind)], r.tid, r.role,
 			    e.local_fault_scope ? "true" : "false", (unsigned long long)e.calls, (unsigned long long)e.ns,
-			    (unsigned long long)r.rip, (unsigned long long)r.address, (unsigned long long)r.bytes,
+			    (unsigned long long)r.rip, (unsigned long long)r.address, write ? "store_bytes" : "read_bytes", (unsigned long long)r.bytes,
 			    (unsigned long long)r.hash, r.stage, r.jit_offset, r.pc, r.opcode, r.memory, r.resource,
 			    r.uses, r.flat_slot, r.descriptor, r.memory_kind, r.immediate, r.planning_only ? "true" : "false",
 			    (unsigned long long)e.tick, (unsigned long long)w.sequence,
@@ -322,6 +386,15 @@ inline void Report(State& s, uint64_t now) {
 				    (unsigned long long)address, (unsigned long long)bytes);
 			}
 			std::fprintf(stderr, "]");
+			if (write) {
+				std::fprintf(stderr, ",\"request_address\":\"0x%llx\",\"request_bytes\":%llu,\"write_cause\":%u,"
+				    "\"owner_address\":\"0x%llx\",\"owner_bytes\":%llu,\"store_width_known\":false",
+				    (unsigned long long)r.request_address, (unsigned long long)r.request_bytes, r.write_cause,
+				    (unsigned long long)r.owner_address, (unsigned long long)r.owner_bytes);
+				std::fprintf(stderr, ",\"request_min\":\"0x%llx\",\"request_end_max\":\"0x%llx\",\"download_bytes_total\":%llu",
+				    (unsigned long long)e.request_min, (unsigned long long)e.request_end_max,
+				    (unsigned long long)e.download_bytes);
+			}
 			if (r.kind == Kind::IndirectRecords) {
 				std::fprintf(stderr, ",\"indirect_record\":{\"address\":\"0x%llx\",\"fault_offset\":%llu,\"count_address\":\"0x%llx\","
 				    "\"index\":%u,\"stride\":%u,\"count\":%u,\"indexed\":%s,"
@@ -333,26 +406,61 @@ inline void Report(State& s, uint64_t now) {
 			}
 			std::fprintf(stderr, "}\n");
 		}
+		const char* key_tag = write ? "WRITEBACK_KEY" : "READBACK_KEY";
+		std::fprintf(stderr, "[%s] {\"tid\":%u,\"end_ns\":%llu,\"key_overflow\":%llu,\"key_capacity\":%zu}\n", key_tag, tid,
+		    (unsigned long long)now, (unsigned long long)s.key_overflow, s.keys.size());
+		std::sort(s.keys.begin(), s.keys.end(), [](const KeyEntry& a, const KeyEntry& b) { return a.ns > b.ns; });
+		for (const auto& k: s.keys) {
+			if (!k.calls) break;
+			std::fprintf(stderr, "[%s] {\"tid\":%u,\"end_ns\":%llu,\"kind\":\"%s\",\"request_role\":%u,\"reader_hash\":\"0x%llx\","
+			    "\"stage\":%u,\"memory\":%u,\"descriptor\":%u,\"flat_slot\":%u,\"uses\":%u,\"calls\":%llu,\"wait_ns\":%llu,"
+			    "\"download_bytes\":%llu,\"false_shared_waits\":%llu,\"false_shared_wait_ns\":%llu}\n",
+			    key_tag, tid, (unsigned long long)now, KindNames[static_cast<size_t>(k.kind)], k.role,
+			    (unsigned long long)k.hash, k.stage, k.memory, k.descriptor, k.flat_slot, k.uses,
+			    (unsigned long long)k.calls, (unsigned long long)k.ns, (unsigned long long)k.download_bytes,
+			    (unsigned long long)k.false_shared, (unsigned long long)k.false_shared_ns);
+		}
 	}
 	ResetWindow(s, now, s.generation);
+}
+// Called on the owning GPU thread, before submit-profile advances its generation.
+// A separate five-second timer starting at the first wait can never expire when
+// the enclosing window closes first; the next wait would silently reset it.
+// Flush partial windows too (gate/timer/experiment changes and shutdown).
+inline void FlushCurrentThread(uint64_t now) {
+	if (!Enabled()) return;
+	const auto generation = SubmitProfile::Detail::generation.load(std::memory_order_relaxed);
+	if (state.generation == generation) Report(state, now);
+	if (auto* writes = WriteState().get(); writes && writes->generation == generation) {
+		Report(*writes, now, true);
+	}
 }
 class WaitScope {
 public:
 	explicit WaitScope(uint64_t tick): m_tick(tick) {
-		if (!Enabled() || SubmitProfile::Detail::current_wait_site != SubmitProfile::WaitSite::ReadbackCpuReadFault) return;
+		const auto site = SubmitProfile::CurrentWaitSite();
+		if (!Enabled() || (site != SubmitProfile::WaitSite::ReadbackCpuReadFault &&
+		                   site != SubmitProfile::WaitSite::ReadbackCpuWriteInvalidate)) return;
+		m_write = site == SubmitProfile::WaitSite::ReadbackCpuWriteInvalidate;
+		if (m_write && !WriteState()) WriteState() = std::make_unique<State>();
+		m_state = m_write ? WriteState().get() : &state;
 		m_start = SubmitProfile::NowNs();
 		m_generation = SubmitProfile::Detail::generation.load(std::memory_order_relaxed);
-		if (state.generation != m_generation) {
-			ResetWindow(state, m_start, m_generation); state.writers = {};
+		if (m_state->generation != m_generation) {
+			ResetWindow(*m_state, m_start, m_generation); m_state->writers = {};
 		}
 	}
 	~WaitScope() {
 		if (!m_start || !Enabled() || m_generation != SubmitProfile::Detail::generation.load(std::memory_order_relaxed)) return;
 		const auto now = SubmitProfile::NowNs();
-		Add(state, origin, now - m_start, m_tick, SubmitProfile::Diagnostics::ReadFaults::active != nullptr);
-		Report(state, now);
+		Add(*m_state, origin, now - m_start, m_tick,
+		    m_write ? origin.kind == Kind::WriteFault && origin.tid == SubmitProfile::Diagnostics::ThreadId()
+		            : SubmitProfile::Diagnostics::ReadFaults::active != nullptr,
+		    m_write && state.generation == m_generation ? &state.writers : nullptr);
 	}
 private:
 	uint64_t m_tick, m_start = 0, m_generation = 0;
+	State* m_state = nullptr;
+	bool m_write = false;
 };
 } // namespace Common::ReadbackProfile

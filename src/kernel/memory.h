@@ -142,6 +142,12 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 // GPU-thread-only, no readback or protection changes. Rejects dirty bytes and
 // requires a GPU-dirty neighbor in the same tracking page.
 bool                   TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// No other guest address maps any backing byte of the range.
+bool                   IsUniqueGuestBackingRange(uint64_t vaddr, uint64_t size);
+// GPU thread: read bytes that no GPU write, pending download or image owns.
+bool                   TryReadCpuOwnedBacking(uint64_t vaddr, void* data, uint64_t size);
+// Guest-thread fault service: an aligned 1/2/4/8-byte load of clean bytes on a GPU-dirty page.
+bool                   TryLoadCleanGuestRead(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size, bool& recovered);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
@@ -149,6 +155,7 @@ void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t s
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+[[nodiscard]] bool TryReadSrtBatch(uint64_t fault, uint64_t address, uint64_t bytes);
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

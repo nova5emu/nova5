@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <unordered_set>
 #include <array>
 #include <atomic>
 #include <map>
@@ -61,6 +62,9 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
 	                                  Common::SubmitProfile::WaitSite site = Common::SubmitProfile::WaitSite::BufferReadback,
 	                                  Common::BufferUploadProfile::Cause cause = Common::BufferUploadProfile::Cause::Invalidate);
+	// SRT fault recovery: one existing owner, mapped span, two dirty pages;
+	// otherwise no side effects. Caller proved every spanned page is needed.
+	bool TryReadSrtBatch(uint64_t fault, uint64_t address, uint64_t bytes);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	// GPU-thread only. Full contiguous coverage, not IsRegionRegistered's intersection.
@@ -95,6 +99,9 @@ public:
 	[[nodiscard]] bool HasUnpublishedDownloads() const {
 		return m_unpublished_downloads.load(std::memory_order_acquire) != 0;
 	}
+	// guest-clean-reads: one clean guest load per continuous GPU-dirty episode of a page.
+	// A page's budget is renewed only when a download removes its GPU-dirty bytes.
+	[[nodiscard]] bool ConsumeCleanReadBudget(uint64_t page);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
@@ -179,6 +186,9 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// GPU lane only. Returns the original one-byte request unless at least two
+	// consecutive full dirty pages can be published from this existing owner.
+	[[nodiscard]] GuestRange FaultReadbackRange(const Buffer& buffer, uint64_t fault, bool write);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
 	std::unique_ptr<Common::BufferUploadProfile::State> m_buffer_upload_profile;
 	struct CoarsenOwner {
@@ -268,6 +278,7 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	std::unordered_set<uint64_t> m_clean_read_pages; // GPU thread only.
 };
 
 } // namespace Libs::Graphics

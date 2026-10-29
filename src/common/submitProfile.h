@@ -1,6 +1,7 @@
 #pragma once
 #include "common/guestCpuProfile.h"
 #include "common/guestHostImport.h"
+#include "common/readbackAhead.h"
 
 #include <algorithm>
 #include <array>
@@ -157,7 +158,18 @@ enum class Extra : uint16_t {
 	FcFaults, FcUniquePageFrames, FcRepeatPageFrames, FcRefaultAfterUpload,
 	FcExpanded, FcDirtyBytes, FcNewDirtyBytes, FcExtraDirtyUpperBytes,
 	FcUploadBytes, FcExtraUploadUpperBytes, FcRejectGpu, FcRejectImport,
-	FcRejectWatcher, FcRejectReadback, FcPromotions, FcRetired, FcFrames, FcOwnerFrames, FcStreamBytes, Count
+	FcRejectWatcher, FcRejectReadback, FcPromotions, FcRetired, FcFrames, FcOwnerFrames, FcStreamBytes,
+	SrtBatchCandidates, SrtBatchReadbacks, SrtBatchFallbacks, SrtBatchRequestedBytes,
+	WriteAheadAttempts, WriteAheadBatches, WriteAheadPages, WriteAheadExtraBytes,
+	WriteAheadRejectPending, WriteAheadRejectImport, WriteAheadRejectRange, WriteAheadRejectSparse,
+	WriteAheadLimitHits, WriteAheadRejectFirstPage,
+	ReadAheadAttempts, ReadAheadBatches, ReadAheadPages, ReadAheadExtraBytes,
+	ReadAheadRejectPending, ReadAheadRejectImport, ReadAheadRejectRange, ReadAheadRejectSparse,
+	ReadAheadLimitHits, ReadAheadRejectFirstPage,
+	GuestCleanServed, GuestCleanRejectDirty, GuestCleanRejectPending, GuestCleanRejectWidth, GuestCleanRejectBacking,
+	GuestCleanRejectInstruction, GuestCleanRejectBudget, GuestCleanRecovered,
+	LinearCopyCandidates, LinearCopyRejectShape, LinearCopyRejectDescriptor, LinearCopyRejectParameters,
+	LinearCopyRejectCount, LinearCopyRejectOverlap, LinearCopyRejectAlias, LinearCopyCpu, LinearCopyGpu, LinearCopyBytes, Count
 };
 inline constexpr std::array ExtraNames {
 	"flips", "occlusion_dumps", "predication_zpass", "predication_bool", "predication_off",
@@ -232,7 +244,18 @@ inline constexpr std::array ExtraNames {
 	"fc_faults", "fc_unique_page_frames", "fc_repeat_page_frames", "fc_refault_after_upload",
 	"fc_expanded", "fc_dirty_bytes", "fc_new_dirty_bytes", "fc_extra_dirty_upper_bytes",
 	"fc_upload_bytes", "fc_extra_upload_upper_bytes", "fc_reject_gpu", "fc_reject_import",
-	"fc_reject_watcher", "fc_reject_readback", "fc_promotions", "fc_retired", "fc_frames", "fc_owner_frames", "fc_stream_bytes"
+	"fc_reject_watcher", "fc_reject_readback", "fc_promotions", "fc_retired", "fc_frames", "fc_owner_frames", "fc_stream_bytes",
+	"srt_batch_candidates", "srt_batch_readbacks", "srt_batch_fallbacks", "srt_batch_requested_bytes",
+	"write_ahead_attempts", "write_ahead_batches", "write_ahead_pages", "write_ahead_extra_bytes",
+	"write_ahead_reject_pending", "write_ahead_reject_import", "write_ahead_reject_range", "write_ahead_reject_sparse",
+	"write_ahead_limit_hits", "write_ahead_reject_first_page",
+	"read_ahead_attempts", "read_ahead_batches", "read_ahead_pages", "read_ahead_extra_bytes",
+	"read_ahead_reject_pending", "read_ahead_reject_import", "read_ahead_reject_range", "read_ahead_reject_sparse",
+	"read_ahead_limit_hits", "read_ahead_reject_first_page",
+	"guest_clean_served", "guest_clean_reject_dirty", "guest_clean_reject_pending", "guest_clean_reject_width",
+	"guest_clean_reject_backing", "guest_clean_reject_instruction", "guest_clean_reject_budget", "guest_clean_recovered",
+	"linear_copy_candidates", "linear_copy_reject_shape", "linear_copy_reject_descriptor", "linear_copy_reject_parameters",
+	"linear_copy_reject_count", "linear_copy_reject_overlap", "linear_copy_reject_alias", "linear_copy_cpu", "linear_copy_gpu", "linear_copy_bytes"
 };
 static_assert(ExtraNames.size() == static_cast<size_t>(Extra::Count));
 inline std::atomic<uint64_t> hot_owner_count {0}, hot_owner_bytes {0};
@@ -262,6 +285,10 @@ inline bool Armed() {
 inline std::atomic<bool> recording {false};
 inline std::atomic<bool> experiment {false};
 inline std::atomic<bool> compact_operands {false};
+// Tests that drive the scheduler's native command buffer turn this off and enable the recorder by hand.
+inline std::atomic<bool> vk_recorder_managed {true};
+// Diagnostics outside common (e.g. the SRT descriptor probe) flush their window here.
+inline std::atomic<void (*)()> window_close_hook {nullptr};
 
 using Counter = std::atomic<uint64_t>;
 template <size_t N>
@@ -359,7 +386,10 @@ inline void TakeTag(ThreadTag& tag, uint32_t& tid, bool& multi) {
 enum class Experiment : uint32_t {
 	None = 0, ReleaseMem = 1, IndirectCountGpu = 2,
 	LegacyIndexClamp = 4, NoIndirectMeshGpu = 8, NoWalkerControlGpu = 16, NoGpuTimestamps = 32,
-	GuestHostImport = 64, HotUnprotected = 128, FaultCoarsening = 256, VkRecorder = 512
+	GuestHostImport = 64, HotUnprotected = 128, FaultCoarsening = 256, VkRecorder = 512,
+	SrtReadbackBatch = 1024, WriteReadbackAhead = 2048, ReadReadbackAhead = 4096, NoReadbackAhead = 8192,
+	ReadbackAheadSparse = 16384, NoVkRecorder = 32768, GuestCleanReads = 65536, DsLinearCopy = 131072,
+	DsGpuPages = 262144
 };
 inline Experiment ParseExperiment(std::string_view names) {
 	uint32_t mask = 0;
@@ -379,6 +409,15 @@ inline Experiment ParseExperiment(std::string_view names) {
 			if (name == "hot-unprotected") mask |= static_cast<uint32_t>(Experiment::HotUnprotected);
 			if (name == "fault-coarsening") mask |= static_cast<uint32_t>(Experiment::FaultCoarsening);
 			if (name == "vk-recorder") mask |= static_cast<uint32_t>(Experiment::VkRecorder);
+			if (name == "srt-readback-batch") mask |= static_cast<uint32_t>(Experiment::SrtReadbackBatch);
+			if (name == "write-readback-ahead") mask |= static_cast<uint32_t>(Experiment::WriteReadbackAhead);
+			if (name == "read-readback-ahead") mask |= static_cast<uint32_t>(Experiment::ReadReadbackAhead);
+			if (name == "no-readback-ahead") mask |= static_cast<uint32_t>(Experiment::NoReadbackAhead);
+			if (name == "readback-ahead-sparse") mask |= static_cast<uint32_t>(Experiment::ReadbackAheadSparse);
+			if (name == "no-vk-recorder") mask |= static_cast<uint32_t>(Experiment::NoVkRecorder);
+			if (name == "guest-clean-reads") mask |= static_cast<uint32_t>(Experiment::GuestCleanReads);
+			if (name == "ds-linear-copy") mask |= static_cast<uint32_t>(Experiment::DsLinearCopy);
+			if (name == "ds-gpu-pages") mask |= static_cast<uint32_t>(Experiment::DsGpuPages);
 			// gpu-timestamps is retired: native clocks are now the default.
 			// Like other promoted experiment names, old helpers may keep it as a no-op.
 		}
@@ -399,7 +438,7 @@ inline const char* ExperimentName() {
 	static const auto name = [] {
 		std::string result;
 		constexpr std::array names {"release-mem", "indirect-count-gpu", "legacy-index-clamp",
-		    "no-indirect-mesh-gpu", "no-walker-control-gpu", "no-gpu-timestamps", "guest-host-import", "hot-unprotected", "fault-coarsening", "vk-recorder"};
+		    "no-indirect-mesh-gpu", "no-walker-control-gpu", "no-gpu-timestamps", "guest-host-import", "hot-unprotected", "fault-coarsening", "vk-recorder", "srt-readback-batch", "write-readback-ahead", "read-readback-ahead", "no-readback-ahead", "readback-ahead-sparse", "no-vk-recorder", "guest-clean-reads", "ds-linear-copy", "ds-gpu-pages"};
 		for (uint32_t bit = 0; bit < names.size(); ++bit) {
 			if (!(static_cast<uint32_t>(SelectedExperiment()) & (1u << bit))) continue;
 			if (!result.empty()) result += ',';
@@ -421,6 +460,24 @@ inline const char* ExperimentName() {
 }
 [[nodiscard]] inline bool GpuTimestampsEnabled() {
 	return !ExperimentActive(Experiment::NoGpuTimestamps);
+}
+// Promoted after Demon's Souls A/B/A (+8 %, Astro unaffected): neighbouring GPU-dirty pages are
+// downloaded together on read and write faults. "no-readback-ahead" restores single-page readbacks;
+// the old "write-readback-ahead"/"read-readback-ahead" names are accepted with no effect.
+[[nodiscard]] inline bool ReadbackAheadEnabled() {
+	return !ExperimentActive(Experiment::NoReadbackAhead);
+}
+// Promoted after A/B/A on all three games (Demon's Souls +8 %, Astro Sky Garden +5 %, galaxy menu
+// +3 %, Sons of Sparta unchanged at 60): the guest command scheduler records through the vk-recorder.
+// "no-vk-recorder" switches back to direct command buffers; the old "vk-recorder" name has no effect.
+[[nodiscard]] inline bool VkRecorderEnabled() {
+	return !ExperimentActive(Experiment::NoVkRecorder);
+}
+[[nodiscard]] inline bool VkRecorderManaged() {
+	return Detail::vk_recorder_managed.load(std::memory_order_relaxed);
+}
+inline void SetVkRecorderManaged(bool managed) {
+	Detail::vk_recorder_managed.store(managed, std::memory_order_relaxed);
 }
 inline void SetExperiment(bool active) {
 	Detail::experiment.store(active, std::memory_order_relaxed);
@@ -1110,6 +1167,8 @@ inline void WriteReport(std::FILE* out, double interval_ms, bool timer_1ms,
 	             experiment ? "true" : "false",
 	             Detail::gpu_thread_tid.load(std::memory_order_relaxed));
 	std::fprintf(out, ",\"experiment_selected\":\"%s\"", ExperimentName());
+	std::fprintf(out, ",\"readback_ahead_config\":{\"write_pages\":%u,\"read_pages\":%u}",
+	             Common::ReadbackAhead::WritePages(), Common::ReadbackAhead::ReadPages());
 	Diagnostics::Report(out);
 
 	std::fprintf(out, ",\"submits\":[");
