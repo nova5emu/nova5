@@ -8,6 +8,7 @@
   Emulador de PS5 de código abierto para PC, con un lanzador de estilo consola.<br>
   <a href="https://nova5emu.github.io/nova5/">Web oficial</a> ·
   <a href="https://github.com/nova5emu/nova5/releases/latest">Descargar</a> ·
+  <a href="https://ko-fi.com/nova5emu">Apoyar en Ko-fi</a> ·
   <a href="LICENSE">GPL-2.0</a>
 </p>
 
@@ -49,6 +50,12 @@ La emulación de PS5 es experimental. Juegos comprobados por nosotros:
 - Lanzador: `src/nova5` (Avalonia, .NET 10). `dotnet publish src/nova5 -c Release -o <carpeta del emulador>`.
 - Instalador: `src/nova5/package/build-package.ps1` genera `_Build/package/Nova5-Setup.exe` con Inno Setup 6.
 - Web: carpeta `website/`, publicada con GitHub Pages.
+
+## Apoya el proyecto
+
+Nova5 es y seguirá siendo gratis. Si quieres ayudar a que avance más rápido, puedes apoyarlo en
+[Ko-fi](https://ko-fi.com/nova5emu) ☕. Las aportaciones son voluntarias y no dan acceso a nada extra:
+se usan para hardware de pruebas y horas de desarrollo.
 
 ## Licencia y créditos
 
