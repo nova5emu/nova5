@@ -227,3 +227,7 @@ details p { color: var(--muted); margin: 0 0 20px; }
   .js [data-reveal] { opacity: 1; transform: none; }
   .progress { display: none; }
 }
+@media (max-width: 420px) {
+  .nav > .btn.small { display: none; }
+  .menu-toggle { margin-left: auto; }
+}
