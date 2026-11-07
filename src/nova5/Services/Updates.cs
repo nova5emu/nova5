@@ -74,12 +74,12 @@ public static class Updates
 			}
 		}
 		var length = new FileInfo(path).Length;
-		if (length != update.Size) throw new InvalidDataException($"Descarga incompleta ({length} de {update.Size} bytes)");
+		if (length != update.Size) throw new InvalidDataException(L.F("Descarga incompleta ({0} de {1} bytes)", length, update.Size));
 		if (update.Sha256 is { } expected)
 		{
 			await using var file = File.OpenRead(path);
 			var actual = Convert.ToHexString(await SHA256.HashDataAsync(file));
-			if (!actual.Equals(expected, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("La descarga no coincide con la publicada");
+			if (!actual.Equals(expected, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException(L.T("La descarga no coincide con la publicada"));
 		}
 		return path;
 	}

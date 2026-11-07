@@ -133,10 +133,10 @@ public static partial class Archives
 		if (File.Exists(marker) && File.ReadAllText(marker).Trim() != parts[0].FullName) CleanUp(archive);
 		if (Directory.Exists(output) && !File.Exists(marker))
 		{
-			throw new IOException($"Ya existe la carpeta {output}; muévela o bórrala para descomprimir este archivo");
+			throw new IOException(L.F("Ya existe la carpeta {0}; muévela o bórrala para descomprimir este archivo", output));
 		}
-		progress.Report(new Packages.InstallProgress(File.Exists(marker) ? "Retomando la descompresión…" : "Leyendo el archivo…", null));
-		if (parts.Any(p => !p.Exists)) throw new IOException("Faltan partes del archivo: " + string.Join(", ", parts.Where(p => !p.Exists).Select(p => p.Name)));
+		progress.Report(new Packages.InstallProgress(File.Exists(marker) ? L.T("Retomando la descompresión…") : L.T("Leyendo el archivo…"), null));
+		if (parts.Any(p => !p.Exists)) throw new IOException(L.T("Faltan partes del archivo: ") + string.Join(", ", parts.Where(p => !p.Exists).Select(p => p.Name)));
 
 		try
 		{
@@ -144,7 +144,7 @@ public static partial class Archives
 		}
 		catch (Exception e) when (e is SharpCompressException or IndexOutOfRangeException)
 		{
-			throw new InvalidDataException("El archivo está dañado o incompleto: " + e.Message);
+			throw new InvalidDataException(L.T("El archivo está dañado o incompleto: ") + e.Message);
 		}
 
 		// A game folder or a .pkg (installed next); nothing else is worth keeping.
@@ -152,7 +152,7 @@ public static partial class Archives
 		                Directory.EnumerateFiles(output, "*.pkg", SearchOption.AllDirectories).Any();
 		if (!holdsGame) throw new InvalidDataException("El archivo no contiene un juego de PS5 (falta eboot.bin) ni un .pkg");
 		File.Delete(Path.Combine(output, Packages.Marker));
-		progress.Report(new Packages.InstallProgress("Descomprimido", 1));
+		progress.Report(new Packages.InstallProgress(L.T("Descomprimido"), 1));
 	}
 
 	private static void Unpack(List<FileInfo> parts, string output, IProgress<Packages.InstallProgress> progress, CancellationToken cancel)
@@ -161,7 +161,7 @@ public static partial class Archives
 		var files = opened.Entries.Where(e => !e.IsDirectory).ToList();
 		if (opened.IsEncrypted || files.Any(e => e.IsEncrypted))
 		{
-			throw new InvalidDataException("El archivo tiene contraseña; descomprímelo tú con ella en tu carpeta de juegos");
+			throw new InvalidDataException(L.T("El archivo tiene contraseña; descomprímelo tú con ella en tu carpeta de juegos"));
 		}
 		var root  = Path.GetFullPath(output) + Path.DirectorySeparatorChar;
 		string Target(IEntry entry) => Path.GetFullPath(Path.Combine(output, (entry.Key ?? "").Replace('/', Path.DirectorySeparatorChar)));
@@ -171,7 +171,7 @@ public static partial class Archives
 		var free  = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(output))!).AvailableFreeSpace;
 		if (free < total - kept + (2L << 30))
 		{
-			throw new IOException($"No hay espacio: el juego ocupa {total / (double)(1L << 30):0} GB y hacen falta {(total - kept) / (double)(1L << 30) + 2:0} GB libres");
+			throw new IOException(L.F("No hay espacio: el juego ocupa {0:0} GB y hacen falta {1:0} GB libres", total / (double)(1L << 30), (total - kept) / (double)(1L << 30) + 2));
 		}
 
 		Directory.CreateDirectory(output);
@@ -227,7 +227,7 @@ public static partial class Archives
 		{
 			foreach (var entry in opened.Entries) Write(entry, entry.OpenEntryStream);
 		}
-		progress.Report(new Packages.InstallProgress("Terminando…", null));
+		progress.Report(new Packages.InstallProgress(L.T("Terminando…"), null));
 	}
 
 	private static IArchive OpenFor(List<FileInfo> parts)
@@ -238,7 +238,7 @@ public static partial class Archives
 		}
 		catch (Exception e) when (e is SharpCompressException or InvalidOperationException or ArgumentException or NotSupportedException)
 		{
-			throw new InvalidDataException("No se pudo abrir el archivo (dañado o incompleto): " + e.Message);
+			throw new InvalidDataException(L.T("No se pudo abrir el archivo (dañado o incompleto): ") + e.Message);
 		}
 	}
 

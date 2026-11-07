@@ -8,6 +8,11 @@ public sealed record SwitchGame(string Name, string Path, long Size)
 {
 	public bool    Extracted { get; init; }
 	public string? Icon      { get; init; } // icon_*.dat (a JPEG) of an extracted game, when it has one.
+	// A loose dump (base\, updates\<version>\, dlc\<id>\, as console dump tools write it): its folder. Path boots its base;
+	// packing it into a .nup (PackNup) brings its update and DLC along.
+	public string? DumpRoot  { get; init; }
+	public bool    HasExtras { get; init; } // The dump has updates or DLC.
+	public bool    NamedFromFolder { get; init; } // No title in the game's own data: the name comes from its folder.
 }
 
 // NovaS: the Switch 2 side of Nova5. Its engine is Eglantine (GPL-3.0, derived from Eden, yuzu and Sudachi), kept
@@ -23,13 +28,14 @@ public static partial class SwitchGames
 	public static bool   HasEngine => File.Exists(Engine);
 	public static bool   HasKeys   => File.Exists(System.IO.Path.Combine(KeysDir, "prod.keys"));
 
-	// Games (.nsp, .xci and their compressed forms) up to three levels below each folder.
+	// Games (.nsp, .xci and their compressed forms, .nup and extracted games) up to five levels below each folder: a loose
+	// dump's exefs sits at <game>\<dump>\base\exefs.
 	public static List<SwitchGame> Scan(IEnumerable<string> roots)
 	{
 		var found = new Dictionary<string, SwitchGame>(StringComparer.OrdinalIgnoreCase);
 		foreach (var root in roots.Where(Directory.Exists))
 		{
-			foreach (var dir in Folders(root, 3))
+			foreach (var dir in Folders(root, 5))
 			{
 				try
 				{
@@ -47,9 +53,19 @@ public static partial class SwitchGames
 				}
 			}
 		}
-		// A cover the player chose wins over the game's own icon.
-		return found.Values.Select(g => CoverOf(g) is { } cover ? g with { Icon = cover } : g)
-		    .OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
+		// A loose dump already packed into its .nup shows once, as the .nup.
+		var games = found.Values.Where(g => g.DumpRoot is null || !File.Exists(NupOf(g.DumpRoot))).Select(Dress);
+		return games.OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
+	}
+
+	// The cover: the one the player chose, else NovaS's own for a known game, else the game's icon. A known game named
+	// only from its folder also gets its proper name.
+	private static SwitchGame Dress(SwitchGame game)
+	{
+		var known = SwitchCovers.Find(game.Name);
+		if (known is { } k && game.NamedFromFolder) game = game with { Name = k.Name };
+		if (CoverOf(game) is { } chosen) return game with { Icon = chosen };
+		return known is { } match ? game with { Icon = match.Cover } : game;
 	}
 
 	// ---- Covers chosen by the player (_Cache\novas-covers, one per game file) ----
@@ -96,6 +112,12 @@ public static partial class SwitchGames
 		if (!File.Exists(main) || !File.Exists(System.IO.Path.Combine(exefs, "main.npdm"))) return null;
 		var game = System.IO.Path.GetFileName(exefs).Equals("exefs", StringComparison.OrdinalIgnoreCase)
 		    ? System.IO.Path.GetDirectoryName(exefs)! : exefs;
+		// A loose dump: its base is the game; an update's or a DLC's exefs is not a game of its own.
+		var parent = System.IO.Path.GetDirectoryName(game);
+		var parentName = System.IO.Path.GetFileName(parent ?? "");
+		if (parentName.Equals("updates", StringComparison.OrdinalIgnoreCase) || parentName.Equals("dlc", StringComparison.OrdinalIgnoreCase)) return null;
+		string? dumpRoot = null;
+		if (System.IO.Path.GetFileName(game).Equals("base", StringComparison.OrdinalIgnoreCase) && parent is not null) dumpRoot = parent;
 		var places = new[] { game, exefs, System.IO.Path.Combine(game, "control") }.Where(Directory.Exists).ToList();
 		var nacp   = places.Select(p => System.IO.Path.Combine(p, "control.nacp")).FirstOrDefault(File.Exists);
 		var icon   = places.SelectMany(p => Directory.EnumerateFiles(p, "icon_*.dat"))
@@ -110,7 +132,24 @@ public static partial class SwitchGames
 		{
 			size = 0;
 		}
-		return new SwitchGame((nacp is null ? null : TitleFromNacp(nacp)) ?? Clean(System.IO.Path.GetFileName(game)), main, size) { Extracted = true, Icon = icon };
+		var title = nacp is null ? null : TitleFromNacp(nacp);
+		var folder = dumpRoot ?? game;
+		if (dumpRoot is not null)
+		{
+			try
+			{
+				size = Directory.EnumerateFiles(dumpRoot, "*", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
+			}
+			catch (Exception e) when (e is UnauthorizedAccessException or IOException)
+			{
+			}
+		}
+		var extras = dumpRoot is not null && new[] { "updates", "dlc" }.Any(d =>
+		    Directory.Exists(System.IO.Path.Combine(dumpRoot, d)) && Directory.EnumerateDirectories(System.IO.Path.Combine(dumpRoot, d)).Any());
+		return new SwitchGame(title ?? Words(Clean(System.IO.Path.GetFileName(folder))), main, size)
+		{
+			Extracted = true, Icon = icon, DumpRoot = dumpRoot, HasExtras = extras, NamedFromFolder = title is null,
+		};
 	}
 
 	// A .nup (Eglantine's "NX Package"): loose, already decrypted ExeFS/RomFS of a game, its updates and DLC in one file,
@@ -214,6 +253,27 @@ public static partial class SwitchGames
 		return null;
 	}
 
+	// "DonkeyKongBananza" -> "Donkey Kong Bananza" (folder names written without spaces).
+	private static string Words(string name) =>
+	    name.Contains(' ') ? name : System.Text.RegularExpressions.Regex.Replace(name, "(?<=[a-z0-9])(?=[A-Z])", " ");
+
+	// ---- Loose dumps packed into a .nup: the base, its updates and DLC in one file that needs no keys ----
+
+	// Where the engine writes it: next to the dump folder, with the folder's name.
+	public static string NupOf(string dumpRoot) => System.IO.Path.TrimEndingDirectorySeparator(dumpRoot) + ".nup";
+
+	// The engine packs the dump (eden-cli --pack-nup); its progress lines ("12 / 3400 MiB, ...") come on stderr.
+	public static Process PackNup(string dumpRoot)
+	{
+		var info = new ProcessStartInfo(Engine)
+		{
+			UseShellExecute = false, WorkingDirectory = EngineDir, CreateNoWindow = true, RedirectStandardError = true, RedirectStandardOutput = true,
+		};
+		info.ArgumentList.Add("--pack-nup");
+		info.ArgumentList.Add(dumpRoot);
+		return Process.Start(info) ?? throw new InvalidOperationException(L.T("No se pudo iniciar el empaquetado"));
+	}
+
 	// "Mario Kart World [0100...][v0] (NSP).nsp" -> "Mario Kart World".
 	public static string CleanName(string file) => Clean(System.IO.Path.GetFileNameWithoutExtension(file));
 
@@ -241,7 +301,7 @@ public static partial class SwitchGames
 		info.ArgumentList.Add("-f");
 		info.ArgumentList.Add("-g");
 		info.ArgumentList.Add(game.Path);
-		return Process.Start(info) ?? throw new InvalidOperationException("No se pudo iniciar NovaS");
+		return Process.Start(info) ?? throw new InvalidOperationException(L.T("No se pudo iniciar NovaS"));
 	}
 
 	public static string FirmwareDir => System.IO.Path.Combine(UserDir, "nand", "system", "Contents", "registered");
@@ -269,7 +329,7 @@ public static partial class SwitchGames
 		var entries = archive?.Entries.Where(e => e.Name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)).ToList();
 		var files   = zip ? new List<string>() : Directory.GetFiles(source, "*.nca").ToList();
 		var count   = entries?.Count ?? files.Count;
-		if (count == 0) throw new InvalidDataException("No hay archivos .nca de firmware ahí");
+		if (count == 0) throw new InvalidDataException(L.T("No hay archivos .nca de firmware ahí"));
 		if (Directory.Exists(FirmwareDir)) Directory.Delete(FirmwareDir, recursive: true);
 		Directory.CreateDirectory(FirmwareDir);
 		for (var i = 0; i < count; i++)
@@ -290,36 +350,36 @@ public static partial class SwitchGames
 
 	public static readonly Option[] Options =
 	{
-		new("Resolución", "Más resolución se ve más nítido pero pide más a la tarjeta gráfica.", "Renderer", "resolution_setup",
-		    new[] { ("5", "4K (1.5x)"), ("3", "Nativa (1440p)"), ("6", "2x (5K)"), ("7", "3x") }),
-		new("Modo de consola", "Dock: como conectada a la tele (más resolución). Portátil: como en la mano.", "System", "use_docked_mode",
-		    new[] { ("1", "Dock (TV)"), ("0", "Portátil") }),
-		new("Sincronización vertical", "Sí evita cortes en la imagen; No da la menor latencia.", "Renderer", "use_vsync",
-		    new[] { ("2", "Sí"), ("1", "Mailbox"), ("0", "No") }),
-		new("Idioma de los juegos", "El idioma de la consola que ven los juegos.", "System", "language_index",
-		    new[] { ("14", "Español (Latinoamérica)"), ("5", "Español (España)"), ("1", "Inglés") }),
-		new("Límite de velocidad", "Sí: el juego va a su velocidad real. No: tan rápido como pueda el PC.", "Core", "use_speed_limit",
-		    new[] { ("true", "Sí"), ("false", "No") }),
-		new("Caché de shaders", "Guarda los shaders compilados para que las siguientes partidas no den tirones.", "Renderer", "use_disk_shader_cache",
-		    new[] { ("true", "Sí"), ("false", "No") }),
-		new("Precisión de la GPU", "Normal: reparte el trabajo de la GPU en dos hilos (en Zelda, hasta 9 FPS más que Alta). " +
-		    "Alta: un solo hilo, por si algún juego se ve mal con Normal.", "Renderer", "gpu_accuracy",
-		    new[] { ("0", "Normal (rápida)"), ("1", "Alta") }),
-		new("Lecturas rápidas de la GPU", "Copia antes de tiempo los datos que el juego lee de la tarjeta, así no la espera (en Zelda, de 44 a 52 FPS " +
-		    "en el pueblo Kokiri). Si ves parpadeos, pon No.", EnvSection, "EDEN_NX2_PREFLUSH",
-		    new[] { ("1", "Sí (más FPS)"), ("0", "No") }),
-		new("Zelda: Ocarina of Time — FPS", "60 dinámico: hasta 60 FPS y el juego ajusta su tiempo, así nunca va más lento aunque bajen los FPS. " +
-		    "30 estables: siempre 30 FPS a velocidad normal. 60 fijo: el original (va más lento si baja de 60).", "Renderer", "oot_frame_mode",
-		    new[] { ("2", "60 dinámico"), ("1", "30 estables"), ("0", "60 fijo") }),
-		new("Zelda: antialiasing del juego", "Sin nitidez: se salta la red de antialiasing y nitidez del juego (unos 3-4 FPS más; la imagen " +
-		    "queda un poco más suave). Original: como en la consola.", "Renderer", "oot_anti_aliasing",
-		    new[] { ("1", "Sin nitidez (más FPS)"), ("0", "Original") }),
-		new("Generación de fotogramas (FSR3)", "Inventa un fotograma entre cada dos: un juego a 30 FPS se ve a 60. Con Zelda, lo más fluido es " +
-		    "\"30 estables\" + esto. Puede dar un poco más de retraso al mando y algún borde raro en movimientos rápidos.", "Renderer", "frame_gen",
-		    new[] { ("true", "Sí (x2)"), ("false", "No") }),
-		new("Compilación de shaders", "En segundo plano: los shaders nuevos se preparan sin frenar el juego (algún objeto puede tardar un instante en " +
-		    "aparecer la primera vez). Esperando: nada falta, pero hay tirones mientras se compilan.", "Renderer", "use_asynchronous_shaders",
-		    new[] { ("true", "En segundo plano"), ("false", "Esperando") }),
+		new(L.T("Resolución"), L.T("Más resolución se ve más nítido pero pide más a la tarjeta gráfica."), "Renderer", "resolution_setup",
+		    new[] { ("5", "4K (1.5x)"), ("3", L.T("Nativa (1440p)")), ("6", "2x (5K)"), ("7", "3x") }),
+		new(L.T("Modo de consola"), L.T("Dock: como conectada a la tele (más resolución). Portátil: como en la mano."), "System", "use_docked_mode",
+		    new[] { ("1", "Dock (TV)"), ("0", L.T("Portátil")) }),
+		new(L.T("Sincronización vertical"), L.T("Sí evita cortes en la imagen; No da la menor latencia."), "Renderer", "use_vsync",
+		    new[] { ("2", L.T("Sí")), ("1", "Mailbox"), ("0", "No") }),
+		new(L.T("Idioma de los juegos"), L.T("El idioma de la consola que ven los juegos."), "System", "language_index",
+		    new[] { ("14", L.T("Español (Latinoamérica)")), ("5", L.T("Español (España)")), ("1", L.T("Inglés")) }),
+		new(L.T("Límite de velocidad"), L.T("Sí: el juego va a su velocidad real. No: tan rápido como pueda el PC."), "Core", "use_speed_limit",
+		    new[] { ("true", L.T("Sí")), ("false", "No") }),
+		new(L.T("Caché de shaders"), L.T("Guarda los shaders compilados para que las siguientes partidas no den tirones."), "Renderer", "use_disk_shader_cache",
+		    new[] { ("true", L.T("Sí")), ("false", "No") }),
+		new(L.T("Precisión de la GPU"), L.T("Normal: reparte el trabajo de la GPU en dos hilos (en Zelda, hasta 9 FPS más que Alta). ") +
+		    L.T("Alta: un solo hilo, por si algún juego se ve mal con Normal."), "Renderer", "gpu_accuracy",
+		    new[] { ("0", L.T("Normal (rápida)")), ("1", L.T("Alta")) }),
+		new(L.T("Lecturas rápidas de la GPU"), L.T("Copia antes de tiempo los datos que el juego lee de la tarjeta, así no la espera (en Zelda, de 44 a 52 FPS ") +
+		    L.T("en el pueblo Kokiri). Si ves parpadeos, pon No."), EnvSection, "EDEN_NX2_PREFLUSH",
+		    new[] { ("1", L.T("Sí (más FPS)")), ("0", "No") }),
+		new("Zelda: Ocarina of Time — FPS", L.T("60 dinámico: hasta 60 FPS y el juego ajusta su tiempo, así nunca va más lento aunque bajen los FPS. ") +
+		    L.T("30 estables: siempre 30 FPS a velocidad normal. 60 fijo: el original (va más lento si baja de 60)."), "Renderer", "oot_frame_mode",
+		    new[] { ("2", L.T("60 dinámico")), ("1", L.T("30 estables")), ("0", L.T("60 fijo")) }),
+		new(L.T("Zelda: antialiasing del juego"), L.T("Sin nitidez: se salta la red de antialiasing y nitidez del juego (unos 3-4 FPS más; la imagen ") +
+		    L.T("queda un poco más suave). Original: como en la consola."), "Renderer", "oot_anti_aliasing",
+		    new[] { ("1", L.T("Sin nitidez (más FPS)")), ("0", "Original") }),
+		new(L.T("Generación de fotogramas (FSR3)"), L.T("Inventa un fotograma entre cada dos: un juego a 30 FPS se ve a 60. Con Zelda, lo más fluido es ") +
+		    L.T("\"30 estables\" + esto. Puede dar un poco más de retraso al mando y algún borde raro en movimientos rápidos."), "Renderer", "frame_gen",
+		    new[] { ("true", L.T("Sí (x2)")), ("false", "No") }),
+		new(L.T("Compilación de shaders"), L.T("En segundo plano: los shaders nuevos se preparan sin frenar el juego (algún objeto puede tardar un instante en ") +
+		    L.T("aparecer la primera vez). Esperando: nada falta, pero hay tirones mientras se compilan."), "Renderer", "use_asynchronous_shaders",
+		    new[] { ("true", L.T("En segundo plano")), ("false", L.T("Esperando")) }),
 	};
 
 	public static string SettingsPath => System.IO.Path.Combine(UserDir, "config", "sdl2-config.ini");

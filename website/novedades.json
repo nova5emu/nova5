@@ -2,6 +2,30 @@
   "_comment": "Novedades de cada versión, de la más nueva a la más antigua. Las leen la web (sección Novedades) y el lanzador (cuadro al actualizar y Ajustes > Información de la versión). Añade la versión nueva arriba antes de publicarla.",
   "versions": [
     {
+      "version": "0.8.1",
+      "date": "2026-11-07",
+      "title": "Idioma inglés o español, NovaS con forma de consola y carátulas automáticas",
+      "items": [
+        "Nova5 y NovaS en español o en inglés: por defecto el idioma de tu PC, y puedes elegirlo en Ajustes › Nova5 › Idioma o en los ajustes de NovaS.",
+        "NovaS se ve como una consola en tu escritorio, sin marco y con su barrita para minimizar, agrandar y cerrar. Agrandado queda solo la pantalla.",
+        "Al pasar de Nova5 a NovaS la ventana se convierte en la consola, y al volver recupera su tamaño.",
+        "Carátulas automáticas para 23 juegos de Switch 2 (Zelda, Mario Kart World, Donkey Kong Bananza, Kirby Air Riders, Pokémon...).",
+        "NovaS encuentra los juegos en carpetas sueltas (base, actualizaciones y DLC, como los saca la consola) y los empaqueta en .nup para jugarlos con su actualización.",
+        "Logos nuevos de Nova5 y NovaS, también en la barra de tareas.",
+        "Ya no suena la música de menú de PS5 al volver de un juego de Switch 2."
+      ],
+      "title_en": "English or Spanish, NovaS shaped like a console and automatic covers",
+      "items_en": [
+        "Nova5 and NovaS in English or Spanish: your PC's language by default, and you can choose it in Settings › Nova5 › Language or in NovaS's settings.",
+        "NovaS looks like a console on your desktop, with no frame and its small bar to minimize, enlarge and close. Enlarged, only the screen is shown.",
+        "Going from Nova5 to NovaS turns the window into the console, and going back restores its size.",
+        "Automatic covers for 23 Switch 2 games (Zelda, Mario Kart World, Donkey Kong Bananza, Kirby Air Riders, Pokémon...).",
+        "NovaS finds games in loose folders (base, updates and DLC, as dumped from the console) and packs them into .nup so they play with their update.",
+        "New Nova5 and NovaS logos, on the taskbar too.",
+        "The PS5 menu music no longer plays when you come back from a Switch 2 game."
+      ]
+    },
+    {
       "version": "0.8.0",
       "date": "2026-11-07",
       "title": "NovaS: juegos de Switch 2 dentro de Nova5",
@@ -14,6 +38,17 @@
         "«Preparar shaders» está en el menú del clic derecho, con su progreso y los fallos en un cuadro.",
         "Los .zar que han perdido su archivo .zar.meta lo recuperan solos.",
         "Marvel's Wolverine: correcciones de memoria, de imágenes y de la GPU para que avance más. Todavía no es jugable y estas correcciones no se han probado a fondo."
+      ],
+      "title_en": "NovaS: Switch 2 games inside Nova5",
+      "items_en": [
+        "New NovaS (Switch 2) tab with its own console menu: add your .nsp, .xci, .nup or decrypted games, install your console's keys and firmware from the menu and play with a controller.",
+        "The Legend of Zelda: Ocarina of Time at a real 60 FPS in calm areas and 54-57 in Kokiri village (1440p); with FSR3 frame generation up to 120 show on screen.",
+        "NovaS settings: resolution up to 3x, FSR3 frame generation, GPU accuracy, console mode, language and Zelda FPS (fixed 60, steady 30 or dynamic 60).",
+        "Nova5 and NovaS open in a medium window you can enlarge, maximize or switch to full screen with F11. Games still open full screen.",
+        "Games in .rar, .zip or .7z (also split into parts) are unpacked by the launcher itself.",
+        "«Prepare shaders» is in the right-click menu, with its progress and any failures in a box.",
+        ".zar files that lost their .zar.meta get it back by themselves.",
+        "Marvel's Wolverine: memory, image and GPU fixes so it gets further. It is not playable yet and these fixes have not been fully tested."
       ]
     },
     {

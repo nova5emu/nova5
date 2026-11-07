@@ -7,6 +7,7 @@ internal static class Program
 	[STAThread]
 	public static void Main(string[] args)
 	{
+		L.Init(Services.Store.Load().Language); // Before anything builds its texts.
 		var musicTest = Array.IndexOf(args, "--music-test");
 		if (musicTest >= 0 && musicTest + 2 < args.Length)
 		{

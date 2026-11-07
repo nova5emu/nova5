@@ -159,7 +159,7 @@ public static class Library
 	private static string? TitleName(JsonElement root)
 	{
 		if (!root.TryGetProperty("localizedParameters", out var localized)) return null;
-		var preferred = new List<string> { "es-419", "es-ES", "en-US" };
+		var preferred = new List<string> { "es-419", L.T("es-ES"), "en-US" };
 		if (localized.TryGetProperty("defaultLanguage", out var language) && language.GetString() is { } lang)
 		{
 			preferred.Add(lang);

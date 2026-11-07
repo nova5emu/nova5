@@ -21,7 +21,7 @@ public static partial class ShaderPrep
 	// False when the game ships no shaders the tool can find (a Unity game's are not in shader bundles).
 	public static async Task<bool> RunAsync(Game game, bool quick, IProgress<(double Done, bool Ready)> progress, CancellationToken cancel)
 	{
-		if (!Available) throw new FileNotFoundException("Falta la herramienta de shaders (precompile-windows.ps1)");
+		if (!Available) throw new FileNotFoundException(L.T("Falta la herramienta de shaders (precompile-windows.ps1)"));
 		var info = new ProcessStartInfo("powershell.exe")
 		{
 			UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
@@ -33,7 +33,7 @@ public static partial class ShaderPrep
 		info.ArgumentList.Add("-Affinity");
 		info.ArgumentList.Add((Environment.ProcessorCount >= 63 ? -1L : (1L << Environment.ProcessorCount) - 1).ToString());
 		if (quick) info.ArgumentList.Add("-Quick");
-		using var process = Process.Start(info) ?? throw new IOException("No se pudo iniciar la preparación de shaders");
+		using var process = Process.Start(info) ?? throw new IOException(L.T("No se pudo iniciar la preparación de shaders"));
 		// Everything the script says, for when it stops: logs\preparar-shaders-<title id>.txt next to Nova5.exe.
 		var logPath = Path.Combine(AppContext.BaseDirectory, "logs", $"preparar-shaders-{game.TitleId}.txt");
 		Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
@@ -75,7 +75,7 @@ public static partial class ShaderPrep
 		if (process.ExitCode != 0)
 		{
 			var reason = stderr.Trim();
-			throw new IOException(reason.Length > 0 ? reason.Split('\n')[^1].Trim() : last.Length > 0 ? last : $"la herramienta terminó con el código {process.ExitCode}");
+			throw new IOException(reason.Length > 0 ? reason.Split('\n')[^1].Trim() : last.Length > 0 ? last : L.F("la herramienta terminó con el código {0}", process.ExitCode));
 		}
 		progress.Report((1, true));
 		return !none;

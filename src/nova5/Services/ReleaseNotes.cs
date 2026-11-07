@@ -20,8 +20,10 @@ public static class ReleaseNotes
 		foreach (var entry in json.RootElement.GetProperty("versions").EnumerateArray())
 		{
 			if (!Version.TryParse(entry.GetProperty("version").GetString(), out var version)) continue;
-			notes.Add(new ReleaseNote(version, entry.GetProperty("date").GetString() ?? "", entry.GetProperty("title").GetString() ?? "",
-			    entry.GetProperty("items").EnumerateArray().Select(i => i.GetString() ?? "").ToList()));
+			// In English, a version's English title and items when it has them.
+			var english = L.English && entry.TryGetProperty("items_en", out _);
+			notes.Add(new ReleaseNote(version, entry.GetProperty("date").GetString() ?? "", entry.GetProperty(english ? "title_en" : "title").GetString() ?? "",
+			    entry.GetProperty(english ? "items_en" : "items").EnumerateArray().Select(i => i.GetString() ?? "").ToList()));
 		}
 		return notes.OrderByDescending(n => n.Version).ToList();
 	}

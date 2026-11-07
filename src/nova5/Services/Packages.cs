@@ -107,28 +107,28 @@ public static partial class Packages
 
 	public static async Task InstallAsync(string package, IProgress<InstallProgress> progress, CancellationToken cancel)
 	{
-		if (!File.Exists(Tool)) throw new FileNotFoundException("Falta el extractor de PKG (tools\\pkg-to-anyps5.exe)");
-		if (!LooksInstallable(package)) throw new InvalidDataException("Este PKG no es un paquete de juego compatible (cifrado o dañado)");
+		if (!File.Exists(Tool)) throw new FileNotFoundException(L.T("Falta el extractor de PKG (tools\\pkg-to-anyps5.exe)"));
+		if (!LooksInstallable(package)) throw new InvalidDataException(L.T("Este PKG no es un paquete de juego compatible (cifrado o dañado)"));
 		var size   = new FileInfo(package).Length;
 		var output = OutputFor(package);
 		var free   = new DriveInfo(Path.GetPathRoot(output)!).AvailableFreeSpace;
-		if (free < size + (2L << 30)) throw new IOException($"No hay espacio: hacen falta {size / 1e9 + 2:0} GB libres");
+		if (free < size + (2L << 30)) throw new IOException(L.F("No hay espacio: hacen falta {0:0} GB libres", size / 1e9 + 2));
 		CleanUp(package); // A previous attempt that was interrupted starts over.
 		if (Directory.Exists(output) && !File.Exists(Path.Combine(output, Marker)))
 		{
-			throw new IOException($"Ya existe la carpeta {output}; muévela o bórrala para instalar este PKG");
+			throw new IOException(L.F("Ya existe la carpeta {0}; muévela o bórrala para instalar este PKG", output));
 		}
 
 		Directory.CreateDirectory(output);
 		await File.WriteAllTextAsync(Path.Combine(output, Marker), package, cancel);
-		progress.Report(new InstallProgress("Leyendo el paquete…", null));
+		progress.Report(new InstallProgress(L.T("Leyendo el paquete…"), null));
 		var info = new ProcessStartInfo(Tool)
 		{
 			UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
 			StandardOutputEncoding = System.Text.Encoding.UTF8, StandardErrorEncoding = System.Text.Encoding.UTF8,
 		};
 		foreach (var arg in new[] { package, output, "--jobs", "4", "--verbose" }) info.ArgumentList.Add(arg);
-		using var process = Process.Start(info) ?? throw new InvalidOperationException("No se pudo iniciar el extractor");
+		using var process = Process.Start(info) ?? throw new InvalidOperationException(L.T("No se pudo iniciar el extractor"));
 		var errors = process.StandardError.ReadToEndAsync(cancel);
 		var status = new ExtractorStatus();
 		var lines  = Task.Run(async () =>
@@ -141,16 +141,16 @@ public static partial class Packages
 			if (status.Total + (2L << 30) > free) // The package is compressed: the real size is known once its index is read.
 			{
 				process.Kill(entireProcessTree: true);
-				throw new IOException($"No hay espacio: el juego ocupa {status.Total / (double)(1L << 30):0} GB y hacen falta {status.Total / (double)(1L << 30) + 2:0} GB libres");
+				throw new IOException(L.F("No hay espacio: el juego ocupa {0:0} GB y hacen falta {1:0} GB libres", status.Total / (double)(1L << 30), status.Total / (double)(1L << 30) + 2));
 			}
 			progress.Report(status.Now());
 		}
 		await lines;
 		if (process.ExitCode != 0)
 		{
-			throw new InvalidDataException("El extractor falló: " + (await errors).Trim().Split('\n').LastOrDefault());
+			throw new InvalidDataException(L.T("El extractor falló: ") + (await errors).Trim().Split('\n').LastOrDefault());
 		}
-		progress.Report(new InstallProgress("Terminando…", null));
+		progress.Report(new InstallProgress(L.T("Terminando…"), null));
 
 		// The emulator loads ELF executables: put the unwrapped ones from source\ over the packaged ones in app0\.
 		var source = Path.Combine(output, "source");
@@ -169,10 +169,10 @@ public static partial class Packages
 		if (!File.Exists(Path.Combine(app, "sce_sys", "param.json")) ||
 		    (!File.Exists(Path.Combine(app, "eboot.bin")) && Library.ReadAddon(app) is null))
 		{
-			throw new InvalidDataException("El paquete no contiene un juego ni un DLC (falta eboot.bin o param.json)");
+			throw new InvalidDataException(L.T("El paquete no contiene un juego ni un DLC (falta eboot.bin o param.json)"));
 		}
 		File.Delete(Path.Combine(output, Marker));
-		progress.Report(new InstallProgress("Instalado", 1));
+		progress.Report(new InstallProgress(L.T("Instalado"), 1));
 	}
 
 	// Follows pkg-to-anyps5 --verbose without a terminal. It prints a line when a step starts:
@@ -183,7 +183,7 @@ public static partial class Packages
 	private sealed partial class ExtractorStatus
 	{
 		private readonly object _lock = new();
-		private string   _step = "Leyendo el paquete…";
+		private string   _step = L.T("Leyendo el paquete…");
 		private bool     _copying;
 		private double   _fraction, _speed;
 		private long     _done, _total, _filesDone, _filesTotal;
@@ -208,10 +208,10 @@ public static partial class Packages
 					_copying  = step.Groups[1].Value == "copying app0";
 					_step     = step.Groups[1].Value switch
 					{
-						"reading package"        => "Leyendo el paquete…",
-						"unwrapping executables" => "Preparando los ejecutables…",
-						"copying app0"           => "Copiando archivos",
-						_                        => "Instalando…",
+						"reading package"        => L.T("Leyendo el paquete…"),
+						"unwrapping executables" => L.T("Preparando los ejecutables…"),
+						"copying app0"           => L.T("Copiando archivos"),
+						_                        => L.T("Instalando…"),
 					};
 					_fraction   = 0;
 					_done       = 0;
@@ -240,7 +240,7 @@ public static partial class Packages
 		{
 			lock (_lock)
 			{
-				if (!_copying) return new InstallProgress(_step, _step == "Preparando los ejecutables…" && _total > 0 ? _fraction : null);
+				if (!_copying) return new InstallProgress(_step, _step == L.T("Preparando los ejecutables…") && _total > 0 ? _fraction : null);
 				var since     = (DateTime.UtcNow - _at).TotalSeconds;
 				var done      = _total > 0 ? Math.Min(_total, _done + (long)(_speed * since)) : _done;
 				var remaining = _remaining is { } r ? TimeSpan.FromSeconds(Math.Max(0, r.TotalSeconds - since)) : (TimeSpan?)null;

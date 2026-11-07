@@ -54,7 +54,7 @@ public static class Trophies
 				if (ReadId(definition, "id") is not { } id || !definition.TryGetProperty("grade", out var grade)) continue;
 				var index = "PGSB".IndexOf(grade.GetString() ?? "?", StringComparison.Ordinal);
 				if (index < 0) continue;
-				var (name, detail) = names.GetValueOrDefault(id, ($"Trofeo {id}", ""));
+				var (name, detail) = names.GetValueOrDefault(id, (L.F("Trofeo {0}", id), ""));
 				list.Add(new Trophy(id, (TrophyGrade)(index + 1), name, detail,
 				    definition.TryGetProperty("hidden", out var hidden) && hidden.ValueKind == JsonValueKind.True,
 				    files.GetValueOrDefault($"trop{id:0000}.png"), unlocks.GetValueOrDefault(id)));
@@ -71,9 +71,9 @@ public static class Trophies
 	// Spanish variants are tried first, as the launcher is in Spanish, then English.
 	private static IEnumerable<string> Locales(string consoleLanguage) => consoleLanguage switch
 	{
-		"3" => new[] { "es-ES", "es-419" },
-		"20" => new[] { "es-419", "es-ES" },
-		_ => new[] { "es-419", "es-ES", "en-US", "en-GB" },
+		"3" => new[] { L.T("es-ES"), "es-419" },
+		"20" => new[] { "es-419", L.T("es-ES") },
+		_ => new[] { "es-419", L.T("es-ES"), "en-US", "en-GB" },
 	};
 
 	private static int? ReadId(JsonElement element, string property)

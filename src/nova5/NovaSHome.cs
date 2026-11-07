@@ -74,29 +74,21 @@ public sealed class NovaSHome : Grid
 		Background = new SolidColorBrush(Back);
 		_buttons = new List<Action>
 		{
-			new("", "Añadir carpeta", () => AddFolder?.Invoke()),
-			new("", "Claves", () => InstallKeys?.Invoke()),
+			new("", L.T("Añadir carpeta"), () => AddFolder?.Invoke()),
+			new("", L.T("Claves"), () => InstallKeys?.Invoke()),
 			new("", "Firmware", () => InstallFirmware?.Invoke()),
-			new("", "Portada", () => { if (_index < _games.Count) ChangeCover?.Invoke(_games[_index]); else Toast("Elige primero un juego"); }),
-			new("", "Ajustes NovaS", OpenSettings),
+			new("", L.T("Portada"), () => { if (_index < _games.Count) ChangeCover?.Invoke(_games[_index]); else Toast(L.T("Elige primero un juego")); }),
+			new("", L.T("Ajustes NovaS"), OpenSettings),
 			// NovaS on its own has no PS5 side to go back to: its last button closes it.
-			Edition.NovaSOnly ? new("", "Salir", () => Leave?.Invoke()) : new("", "Nova5 (PS5)", () => Leave?.Invoke()),
+			Edition.NovaSOnly ? new("", L.T("Salir"), () => Leave?.Invoke()) : new("", "Nova5 (PS5)", () => Leave?.Invoke()),
 		};
 
 		var stage = new Canvas { Width = 1920, Height = 1080 };
 
-		// Top: player and brand on the left, clock and controller on the right.
+		// Top: NovaS's red and blue mark and its name on the left, clock and controller on the right.
 		var who = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 18 };
-		who.Children.Add(new Border
-		{
-			Width = 62, Height = 62, CornerRadius = new CornerRadius(31), BorderThickness = new Thickness(3),
-			BorderBrush = new SolidColorBrush(Accent), Background = new SolidColorBrush(Panel),
-			Child = Label("", 28, FontWeight.Normal, TextColor, Icons, center: true),
-		});
-		var brand = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2, VerticalAlignment = VerticalAlignment.Center };
-		brand.Children.Add(Label("Nova", 34, FontWeight.Bold, TextColor));
-		brand.Children.Add(Label("S", 34, FontWeight.Black, Accent));
-		who.Children.Add(brand);
+		who.Children.Add(MainWindow.NovaSMark(62));
+		who.Children.Add(Label("NovaS", 34, FontWeight.Bold, TextColor));
 		Place(stage, who, RowLeft, 54);
 
 		var status = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 30, VerticalAlignment = VerticalAlignment.Center };
@@ -137,11 +129,11 @@ public sealed class NovaSHome : Grid
 		// Bottom bar: a thin line, the controls on the right.
 		Place(stage, new Rectangle { Width = 1920 - RowLeft * 2, Height = 1, Fill = new SolidColorBrush(Line) }, RowLeft, 980);
 		var hints = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 34 };
-		hints.Children.Add(Hint("A", "Iniciar"));
-		hints.Children.Add(Hint("Y", "Ajustes"));
+		hints.Children.Add(Hint("A", L.T("Iniciar")));
+		hints.Children.Add(Hint("Y", L.T("Ajustes")));
 		if (!Edition.NovaSOnly) hints.Children.Add(Hint("B", "Nova5"));
 		var hintsDock = new DockPanel { Width = 1920 - RowLeft * 2, LastChildFill = false };
-		var console = Label("Juegos de Switch 2", 20, FontWeight.Normal, Dim);
+		var console = Label(L.T("Juegos de Switch 2"), 20, FontWeight.Normal, Dim);
 		DockPanel.SetDock(console, Dock.Left);
 		DockPanel.SetDock(hints, Dock.Right);
 		hintsDock.Children.Add(console);
@@ -157,17 +149,18 @@ public sealed class NovaSHome : Grid
 		// (the same look as NovaS's web page). The drawn buttons work like the real ones.
 		_screen.Children.Add(stage);
 		_screen.Children.Add(_settingsHost);
-		Background = new SolidColorBrush(Desk);
+		_joyLeft  = JoyCon(left: true);
+		_joyRight = JoyCon(left: false);
+		_bezel.Child = _screen;
 		var device = new StackPanel { Orientation = Orientation.Horizontal };
-		device.Children.Add(JoyCon(left: true));
-		device.Children.Add(new Border { Background = new SolidColorBrush(Bezel), Padding = new Thickness(0, BezelSize), Child = _screen });
-		device.Children.Add(JoyCon(left: false));
-		var shadow = new Border
-		{
-			Child = device, Margin = new Thickness(90, 70), CornerRadius = new CornerRadius(JoyWidth * 0.6, JoyWidth * 0.6, JoyWidth * 0.6, JoyWidth * 0.6),
-			BoxShadow = BoxShadows.Parse("0 34 70 0 #4426282E"),
-		};
-		Children.Add(new Viewbox { Stretch = Stretch.Uniform, Child = shadow });
+		device.Children.Add(_joyLeft);
+		device.Children.Add(_bezel);
+		device.Children.Add(_joyRight);
+		_shadow.Child = device;
+		Children.Add(new Viewbox { Stretch = Stretch.Uniform, Child = _shadow });
+		// When NovaS is the window (no frame): this small bar on top of the screen minimizes, enlarges and closes it.
+		_screen.Children.Add(_windowBar = WindowBar());
+		Look = Edition.NovaSOnly ? NovaSLook.Console : NovaSLook.Desk;
 
 		var clock =new DispatcherTimer(TimeSpan.FromSeconds(1), DispatcherPriority.Background, (_, _) => _clock.Text = DateTime.Now.ToString("HH:mm"));
 		clock.Start();
@@ -175,6 +168,87 @@ public sealed class NovaSHome : Grid
 	}
 
 	public string PadStatus { set => _pad.Text = value; }
+
+	// The console's size with the small margin its shadow needs: NovaS on its own sizes its window to it.
+	public const double WindowMargin = 26;
+	public static double ConsoleAspect => (JoyWidth * 2 + 1920 + WindowMargin * 2) / (1080 + BezelSize * 2 + WindowMargin * 2);
+
+	private readonly Border _shadow = new() { CornerRadius = new CornerRadius(JoyWidth * 0.6) };
+	private readonly Border _bezel  = new() { Background = new SolidColorBrush(Bezel) };
+	private Border _joyLeft = new(), _joyRight = new();
+	private TextBlock? _sizeGlyph;
+	private Border? _windowBar;
+	private NovaSLook _look;
+
+	// Desk: inside Nova5, the console on a wide light desk. Console: NovaS's own see-through window, only the console is
+	// drawn. Screen: NovaS full screen, no controllers, just the screen as before.
+	public enum NovaSLook { Desk, Console, Screen }
+
+	public NovaSLook Look
+	{
+		set
+		{
+			_look = value;
+			var screen = value == NovaSLook.Screen;
+			if (_windowBar is not null) _windowBar.IsVisible = value != NovaSLook.Desk;
+			Background = value switch
+			{
+				NovaSLook.Desk    => new SolidColorBrush(Desk),
+				NovaSLook.Console => Brushes.Transparent,
+				_                 => new SolidColorBrush(Back),
+			};
+			_joyLeft.IsVisible = _joyRight.IsVisible = !screen;
+			_bezel.Padding = screen ? new Thickness(0) : new Thickness(0, BezelSize);
+			_shadow.CornerRadius = screen ? new CornerRadius(0) : new CornerRadius(JoyWidth * 0.6);
+			_shadow.Margin = value switch
+			{
+				NovaSLook.Desk    => new Thickness(90, 70),
+				NovaSLook.Console => new Thickness(WindowMargin, WindowMargin * 0.4, WindowMargin, WindowMargin * 1.6),
+				_                 => new Thickness(0),
+			};
+			_shadow.BoxShadow = value switch
+			{
+				NovaSLook.Desk    => BoxShadows.Parse("0 34 70 0 #4426282E"),
+				NovaSLook.Console => BoxShadows.Parse("0 10 22 0 #5526282E"),
+				_                 => default,
+			};
+			if (_sizeGlyph is not null) _sizeGlyph.Text = screen ? "\uE73F" : "\uE740"; // Back to the console / full screen.
+		}
+	}
+
+	// The window bar's requests (NovaS on its own) and dragging the window by the bar or the controllers' bodies.
+	public event System.Action? MinimizeRequested, FullScreenRequested, CloseRequested;
+	public event System.Action<PointerPressedEventArgs>? MoveRequested;
+
+	private Border WindowBar()
+	{
+		var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 14 };
+		Border Round(string glyph, Color hover, System.Action run, out TextBlock label)
+		{
+			label = Label(glyph, 26, FontWeight.Normal, TextColor, Icons, center: true);
+			var round = new Border
+			{
+				Width = 62, Height = 62, CornerRadius = new CornerRadius(31), Background = new SolidColorBrush(Panel),
+				Child = label, Cursor = new Cursor(StandardCursorType.Hand),
+			};
+			round.PointerEntered += (_, _) => round.Background = new SolidColorBrush(hover);
+			round.PointerExited  += (_, _) => round.Background = new SolidColorBrush(Panel);
+			round.PointerPressed += (_, e) => { e.Handled = true; run(); };
+			return round;
+		}
+		buttons.Children.Add(Round("\uE921", Line, () => MinimizeRequested?.Invoke(), out _));
+		buttons.Children.Add(Round("\uE740", Line, () => FullScreenRequested?.Invoke(), out var size));
+		buttons.Children.Add(Round("\uE8BB", Color.Parse("#E5484D"), () => CloseRequested?.Invoke(), out _));
+		_sizeGlyph = size;
+		var bar = new Border
+		{
+			Child = buttons, Padding = new Thickness(20, 10), CornerRadius = new CornerRadius(41), Margin = new Thickness(0, 12, 0, 0),
+			Background = new SolidColorBrush(Color.Parse("#1D1E24"), 0.92), BorderBrush = new SolidColorBrush(Line), BorderThickness = new Thickness(1),
+			HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Top, Cursor = new Cursor(StandardCursorType.SizeAll),
+		};
+		bar.PointerPressed += (_, e) => { if (!e.Handled) MoveRequested?.Invoke(e); };
+		return bar;
+	}
 
 	private void BuildActions()
 	{
@@ -255,14 +329,14 @@ public sealed class NovaSHome : Grid
 		{
 			var body = new StackPanel { Spacing = 22 };
 			var head = new DockPanel { LastChildFill = false };
-			head.Children.Add(Label("Ajustes de NovaS", 40, FontWeight.Bold, TextColor));
-			var close = Hint("B", "Volver");
+			head.Children.Add(Label(L.T("Ajustes de NovaS"), 40, FontWeight.Bold, TextColor));
+			var close = Hint("B", L.T("Volver"));
 			close.Cursor = new Cursor(StandardCursorType.Hand);
 			close.PointerPressed += (_, _) => CloseSettings();
 			DockPanel.SetDock(close, Dock.Right);
 			head.Children.Add(close);
 			body.Children.Add(head);
-			body.Children.Add(Label("▲ ▼ / rueda del ratón elegir y desplazar     ◂ ▸ / A / clic cambiar     B volver", 20, FontWeight.Normal, Dim));
+			body.Children.Add(Label(L.T("▲ ▼ / rueda del ratón elegir y desplazar     ◂ ▸ / A / clic cambiar     B volver"), 20, FontWeight.Normal, Dim));
 			_settingsScroll.Content = _settingsRows;
 			body.Children.Add(_settingsScroll);
 			_settingsSheet = new Border
@@ -283,21 +357,32 @@ public sealed class NovaSHome : Grid
 
 	private void CloseSettings() => _settingsHost.IsVisible = false;
 
+	// The launcher's language (the first row; the launcher keeps it) and then the engine's options.
+	public Func<string>? LanguageValue;
+	public System.Action<int>? LanguageChange;
+	private int SettingCount => SwitchGames.Options.Length + 1;
+
+	public void RefreshSettings()
+	{
+		if (SettingsOpen) BuildSettings();
+	}
+
 	private void BuildSettings()
 	{
 		_settingsRows.Children.Clear();
-		for (var i = 0; i < SwitchGames.Options.Length; i++)
+		for (var i = 0; i < SettingCount; i++)
 		{
 			var index  = i;
-			var option = SwitchGames.Options[i];
+			var option = i == 0 ? null : SwitchGames.Options[i - 1];
 			var focused = i == _setting;
 			var row = new DockPanel { LastChildFill = true };
-			var value = Label("‹  " + option.Choices[SwitchGames.Current(option)].Name + "  ›", 24, FontWeight.SemiBold, focused ? Accent : TextColor);
+			var shown = option is null ? LanguageValue?.Invoke() ?? "" : option.Choices[SwitchGames.Current(option)].Name;
+			var value = Label("‹  " + shown + "  ›", 24, FontWeight.SemiBold, focused ? Accent : TextColor);
 			DockPanel.SetDock(value, Dock.Right);
 			row.Children.Add(value);
 			var text = new StackPanel { Spacing = 4, HorizontalAlignment = HorizontalAlignment.Left };
-			text.Children.Add(Label(option.Label, 26, FontWeight.SemiBold, TextColor));
-			text.Children.Add(new TextBlock { Text = option.Detail, FontSize = 18, TextWrapping = TextWrapping.Wrap, Foreground = new SolidColorBrush(Dim), MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Left });
+			text.Children.Add(Label(option?.Label ?? "Idioma / Language", 26, FontWeight.SemiBold, TextColor));
+			text.Children.Add(new TextBlock { Text = option?.Detail ?? L.T("Idioma de Nova5 y NovaS. Automático usa el de tu PC. Se aplica al reiniciar."), FontSize = 18, TextWrapping = TextWrapping.Wrap, Foreground = new SolidColorBrush(Dim), MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Left });
 			row.Children.Add(text);
 			var box = new Border
 			{
@@ -313,7 +398,7 @@ public sealed class NovaSHome : Grid
 	// Pad and keyboard move the selection; keep it on screen.
 	private void SelectSetting(int index)
 	{
-		_setting = Math.Clamp(index, 0, SwitchGames.Options.Length - 1);
+		_setting = Math.Clamp(index, 0, SettingCount - 1);
 		BuildSettings();
 		var row = (Control)_settingsRows.Children[_setting];
 		Dispatcher.UIThread.Post(() => row.BringIntoView(), DispatcherPriority.Background);
@@ -321,7 +406,12 @@ public sealed class NovaSHome : Grid
 
 	private void Change(int step)
 	{
-		var option = SwitchGames.Options[_setting];
+		if (_setting == 0)
+		{
+			LanguageChange?.Invoke(step);
+			return;
+		}
+		var option = SwitchGames.Options[_setting - 1];
 		var next = (SwitchGames.Current(option) + step + option.Choices.Length) % option.Choices.Length;
 		try
 		{
@@ -329,7 +419,7 @@ public sealed class NovaSHome : Grid
 		}
 		catch (Exception e) when (e is IOException or UnauthorizedAccessException)
 		{
-			Toast("No se pudo guardar: " + e.Message);
+			Toast(L.T("No se pudo guardar: ") + e.Message);
 		}
 		BuildSettings();
 	}
@@ -408,13 +498,13 @@ public sealed class NovaSHome : Grid
 			var game = _games[_index];
 			_name.Text   = game.Name;
 			_detail.Text = game.Extracted
-			    ? $"{(game.Path.EndsWith(".nup", StringComparison.OrdinalIgnoreCase) ? "Paquete NUP" : "Carpeta descifrada")} · no necesita claves · {game.Size / 1e9:0.0} GB"
+			    ? L.F("{0} · no necesita claves · {1:0.0} GB", (game.Path.EndsWith(".nup", StringComparison.OrdinalIgnoreCase) ? L.T("Paquete NUP") : L.T("Carpeta descifrada")), game.Size / 1e9)
 			    : $"{System.IO.Path.GetExtension(game.Path).TrimStart('.').ToUpperInvariant()} · {game.Size / 1e9:0.0} GB";
 		}
 		else
 		{
-			_name.Text   = _games.Count == 0 ? "Añade tus juegos de Switch 2" : "Añadir carpeta";
-			_detail.Text = "Elige la carpeta con tus .nsp, .xci, .nup o juegos descifrados (exefs + romfs)";
+			_name.Text   = _games.Count == 0 ? L.T("Añade tus juegos de Switch 2") : L.T("Añadir carpeta");
+			_detail.Text = L.T("Elige la carpeta con tus .nsp, .xci, .nup o juegos descifrados (exefs + romfs)");
 		}
 
 		// Extracted (decrypted) games boot without keys; .nsp/.xci need the console's own.
@@ -422,12 +512,12 @@ public sealed class NovaSHome : Grid
 		var missingKeys = needsKeys && !SwitchGames.HasKeys;
 		_banner.IsVisible = !SwitchGames.HasEngine || missingKeys || !SwitchGames.HasFirmware;
 		_bannerText.Text = !SwitchGames.HasEngine
-		    ? $"Falta el motor de NovaS. Actualiza {Edition.Name} para instalarlo."
+		    ? L.F("Falta el motor de NovaS. Actualiza {0} para instalarlo.", Edition.Name)
 		    : missingKeys
-		    ? "Los .nsp y .xci necesitan las claves de TU consola: pulsa \"Claves\" y elige tu prod.keys (y title.keys si lo tienes). " +
-		      "Los .nup y los juegos en carpeta descifrada (exefs + romfs) no las necesitan."
-		    : "Recomendado: instala el firmware de tu consola con \"Firmware\" (elige su .zip o cualquier .nca de su carpeta). " +
-		      "Muchos juegos arrancan sin él, pero algunos lo necesitan para fuentes, teclado y menús.";
+		    ? L.T("Los .nsp y .xci necesitan las claves de TU consola: pulsa \"Claves\" y elige tu prod.keys (y title.keys si lo tienes). ") +
+		      L.T("Los .nup y los juegos en carpeta descifrada (exefs + romfs) no las necesitan.")
+		    : L.T("Recomendado: instala el firmware de tu consola con \"Firmware\" (elige su .zip o cualquier .nca de su carpeta). ") +
+		      L.T("Muchos juegos arrancan sin él, pero algunos lo necesitan para fuentes, teclado y menús.");
 	}
 
 	// ---- Pieces -------------------------------------------------------------------------------
@@ -480,11 +570,19 @@ public sealed class NovaSHome : Grid
 		if (left) { parts.Children.Add(stick); parts.Children.Add(diamond); }
 		else      { parts.Children.Add(diamond); parts.Children.Add(stick); }
 		parts.Children.Add(small);
-		return new Border
+		var body = new Border
 		{
 			Width = JoyWidth, Height = height, Child = parts, Background = new SolidColorBrush(left ? Red : Blue),
 			CornerRadius = left ? new CornerRadius(round, 0, 0, round) : new CornerRadius(0, round, round, 0),
 		};
+		// NovaS as the window: the controllers' bodies (not their buttons) move it; a double click enlarges it.
+		body.PointerPressed += (_, e) =>
+		{
+			if (e.Handled || _look != NovaSLook.Console) return;
+			if (e.ClickCount == 2) FullScreenRequested?.Invoke();
+			else MoveRequested?.Invoke(e);
+		};
+		return body;
 	}
 
 	// A drawn controller button: it shrinks a little while pressed and acts like that pad input.

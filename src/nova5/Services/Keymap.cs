@@ -11,14 +11,14 @@ public static class Keymap
 
 	public static readonly Control[] Controls =
 	{
-		new("Cross", "Cruz (✕)"), new("Circle", "Círculo (○)"), new("Square", "Cuadrado (□)"), new("Triangle", "Triángulo (△)"),
-		new("L1", "L1"), new("R1", "R1"), new("L2", "L2"), new("R2", "R2"), new("L3", "L3 (pulsar stick izquierdo)"), new("R3", "R3 (pulsar stick derecho)"),
-		new("Up", "Cruceta arriba"), new("Down", "Cruceta abajo"), new("Left", "Cruceta izquierda"), new("Right", "Cruceta derecha"),
-		new("LeftStickUp", "Stick izquierdo arriba"), new("LeftStickDown", "Stick izquierdo abajo"),
-		new("LeftStickLeft", "Stick izquierdo a la izquierda"), new("LeftStickRight", "Stick izquierdo a la derecha"),
-		new("RightStickUp", "Stick derecho arriba"), new("RightStickDown", "Stick derecho abajo"),
-		new("RightStickLeft", "Stick derecho a la izquierda"), new("RightStickRight", "Stick derecho a la derecha"),
-		new("Options", "Options"), new("TouchPad", "Panel táctil (izquierda)"), new("TouchPadRight", "Panel táctil (derecha)"),
+		new("Cross", L.T("Cruz (✕)")), new("Circle", L.T("Círculo (○)")), new("Square", L.T("Cuadrado (□)")), new("Triangle", L.T("Triángulo (△)")),
+		new("L1", "L1"), new("R1", "R1"), new("L2", "L2"), new("R2", "R2"), new("L3", L.T("L3 (pulsar stick izquierdo)")), new("R3", L.T("R3 (pulsar stick derecho)")),
+		new("Up", L.T("Cruceta arriba")), new("Down", L.T("Cruceta abajo")), new("Left", L.T("Cruceta izquierda")), new("Right", L.T("Cruceta derecha")),
+		new("LeftStickUp", L.T("Stick izquierdo arriba")), new("LeftStickDown", L.T("Stick izquierdo abajo")),
+		new("LeftStickLeft", L.T("Stick izquierdo a la izquierda")), new("LeftStickRight", L.T("Stick izquierdo a la derecha")),
+		new("RightStickUp", L.T("Stick derecho arriba")), new("RightStickDown", L.T("Stick derecho abajo")),
+		new("RightStickLeft", L.T("Stick derecho a la izquierda")), new("RightStickRight", L.T("Stick derecho a la derecha")),
+		new("Options", "Options"), new("TouchPad", L.T("Panel táctil (izquierda)")), new("TouchPadRight", L.T("Panel táctil (derecha)")),
 	};
 
 	// The emulator's own keys, plus L2 and R2 (Z and C, as in KytyPS5's launcher), which it has no default for.
@@ -49,10 +49,10 @@ public static class Keymap
 	// What a key looks like on screen ("Mouse:Left" → "Clic izquierdo").
 	public static string Show(string input) => input switch
 	{
-		"" => "Sin asignar", "Mouse:Left" => "Clic izquierdo", "Mouse:Right" => "Clic derecho", "Mouse:Middle" => "Clic central",
-		"Mouse:X1" => "Ratón atrás", "Mouse:X2" => "Ratón adelante", "Mouse:WheelUp" => "Rueda arriba", "Mouse:WheelDown" => "Rueda abajo",
-		"Return" => "Enter", "Space" => "Espacio", "Left Shift" => "Mayús", "Left Ctrl" => "Ctrl", "Left Alt" => "Alt",
-		"Up" => "↑", "Down" => "↓", "Left" => "←", "Right" => "→", "Backspace" => "Retroceso", "Tab" => "Tab",
+		"" => L.T("Sin asignar"), "Mouse:Left" => L.T("Clic izquierdo"), "Mouse:Right" => L.T("Clic derecho"), "Mouse:Middle" => L.T("Clic central"),
+		"Mouse:X1" => L.T("Ratón atrás"), "Mouse:X2" => L.T("Ratón adelante"), "Mouse:WheelUp" => L.T("Rueda arriba"), "Mouse:WheelDown" => L.T("Rueda abajo"),
+		"Return" => "Enter", "Space" => L.T("Espacio"), "Left Shift" => L.T("Mayús"), "Left Ctrl" => "Ctrl", "Left Alt" => "Alt",
+		"Up" => "↑", "Down" => "↓", "Left" => "←", "Right" => "→", "Backspace" => L.T("Retroceso"), "Tab" => "Tab",
 		_ => input,
 	};
 

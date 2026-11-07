@@ -120,14 +120,11 @@ public sealed class MainWindow : Window
 	private string?             _capturing;
 	private readonly TextBlock[] _tabs;
 	private readonly TextBlock  _clock = Text("", 22, FontWeight.SemiBold);
-	private readonly TextBlock  _padStatus = Text("Sin mando", 20, FontWeight.Normal, Palette.Muted);
+	private readonly TextBlock  _padStatus = Text(L.T("Sin mando"), 20, FontWeight.Normal, Palette.Muted);
 	private readonly TextBlock  _toast = Text("", 24, FontWeight.Normal);
 	private readonly Border     _toastBox;
 	private readonly Border     _prompt;
 	private Border?             _statsBox;
-	private Border              _chrome = new();
-	private bool                _chromePinned;
-	private readonly TextBlock  _fullscreenLabel = Text("", 20, FontWeight.Normal);
 	private readonly TextBlock  _updateText = Text("", 20, FontWeight.SemiBold, Palette.AuroraA);
 	private Border              _updatePill = new();
 	private readonly NovaSHome  _novas = new();
@@ -138,6 +135,7 @@ public sealed class MainWindow : Window
 	public MainWindow()
 	{
 		Title      = Edition.Name;
+		Icon       = EditionIcon(Edition.NovaSOnly);
 		Background = Palette.Brush(Palette.Night);
 		FontFamily = Palette.Font;
 		Width      = 1600;
@@ -148,20 +146,36 @@ public sealed class MainWindow : Window
 		WindowStartupLocation = WindowStartupLocation.CenterScreen;
 		MinWidth  = 640;
 		MinHeight = 360;
-		if (SnapshotPath is null && Screens.Primary is { } screen)
+		if (SnapshotPath is null && WorkAreaWidth() is { } workWidth)
 		{
-			Width  = screen.WorkingArea.Width / screen.Scaling * 0.5;
-			Height = Width * (Edition.NovaSOnly ? 0.5 : 9.0 / 16); // NovaS's console is wider than 16:9.
+			Width  = workWidth * 0.5;
+			Height = Edition.NovaSOnly ? Width / NovaSHome.ConsoleAspect : Width * 9 / 16; // NovaS: the window is the console.
 		}
 
-		_buttons = new[] { ActionButton("Jugar", primary: true), ActionButton("Opciones del juego"), ActionButton("Abrir carpeta") };
-		_tabs    = new[] { Text("Juegos", 24, FontWeight.SemiBold), Text("Trofeos", 24, FontWeight.Normal, Palette.Muted), Text("Ajustes", 24, FontWeight.Normal, Palette.Muted), Text("NovaS · Switch 2", 24, FontWeight.Normal, Palette.Muted) };
+		_buttons = new[] { ActionButton(L.T("Jugar"), primary: true), ActionButton(L.T("Opciones del juego")), ActionButton(L.T("Abrir carpeta")) };
+		_tabs    = new[] { Text(L.T("Juegos"), 24, FontWeight.SemiBold), Text(L.T("Trofeos"), 24, FontWeight.Normal, Palette.Muted), Text(L.T("Ajustes"), 24, FontWeight.Normal, Palette.Muted), Text("NovaS · Switch 2", 24, FontWeight.Normal, Palette.Muted) };
 		_novas.Launch    += LaunchSwitch;
 		_novas.InstallKeys     += InstallSwitchKeys;
 		_novas.InstallFirmware += InstallSwitchFirmware;
 		_novas.ChangeCover     += ChangeSwitchCover;
 		_novas.Leave     += () => { if (Edition.NovaSOnly) Close(); else ShowTab(0); };
 		_novas.AddFolder += AddSwitchFolder;
+		// NovaS's console window (see UpdateNovaSWindow): its bar minimizes, enlarges (full screen: just the screen, as
+		// before) and closes it; the bar and the controllers' bodies move it.
+		if (Edition.NovaSOnly && SnapshotPath is null)
+		{
+			// NovaS on its own starts as the console already, without showing a frame first.
+			SystemDecorations     = WindowDecorations.None;
+			TransparencyLevelHint = new[] { WindowTransparencyLevel.Transparent };
+			Background            = Brushes.Transparent;
+			_consoleWindow        = true;
+		}
+		_novas.LanguageValue  = () => LanguageName(_store.Language);
+		_novas.LanguageChange = ChangeLanguage;
+		_novas.MinimizeRequested   += () => WindowState = WindowState.Minimized;
+		_novas.FullScreenRequested += () => WindowState = WindowState == WindowState.FullScreen ? WindowState.Normal : WindowState.FullScreen;
+		_novas.CloseRequested      += Close;
+		_novas.MoveRequested       += e => { if (WindowState == WindowState.Normal) BeginMoveDrag(e); };
 		_toastBox = new Border
 		{
 			Child = _toast, Padding = new Thickness(28, 14), CornerRadius = new CornerRadius(16), Opacity = 0,
@@ -179,9 +193,9 @@ public sealed class MainWindow : Window
 
 		_music.Enabled = _store.Music;
 		_music.Volume  = _store.MusicVolume;
-		if (!Gamepad.Initialize()) _padStatus.Text = "Mando no disponible";
+		if (!Gamepad.Initialize()) _padStatus.Text = L.T("Mando no disponible");
 		_pad.Input     += OnInput;
-		_pad.Connected += name => _novas.PadStatus = _padStatus.Text = name is null ? "Sin mando" : $"Mando: {name}";
+		_pad.Connected += name => _novas.PadStatus = _padStatus.Text = name is null ? L.T("Sin mando") : L.F("Mando: {0}", name);
 		_novas.PadStatus = _padStatus.Text;
 
 		var poll = new DispatcherTimer(TimeSpan.FromMilliseconds(16), DispatcherPriority.Input, (_, _) => _pad.Poll(IsActive && _running is null));
@@ -191,12 +205,6 @@ public sealed class MainWindow : Window
 		_clock.Text = DateTime.Now.ToString("HH:mm");
 
 		KeyDown += OnKey;
-		PointerMoved += (_, e) =>
-		{
-			var y = e.GetPosition(this).Y;
-			if (y <= 6) ShowChrome(true);
-			else if (!_chromePinned && y > 72) ShowChrome(false);
-		};
 		PointerWheelChanged += (_, e) =>
 		{
 			if (_running is not null || _zone is Zone.Prompt or Zone.Notes or Zone.GameOptions or Zone.TrophyList or Zone.TextEntry or Zone.Keys or Zone.Choice) return;
@@ -207,15 +215,14 @@ public sealed class MainWindow : Window
 		PropertyChanged += (_, e) =>
 		{
 			if (e.Property != WindowStateProperty) return;
-			_fullscreenLabel.Text = WindowState == WindowState.FullScreen ? "Ventana" : "Pantalla completa";
 			// What to come back to after a game (the launcher minimizes while it runs) and when leaving full screen.
 			if (WindowState != WindowState.Minimized) _shownState = WindowState;
 			if (WindowState is WindowState.Normal or WindowState.Maximized) _windowedState = WindowState;
+			UpdateNovaSWindow(); // NovaS: a console in a window, only the screen when it fills the screen.
 		};
 		Opened  += (_, _) =>
 		{
 			Reload();
-			_fullscreenLabel.Text = WindowState == WindowState.FullScreen ? "Ventana" : "Pantalla completa";
 			if (SnapshotPath is { } snapshot)
 			{
 				if (SnapshotNotes) ShowNotes(ReleaseNotes.Since(null, Updates.Current), firstTime: false);
@@ -250,9 +257,9 @@ public sealed class MainWindow : Window
 		var brand = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 16, VerticalAlignment = VerticalAlignment.Center };
 		brand.Children.Add(Logo(52));
 		brand.Children.Add(Text("Nova5", 34, FontWeight.Bold));
-		brand.Children.Add(new TextBlock { Text = "EMULADOR", FontSize = 18, FontWeight = FontWeight.Light, Foreground = Palette.Brush(Palette.Muted), LetterSpacing = 3, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 4, 0, 0) });
+		brand.Children.Add(new TextBlock { Text = L.T("EMULADOR"), FontSize = 18, FontWeight = FontWeight.Light, Foreground = Palette.Brush(Palette.Muted), LetterSpacing = 3, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 4, 0, 0) });
 		// Opens the Ko-fi page straight away (also listed in Settings for controller users).
-		var donate = Pill(Text("☕ Donar", 18, FontWeight.SemiBold, Palette.AuroraA));
+		var donate = Pill(Text(L.T("☕ Donar"), 18, FontWeight.SemiBold, Palette.AuroraA));
 		donate.BorderBrush       = Palette.Aurora();
 		donate.Cursor            = new Cursor(StandardCursorType.Hand);
 		donate.VerticalAlignment = VerticalAlignment.Center;
@@ -370,7 +377,7 @@ public sealed class MainWindow : Window
 		Grid.SetColumn(_settingsScroll, 2);
 		settingsBody.Children.Add(categoriesBox);
 		settingsBody.Children.Add(_settingsScroll);
-		var settingsPanel = Sheet("Ajustes", "▲ ▼ elegir     A entrar / cambiar     ◂ valor anterior     B volver", settingsBody, () => ShowTab(0), "B  Volver");
+		var settingsPanel = Sheet(L.T("Ajustes"), L.T("▲ ▼ elegir     A entrar / cambiar     ◂ valor anterior     B volver"), settingsBody, () => ShowTab(0), L.T("B  Volver"));
 		settingsPanel.Width  = 1320;
 		settingsPanel.Height = 790;
 		Place(_settingsPage, settingsPanel, (1920 - 1320) / 2.0, 186);
@@ -382,7 +389,7 @@ public sealed class MainWindow : Window
 		trophyContent.Children.Add(_trophySummary);
 		_trophyScroll.Content = _trophyGames;
 		trophyContent.Children.Add(_trophyScroll);
-		var trophyPanel = _trophyPanel = Sheet("Trofeos", "▲ ▼ elegir     A ver trofeos     B volver", trophyContent, () => ShowTab(0), "B  Volver");
+		var trophyPanel = _trophyPanel = Sheet(L.T("Trofeos"), L.T("▲ ▼ elegir     A ver trofeos     B volver"), trophyContent, () => ShowTab(0), L.T("B  Volver"));
 		trophyPanel.Width  = 1320;
 		trophyPanel.Height = 790;
 		Place(_trophiesPage, trophyPanel, (1920 - 1320) / 2.0, 186);
@@ -390,84 +397,92 @@ public sealed class MainWindow : Window
 
 		var hints = new DockPanel { Width = 1920 - 144, LastChildFill = false };
 		var left = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 34 };
-		left.Children.Add(Clickable(Hint("A", "Aceptar"), () => OnInput(PadInput.Accept)));
-		left.Children.Add(Clickable(Hint("Y", "Ajustes"), () => OnInput(PadInput.Options)));
-		left.Children.Add(Clickable(Hint("LB RB", "Pestañas"), () => OnInput(PadInput.NextTab)));
-		var right = Clickable(Hint("B", "Atrás"), () => OnInput(PadInput.Back));
+		left.Children.Add(Clickable(Hint("A", L.T("Aceptar")), () => OnInput(PadInput.Accept)));
+		left.Children.Add(Clickable(Hint("Y", L.T("Ajustes")), () => OnInput(PadInput.Options)));
+		left.Children.Add(Clickable(Hint("LB RB", L.T("Pestañas")), () => OnInput(PadInput.NextTab)));
+		var right = Clickable(Hint("B", L.T("Atrás")), () => OnInput(PadInput.Back));
 		DockPanel.SetDock(left, Dock.Left);
 		DockPanel.SetDock(right, Dock.Right);
 		hints.Children.Add(left);
 		hints.Children.Add(right);
 		Place(stage, hints, 72, 1080 - 78);
 
+		// Toasts and dialogs on their own layer, above the PS5 pages and NovaS's home alike.
+		var overlay = new Canvas { Width = 1920, Height = 1080 };
 		var toastDock = new Panel { Width = 1920 };
 		_toastBox.HorizontalAlignment = HorizontalAlignment.Center;
 		toastDock.Children.Add(_toastBox);
-		Place(stage, toastDock, 0, 1080 - 170);
+		Place(overlay, toastDock, 0, 1080 - 170);
+		Place(overlay, _prompt, 0, 0);
+		Place(overlay, _gameSheet, 0, 0);
+		Place(overlay, _trophySheet, 0, 0);
+		Place(overlay, _keysSheet, 0, 0);
+		Place(overlay, _choiceSheet, 0, 0);
+		Place(overlay, _textSheet, 0, 0);
+		Place(overlay, _notes, 0, 0);
 
-		Place(stage, _prompt, 0, 0);
-		Place(stage, _gameSheet, 0, 0);
-		Place(stage, _trophySheet, 0, 0);
-		Place(stage, _keysSheet, 0, 0);
-		Place(stage, _choiceSheet, 0, 0);
-		Place(stage, _textSheet, 0, 0);
-		Place(stage, _notes, 0, 0);
-
-		var root = new Grid { Background = Palette.Brush(Palette.Night) };
-		root.Children.Add(_backA);
-		root.Children.Add(_backB);
-		root.Children.Add(new Rectangle { Fill = Palette.Fade(Palette.P(0, 0), Palette.P(1, 0), (0, 0.92), (0.38, 0.55), (0.70, 0)) });
-		root.Children.Add(new Rectangle { Fill = Palette.Fade(Palette.P(0, 1), Palette.P(0, 0), (0, 0.95), (0.45, 0)) });
-		root.Children.Add(new Rectangle { Fill = Palette.Fade(Palette.P(0, 0), Palette.P(0, 1), (0, 0.7), (0.18, 0)) });
-		root.Children.Add(new Viewbox { Stretch = Stretch.Uniform, Child = stage });
+		// The PS5 side (backgrounds and pages) hides while NovaS's console is the window, so the window can be see-through
+		// around it; NovaS on its own never shows it.
+		_ps5Back.Background = Palette.Brush(Palette.Night);
+		_ps5Back.Children.Add(_backA);
+		_ps5Back.Children.Add(_backB);
+		_ps5Back.Children.Add(new Rectangle { Fill = Palette.Fade(Palette.P(0, 0), Palette.P(1, 0), (0, 0.92), (0.38, 0.55), (0.70, 0)) });
+		_ps5Back.Children.Add(new Rectangle { Fill = Palette.Fade(Palette.P(0, 1), Palette.P(0, 0), (0, 0.95), (0.45, 0)) });
+		_ps5Back.Children.Add(new Rectangle { Fill = Palette.Fade(Palette.P(0, 0), Palette.P(0, 1), (0, 0.7), (0.18, 0)) });
+		_ps5Stage.Child = stage;
+		_ps5Back.IsVisible = _ps5Stage.IsVisible = !Edition.NovaSOnly;
+		var root = new Grid();
+		root.Children.Add(_ps5Back);
+		root.Children.Add(_ps5Stage);
 		root.Children.Add(_novas);
-		root.Children.Add(_chrome = BuildChrome());
+		root.Children.Add(new Viewbox { Stretch = Stretch.Uniform, Child = overlay });
 		return root;
 	}
 
-	// Window bar that slides in when the pointer reaches the top edge or Escape is pressed.
-	private Border BuildChrome()
-	{
-		var bar = new DockPanel { LastChildFill = false, Margin = new Thickness(20, 0) };
-		var brand = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };
-		brand.Children.Add(Logo(26));
-		brand.Children.Add(Text(Edition.Name, 18, FontWeight.SemiBold));
-		DockPanel.SetDock(brand, Dock.Left);
-		bar.Children.Add(brand);
-		var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
-		buttons.Children.Add(ChromeButton(Text("Minimizar", 20, FontWeight.Normal), Palette.Brush(Colors.White, 0.12), () => WindowState = WindowState.Minimized));
-		buttons.Children.Add(ChromeButton(_fullscreenLabel, Palette.Brush(Colors.White, 0.12),
-		    () => WindowState = WindowState == WindowState.FullScreen ? _windowedState : WindowState.FullScreen));
-		buttons.Children.Add(ChromeButton(Text($"Cerrar {Edition.Name}", 20, FontWeight.SemiBold), Palette.Brush(Color.Parse("#E5484D"), 0.9), Close));
-		DockPanel.SetDock(buttons, Dock.Right);
-		bar.Children.Add(buttons);
-		return new Border
-		{
-			Height = 60, VerticalAlignment = VerticalAlignment.Top, Opacity = 0, IsHitTestVisible = false, Child = bar,
-			Background = Palette.Brush(Palette.Ink, 0.96), BorderBrush = Palette.Brush(Colors.White, 0.1), BorderThickness = new Thickness(0, 0, 0, 1),
-			Transitions = new Transitions { new DoubleTransition { Property = OpacityProperty, Duration = TimeSpan.FromMilliseconds(160) } },
-		};
-	}
+	private readonly Grid    _ps5Back  = new();
+	private readonly Viewbox _ps5Stage = new() { Stretch = Stretch.Uniform };
+	private bool _consoleWindow;
+	private (PixelPoint Position, double Width, double Height)? _nova5Bounds;
 
-	private static Border ChromeButton(TextBlock label, IBrush hover, Action click)
+	// While NovaS is shown in a normal window (NovaS on its own, or Nova5's NovaS side), the window turns into the
+	// console: no frame, see-through around it, NovaS's own bar to minimize, enlarge and close. Full screen shows just the
+	// screen. Back on the PS5 side, Nova5 gets its frame, look, size and place back.
+	private void UpdateNovaSWindow()
 	{
-		var button = new Border
+		if (SnapshotPath is not null || WindowState == WindowState.Minimized) return;
+		var console = _tab == NovaSTab && WindowState == WindowState.Normal;
+		var scale = RenderScaling;
+		if (console && !_consoleWindow)
 		{
-			Child = label, Padding = new Thickness(18, 8), CornerRadius = new CornerRadius(10),
-			Background = Brushes.Transparent, Cursor = new Cursor(StandardCursorType.Hand),
-		};
-		button.PointerEntered += (_, _) => button.Background = hover;
-		button.PointerExited  += (_, _) => button.Background = Brushes.Transparent;
-		button.PointerPressed += (_, _) => click();
-		return button;
-	}
-
-	private void ShowChrome(bool show, bool pin = false)
-	{
-		_chromePinned = show && pin;
-		if ((_chrome.Opacity > 0) == show) return;
-		_chrome.Opacity          = show ? 1 : 0;
-		_chrome.IsHitTestVisible = show;
+			if (!Edition.NovaSOnly && _nova5Bounds is null) _nova5Bounds = (Position, Width, Height);
+			var center = new Point(Position.X + Width * scale / 2, Position.Y + Height * scale / 2);
+			SystemDecorations     = WindowDecorations.None;
+			TransparencyLevelHint = new[] { WindowTransparencyLevel.Transparent };
+			Background            = Brushes.Transparent;
+			Height   = Width / NovaSHome.ConsoleAspect;
+			Position = new PixelPoint((int)(center.X - Width * scale / 2), (int)(center.Y - Height * scale / 2));
+		}
+		else if (!console && _consoleWindow)
+		{
+			SystemDecorations     = WindowDecorations.Full;
+			TransparencyLevelHint = new[] { WindowTransparencyLevel.None };
+			Background            = Palette.Brush(Palette.Night);
+		}
+		if (!console && _tab != NovaSTab && WindowState == WindowState.Normal && _nova5Bounds is { } bounds)
+		{
+			Width = bounds.Width;
+			Height = bounds.Height;
+			Position = bounds.Position;
+			_nova5Bounds = null;
+		}
+		if (console != _consoleWindow && !Edition.NovaSOnly)
+		{
+			Icon  = EditionIcon(console);
+			Title = console ? "NovaS" : "Nova5";
+		}
+		_consoleWindow = console;
+		_ps5Back.IsVisible = _ps5Stage.IsVisible = !Edition.NovaSOnly && !console;
+		_novas.Look = console ? NovaSHome.NovaSLook.Console : NovaSHome.NovaSLook.Screen;
 	}
 
 	private static Control Clickable(Control control, Action click)
@@ -480,10 +495,10 @@ public sealed class MainWindow : Window
 	private Border BuildPrompt()
 	{
 		var text = new StackPanel { Spacing = 26, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-		text.Children.Add(Text("¿Salir de Nova5?", 44, FontWeight.Bold));
+		text.Children.Add(Text(L.T("¿Salir de Nova5?"), 44, FontWeight.Bold));
 		var keys = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 34, HorizontalAlignment = HorizontalAlignment.Center };
-		keys.Children.Add(Clickable(Hint("A", "Salir"), Close));
-		keys.Children.Add(Clickable(Hint("B", "Volver"), () => ShowPrompt(false)));
+		keys.Children.Add(Clickable(Hint("A", L.T("Salir")), Close));
+		keys.Children.Add(Clickable(Hint("B", L.T("Volver")), () => ShowPrompt(false)));
 		text.Children.Add(keys);
 		return new Border
 		{
@@ -539,7 +554,7 @@ public sealed class MainWindow : Window
 		DockPanel.SetDock(_notesTitle, Dock.Top);
 		content.Children.Add(_notesTitle);
 		content.Children.Add(_notesScroll);
-		var sheet = Sheet("", "▲ ▼ desplazar     A o B cerrar     Vuelve a verlas en Ajustes › Información de la versión", content, CloseNotes, "B  Cerrar");
+		var sheet = Sheet("", L.T("▲ ▼ desplazar     A o B cerrar     Vuelve a verlas en Ajustes › Información de la versión"), content, CloseNotes, L.T("B  Cerrar"));
 		sheet.Width  = 1180;
 		sheet.Height = 820;
 		sheet.HorizontalAlignment = HorizontalAlignment.Center;
@@ -556,13 +571,13 @@ public sealed class MainWindow : Window
 	private void ShowNotes(List<ReleaseNote> notes, bool firstTime)
 	{
 		if (notes.Count == 0) return;
-		_notesTitle.Text = firstTime ? $"Novedades de Nova5 {Updates.Current}" : "Información de la versión";
+		_notesTitle.Text = firstTime ? L.F("Novedades de Nova5 {0}", Updates.Current) : L.T("Información de la versión");
 		_notesList.Children.Clear();
 		foreach (var note in notes)
 		{
 			var block = new StackPanel { Spacing = 10 };
-			var date  = DateTime.TryParse(note.Date, out var day) ? " · " + day.ToString("d 'de' MMMM 'de' yyyy", new System.Globalization.CultureInfo("es-ES")) : "";
-			block.Children.Add(Text($"VERSIÓN {note.Version}{date}", 18, FontWeight.SemiBold, Palette.AuroraA));
+			var date  = DateTime.TryParse(note.Date, out var day) ? " · " + day.ToString(L.T("d 'de' MMMM 'de' yyyy"), new System.Globalization.CultureInfo(L.T("es-ES"))) : "";
+			block.Children.Add(Text(L.F("VERSIÓN {0}{1}", note.Version, date), 18, FontWeight.SemiBold, Palette.AuroraA));
 			block.Children.Add(new TextBlock { Text = note.Title, FontSize = 30, FontWeight = FontWeight.Bold, Foreground = Palette.Brush(Palette.Text), TextWrapping = TextWrapping.Wrap });
 			foreach (var item in note.Items)
 			{
@@ -609,7 +624,7 @@ public sealed class MainWindow : Window
 	private Border BuildKeys()
 	{
 		_keysScroll.Content = _keysList;
-		var sheet = Sheet("Teclado y ratón", "▲ ▼ elegir     A asignar (pulsa una tecla o un botón del ratón)     Supr quitar     B cerrar", _keysScroll, CloseKeys, "B  Cerrar");
+		var sheet = Sheet(L.T("Teclado y ratón"), L.T("▲ ▼ elegir     A asignar (pulsa una tecla o un botón del ratón)     Supr quitar     B cerrar"), _keysScroll, CloseKeys, L.T("B  Cerrar"));
 		sheet.Width  = 1320;
 		sheet.Height = 860;
 		sheet.HorizontalAlignment = HorizontalAlignment.Center;
@@ -653,19 +668,19 @@ public sealed class MainWindow : Window
 
 	private List<Setting> KeyOptions()
 	{
-		var list = Keymap.Controls.Select(c => new Setting(c.Label, "", () => _capturing == c.Name ? "Pulsa una tecla…" : Keymap.Show(_keymap.GetValueOrDefault(c.Name, "")),
+		var list = Keymap.Controls.Select(c => new Setting(c.Label, "", () => _capturing == c.Name ? L.T("Pulsa una tecla…") : Keymap.Show(_keymap.GetValueOrDefault(c.Name, "")),
 		    _ => { _capturing = c.Name; })).ToList();
-		list.Add(new("Sensibilidad del ratón", "Para mover la cámara con el ratón: F7 lo activa dentro del juego.",
+		list.Add(new(L.T("Sensibilidad del ratón"), L.T("Para mover la cámara con el ratón: F7 lo activa dentro del juego."),
 		    () => $"{Sensitivity():0.##}×", step =>
 		    {
 			    var now = Array.IndexOf(Sensitivities, Sensitivity());
 			    SetIni("mouse_sensitivity", Sensitivities[(Math.Max(now, 2) + step + Sensitivities.Length) % Sensitivities.Length].ToString(System.Globalization.CultureInfo.InvariantCulture));
 		    }));
-		list.Add(new("Restablecer", "Vuelve a las teclas de Nova5 para todos los botones.", () => "Restablecer ›", _ =>
+		list.Add(new(L.T("Restablecer"), L.T("Vuelve a las teclas de Nova5 para todos los botones."), () => L.T("Restablecer ›"), _ =>
 		{
 			_keymap = new Dictionary<string, string>(Keymap.Defaults);
 			SetIni("keymap", "");
-			ShowToast("Teclas restablecidas");
+			ShowToast(L.T("Teclas restablecidas"));
 		}));
 		return list;
 	}
@@ -736,7 +751,7 @@ public sealed class MainWindow : Window
 		var content = new StackPanel { Spacing = 22 };
 		content.Children.Add(_textTitle);
 		content.Children.Add(_textBox);
-		var sheet = Sheet("", "Enter o A guardar     Esc o B cancelar", content, () => CloseText(false), "B  Cancelar");
+		var sheet = Sheet("", L.T("Enter o A guardar     Esc o B cancelar"), content, () => CloseText(false), L.T("B  Cancelar"));
 		sheet.Width = 1000;
 		sheet.HorizontalAlignment = HorizontalAlignment.Center;
 		sheet.VerticalAlignment   = VerticalAlignment.Center;
@@ -784,7 +799,7 @@ public sealed class MainWindow : Window
 		row.Children.Add(Cup(TrophyGrade.Platinum, 40));
 		row.Children.Add(Text($"{set.Percent} %", 34, FontWeight.Bold));
 		var summary = new StackPanel { Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
-		summary.Children.Add(Text($"{set.Earned} de {set.Trophies.Count} trofeos", 20, FontWeight.SemiBold, Palette.Muted));
+		summary.Children.Add(Text(L.F("{0} de {1} trofeos", set.Earned, set.Trophies.Count), 20, FontWeight.SemiBold, Palette.Muted));
 		var bar = new Grid { Width = 220, Height = 6 };
 		bar.Children.Add(new Border { CornerRadius = new CornerRadius(3), Background = Palette.Brush(Colors.White, 0.12) });
 		bar.Children.Add(new Border { CornerRadius = new CornerRadius(3), Background = Palette.Aurora(), HorizontalAlignment = HorizontalAlignment.Left,
@@ -826,7 +841,7 @@ public sealed class MainWindow : Window
 
 	private static string GradeName(TrophyGrade grade) => grade switch
 	{
-		TrophyGrade.Platinum => "Platino", TrophyGrade.Gold => "Oro", TrophyGrade.Silver => "Plata", _ => "Bronce",
+		TrophyGrade.Platinum => L.T("Platino"), TrophyGrade.Gold => L.T("Oro"), TrophyGrade.Silver => L.T("Plata"), _ => L.T("Bronce"),
 	};
 
 	// A trophy cup in the grade's colour, drawn so it needs no emoji or icon font.
@@ -868,13 +883,13 @@ public sealed class MainWindow : Window
 		}
 		var all = _trophySets.SelectMany(s => s.Trophies).ToList();
 		FillCounts(_trophySummary, grade => (all.Count(t => t.Grade == grade && t.Unlocked is not null), all.Count(t => t.Grade == grade)),
-		    $"{all.Count(t => t.Unlocked is not null)} de {all.Count} trofeos en {_trophySets.Count} juego(s)");
+		    L.F("{0} de {1} trofeos en {2} juego(s)", all.Count(t => t.Unlocked is not null), all.Count, _trophySets.Count));
 		_trophyGames.Children.Clear();
 		if (_trophySets.Count == 0)
 		{
 			_trophyGames.Children.Add(new TextBlock
 			{
-				Text = "Ningún juego de tu biblioteca trae lista de trofeos (sce_sys/trophy2).", FontSize = 22,
+				Text = L.T("Ningún juego de tu biblioteca trae lista de trofeos (sce_sys/trophy2)."), FontSize = 22,
 				Foreground = Palette.Brush(Palette.Muted), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(26, 10),
 			});
 			return;
@@ -922,7 +937,7 @@ public sealed class MainWindow : Window
 		});
 		var text = new StackPanel { Spacing = 6, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(24, 0, 0, 0), Width = 760 };
 		text.Children.Add(new TextBlock { Text = set.Title, FontSize = 25, FontWeight = FontWeight.SemiBold, Foreground = Palette.Brush(Palette.Text), TextTrimming = TextTrimming.CharacterEllipsis });
-		text.Children.Add(Text($"{set.Earned} de {set.Trophies.Count} conseguidos" + (set.LastUnlock is { } last && last > DateTime.MinValue ? $" · último el {last:d MMM yyyy}" : ""), 18, FontWeight.Normal, Palette.Muted));
+		text.Children.Add(Text(L.F("{0} de {1} conseguidos", set.Earned, set.Trophies.Count) + (set.LastUnlock is { } last && last > DateTime.MinValue ? L.F(" · último el {0:d MMM yyyy}", last) : ""), 18, FontWeight.Normal, Palette.Muted));
 		text.Children.Add(counts);
 		text.Children.Add(bar);
 		var percent = new Border
@@ -982,7 +997,7 @@ public sealed class MainWindow : Window
 		content.Children.Add(_trophyListTitle);
 		content.Children.Add(_trophyListSummary);
 		content.Children.Add(_trophyListScroll);
-		var sheet = Sheet("", "▲ ▼ desplazar     A o B cerrar", content, CloseTrophyList, "B  Cerrar");
+		var sheet = Sheet("", L.T("▲ ▼ desplazar     A o B cerrar"), content, CloseTrophyList, L.T("B  Cerrar"));
 		sheet.Width  = 1320;
 		sheet.Height = 860;
 		sheet.HorizontalAlignment = HorizontalAlignment.Center;
@@ -996,7 +1011,7 @@ public sealed class MainWindow : Window
 	private void ShowTrophyList(TrophySet set)
 	{
 		_trophyListTitle.Text = set.Title;
-		FillCounts(_trophyListSummary, set.Count, $"{set.Earned} de {set.Trophies.Count} · {set.Percent} %");
+		FillCounts(_trophyListSummary, set.Count, L.F("{0} de {1} · {2} %", set.Earned, set.Trophies.Count, set.Percent));
 		_trophyList.Children.Clear();
 		foreach (var trophy in set.Trophies.OrderBy(t => t.Unlocked is null).ThenBy(t => t.Grade).ThenBy(t => t.Id))
 		{
@@ -1015,8 +1030,8 @@ public sealed class MainWindow : Window
 			}
 			if (icon.Child is null) icon.Child = new Panel { Children = { new Viewbox { Margin = new Thickness(18), Child = Cup(trophy.Grade, 40) } } };
 			var text = new StackPanel { Spacing = 3, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(22, 0, 0, 0) };
-			text.Children.Add(new TextBlock { Text = secret ? "Trofeo oculto" : trophy.Name, FontSize = 24, FontWeight = FontWeight.SemiBold, Foreground = Palette.Brush(Palette.Text, earned ? 1 : 0.75), TextWrapping = TextWrapping.Wrap });
-			text.Children.Add(new TextBlock { Text = secret ? "Sigue jugando para descubrirlo." : trophy.Description, FontSize = 18, Foreground = Palette.Brush(Palette.Muted), TextWrapping = TextWrapping.Wrap });
+			text.Children.Add(new TextBlock { Text = secret ? L.T("Trofeo oculto") : trophy.Name, FontSize = 24, FontWeight = FontWeight.SemiBold, Foreground = Palette.Brush(Palette.Text, earned ? 1 : 0.75), TextWrapping = TextWrapping.Wrap });
+			text.Children.Add(new TextBlock { Text = secret ? L.T("Sigue jugando para descubrirlo.") : trophy.Description, FontSize = 18, Foreground = Palette.Brush(Palette.Muted), TextWrapping = TextWrapping.Wrap });
 			var state = new StackPanel { Spacing = 4, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(24, 0, 10, 0) };
 			var grade = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Right };
 			grade.Children.Add(Cup(trophy.Grade, 24));
@@ -1024,7 +1039,7 @@ public sealed class MainWindow : Window
 			state.Children.Add(grade);
 			state.Children.Add(new TextBlock
 			{
-				Text = !earned ? "Bloqueado" : trophy.Unlocked > DateTime.MinValue ? $"Conseguido el {trophy.Unlocked:d MMM yyyy}" : "Conseguido",
+				Text = !earned ? L.T("Bloqueado") : trophy.Unlocked > DateTime.MinValue ? L.F("Conseguido el {0:d MMM yyyy}", trophy.Unlocked) : L.T("Conseguido"),
 				FontSize = 17, Foreground = Palette.Brush(earned ? Palette.AuroraA : Palette.Muted), HorizontalAlignment = HorizontalAlignment.Right,
 			});
 			var row = new DockPanel();
@@ -1074,7 +1089,7 @@ public sealed class MainWindow : Window
 		DockPanel.SetDock(_gameTitle, Dock.Top);
 		content.Children.Add(_gameTitle);
 		content.Children.Add(_gameScroll);
-		var sheet = Sheet("", "▲ ▼ elegir     A ▸ cambiar     ◂ valor anterior     B cerrar", content, CloseGameOptions, "B  Cerrar");
+		var sheet = Sheet("", L.T("▲ ▼ elegir     A ▸ cambiar     ◂ valor anterior     B cerrar"), content, CloseGameOptions, L.T("B  Cerrar"));
 		sheet.Width  = 1320;
 		sheet.Height = 860;
 		sheet.HorizontalAlignment = HorizontalAlignment.Center;
@@ -1112,16 +1127,16 @@ public sealed class MainWindow : Window
 
 	private static string ModeLabel(string mode) => mode switch
 	{
-		"calidad" => "Calidad", "equilibrado" => "Equilibrado", "rendimiento" => "Rendimiento", _ => "Personalizado",
+		"calidad" => L.T("Calidad"), "equilibrado" => L.T("Equilibrado"), "rendimiento" => L.T("Rendimiento"), _ => L.T("Personalizado"),
 	};
 
 	private List<Setting> GameOptions()
 	{
 		var game = _optionsGame!;
-		var list = new List<Setting> { Section("Parches") };
+		var list = new List<Setting> { Section(L.T("Parches")) };
 		if (_patches is { HasModes: true } patches)
 		{
-			list.Add(new("Modo", "Calidad: mejor imagen. Rendimiento: más FPS quitando efectos. Equilibrado: entre los dos. Personalizado: lo que elijas abajo.",
+			list.Add(new(L.T("Modo"), L.T("Calidad: mejor imagen. Rendimiento: más FPS quitando efectos. Equilibrado: entre los dos. Personalizado: lo que elijas abajo."),
 			    () => ModeLabel(patches.Mode), step =>
 			    {
 				    var modes = GamePatches.ModeNames;
@@ -1134,78 +1149,78 @@ public sealed class MainWindow : Window
 			foreach (var patch in file.Mods)
 			{
 				var index = patch.Index;
-				list.Add(new(patch.Label, patch.Detail, () => file.Mods[index].Enabled ? "Sí" : "No",
+				list.Add(new(patch.Label, patch.Detail, () => file.Mods[index].Enabled ? L.T("Sí") : "No",
 				    _ => file.Set(index, !file.Mods[index].Enabled)));
 			}
 		}
 		else
 		{
-			list.Add(new("Sin parches", $"No hay parches para la versión {game.Version} de este juego. Puedes buscar los de la comunidad.", () => "", _ => { }));
+			list.Add(new(L.T("Sin parches"), L.F("No hay parches para la versión {0} de este juego. Puedes buscar los de la comunidad.", game.Version), () => "", _ => { }));
 		}
-		list.Add(new("Buscar parches de la comunidad",
-		    $"Descarga los parches publicados para la versión {game.Version} (colección HEN-Cheats-Collection en GitHub). Llegan desactivados.",
-		    () => _downloadingPatches ? "Buscando…" : "Buscar ›", _ => DownloadPatches(game)));
+		list.Add(new(L.T("Buscar parches de la comunidad"),
+		    L.F("Descarga los parches publicados para la versión {0} (colección HEN-Cheats-Collection en GitHub). Llegan desactivados.", game.Version),
+		    () => _downloadingPatches ? L.T("Buscando…") : L.T("Buscar ›"), _ => DownloadPatches(game)));
 		// This game's own settings ([<title id>] in Nova5.ini), in the general settings' sections; "General" follows those.
 		var id = game.TitleId;
-		list.Add(Section("Gráficos"));
-		list.Add(GameCycle(id, "Resolución", "Resolución a la que se dibuja este juego.", "screen_resolution", "R1920X1080",
+		list.Add(Section(L.T("Gráficos")));
+		list.Add(GameCycle(id, L.T("Resolución"), L.T("Resolución a la que se dibuja este juego."), "screen_resolution", "R1920X1080",
 		    Resolutions.Select(r => (r, r.TrimStart('R').Replace('X', '×'))).ToArray()));
 		// Games with dynamic resolution (Astro Bot) pick it from the GPU time they measure; a smaller time lets them draw more.
-		list.Add(GameCycle(id, "Resolución dinámica", "Para juegos que bajan su resolución solos, como Astro Bot: más nítido dibuja más píxeles y puede bajar algo los FPS.",
-		    "gpu_time_scale", "100", ("100", "Normal"), ("75", "Más nítida"), ("50", "Mucho más nítida"), ("33", "Máxima")));
-		list.Add(GameCycle(id, "Frecuencia de pantalla", "120 o 144 Hz si este juego tiene modo de 120 Hz; 60 Hz si va acelerado.", "vblank_frequency", "60",
+		list.Add(GameCycle(id, L.T("Resolución dinámica"), L.T("Para juegos que bajan su resolución solos, como Astro Bot: más nítido dibuja más píxeles y puede bajar algo los FPS."),
+		    "gpu_time_scale", "100", ("100", "Normal"), ("75", L.T("Más nítida")), ("50", L.T("Mucho más nítida")), ("33", L.T("Máxima"))));
+		list.Add(GameCycle(id, L.T("Frecuencia de pantalla"), L.T("120 o 144 Hz si este juego tiene modo de 120 Hz; 60 Hz si va acelerado."), "vblank_frequency", "60",
 		    RefreshRates.Select(hz => (hz.ToString(), $"{hz} Hz")).ToArray()));
-		list.Add(GameCycle(id, "Sincronización (VSync)", "Mailbox: fluido. VSync: sin cortes, algo más de retraso. Sin límite: el menor retraso.", "present_mode", "Mailbox",
-		    ("Mailbox", "Mailbox"), ("Fifo", "VSync"), ("Immediate", "Sin límite")));
-		list.Add(GameToggle(id, "HDR", "Imagen HDR si tu monitor y el juego lo admiten.", "hdr_enabled", false));
-		list.Add(GameToggle(id, "Pantalla completa", "Este juego se abre a pantalla completa o en una ventana.", "fullscreen_enabled", true));
-		list.Add(GameToggle(id, "Contador de FPS", "Muestra los FPS mientras juegas a este juego.", "perf_overlay_enabled", false));
-		list.Add(GameToggle(id, "Ocultar el cursor", "Oculta el puntero del ratón dentro de este juego.", "hide_cursor_enabled", false));
-		list.Add(Section("Mando"));
-		list.Add(GameCycle(id, "Vibración del mando", "Intensidad de la vibración en este juego (0 % la apaga).", "controller_vibration_intensity", "100",
-		    ("100", "100 %"), ("75", "75 %"), ("50", "50 %"), ("25", "25 %"), ("0", "Apagada")));
-		list.Add(GameCycle(id, "Altavoz del mando", "Volumen del altavoz del DualSense en este juego.", "controller_speaker_volume", "50",
-		    ("100", "100 %"), ("75", "75 %"), ("50", "50 %"), ("25", "25 %"), ("0", "Apagado")));
-		list.Add(GameCycle(id, "Color de la barra de luz", "Color de la luz del DualSense en este juego. Automático: el que pida el juego.", "controller_color", "",
-		    ("", "Automático"), ("#0050FF", "Azul"), ("#5EEAD4", "Aurora"), ("#8B5CF6", "Morado"), ("#FF2D55", "Rojo"), ("#30D158", "Verde"), ("#FFFFFF", "Blanco")));
-		list.Add(Section("Sistema"));
-		list.Add(GameCycle(id, "Idioma de la consola", "El idioma de textos y voces de este juego, si lo tiene.", "console_language", "1", ConsoleLanguages));
-		list.Add(GameToggle(id, "Saltar avisos de inicio", "Pide al juego que se salte los avisos del principio, si lo permite.", "skip_notice_screen", false));
-		list.Add(Section("Rendimiento"));
-		list.Add(GameToggle(id, "Caché de shaders", "Guarda los shaders de este juego para que cargue más rápido.", "shader_cache_enabled", true));
-		list.Add(GameToggle(id, "Compatibilidad de CPU", "Solo si este juego se cierra al arrancar en tu procesador.", "amd_cpu_enabled", false));
+		list.Add(GameCycle(id, L.T("Sincronización (VSync)"), L.T("Mailbox: fluido. VSync: sin cortes, algo más de retraso. Sin límite: el menor retraso."), "present_mode", "Mailbox",
+		    ("Mailbox", "Mailbox"), ("Fifo", "VSync"), ("Immediate", L.T("Sin límite"))));
+		list.Add(GameToggle(id, "HDR", L.T("Imagen HDR si tu monitor y el juego lo admiten."), "hdr_enabled", false));
+		list.Add(GameToggle(id, L.T("Pantalla completa"), L.T("Este juego se abre a pantalla completa o en una ventana."), "fullscreen_enabled", true));
+		list.Add(GameToggle(id, L.T("Contador de FPS"), L.T("Muestra los FPS mientras juegas a este juego."), "perf_overlay_enabled", false));
+		list.Add(GameToggle(id, L.T("Ocultar el cursor"), L.T("Oculta el puntero del ratón dentro de este juego."), "hide_cursor_enabled", false));
+		list.Add(Section(L.T("Mando")));
+		list.Add(GameCycle(id, L.T("Vibración del mando"), L.T("Intensidad de la vibración en este juego (0 % la apaga)."), "controller_vibration_intensity", "100",
+		    ("100", "100 %"), ("75", "75 %"), ("50", "50 %"), ("25", "25 %"), ("0", L.T("Apagada"))));
+		list.Add(GameCycle(id, L.T("Altavoz del mando"), L.T("Volumen del altavoz del DualSense en este juego."), "controller_speaker_volume", "50",
+		    ("100", "100 %"), ("75", "75 %"), ("50", "50 %"), ("25", "25 %"), ("0", L.T("Apagado"))));
+		list.Add(GameCycle(id, L.T("Color de la barra de luz"), L.T("Color de la luz del DualSense en este juego. Automático: el que pida el juego."), "controller_color", "",
+		    ("", L.T("Automático")), ("#0050FF", L.T("Azul")), ("#5EEAD4", "Aurora"), ("#8B5CF6", L.T("Morado")), ("#FF2D55", L.T("Rojo")), ("#30D158", L.T("Verde")), ("#FFFFFF", L.T("Blanco"))));
+		list.Add(Section(L.T("Sistema")));
+		list.Add(GameCycle(id, L.T("Idioma de la consola"), L.T("El idioma de textos y voces de este juego, si lo tiene."), "console_language", "1", ConsoleLanguages));
+		list.Add(GameToggle(id, L.T("Saltar avisos de inicio"), L.T("Pide al juego que se salte los avisos del principio, si lo permite."), "skip_notice_screen", false));
+		list.Add(Section(L.T("Rendimiento")));
+		list.Add(GameToggle(id, L.T("Caché de shaders"), L.T("Guarda los shaders de este juego para que cargue más rápido."), "shader_cache_enabled", true));
+		list.Add(GameToggle(id, L.T("Compatibilidad de CPU"), L.T("Solo si este juego se cierra al arrancar en tu procesador."), "amd_cpu_enabled", false));
 		// Options that only apply to this game.
 		if (game.TitleId == "PPSA01341")
 		{
 			list.AddRange(new[]
 			{
-			DemonsSoulsToggle("Espera de los hilos de trabajo", "Los hilos de trabajo del juego esperan sin gastar procesador. Experimental.", "ds_idle_enabled"),
-			DemonsSoulsToggle("Pausa en bucles de espera", "Menos uso del procesador mientras el juego espera. Experimental.", "ds_spin_backoff_enabled"),
-			DemonsSoulsToggle("Sin descarte de índices", "Omite un paso de descarte de geometría que el emulador no necesita. Experimental.", "ds_disable_index_culling"),
-			DemonsSoulsToggle("Núcleos de rendimiento", "Coloca los hilos de dibujo en los núcleos rápidos del procesador. Experimental.", "ds_affinity_enabled"),
-			DemonsSoulsToggle("Prioridad de dibujo", "Da más prioridad al hilo de dibujo. Experimental.", "ds_render_priority_enabled"),
+			DemonsSoulsToggle(L.T("Espera de los hilos de trabajo"), L.T("Los hilos de trabajo del juego esperan sin gastar procesador. Experimental."), "ds_idle_enabled"),
+			DemonsSoulsToggle(L.T("Pausa en bucles de espera"), L.T("Menos uso del procesador mientras el juego espera. Experimental."), "ds_spin_backoff_enabled"),
+			DemonsSoulsToggle(L.T("Sin descarte de índices"), L.T("Omite un paso de descarte de geometría que el emulador no necesita. Experimental."), "ds_disable_index_culling"),
+			DemonsSoulsToggle(L.T("Núcleos de rendimiento"), L.T("Coloca los hilos de dibujo en los núcleos rápidos del procesador. Experimental."), "ds_affinity_enabled"),
+			DemonsSoulsToggle(L.T("Prioridad de dibujo"), L.T("Da más prioridad al hilo de dibujo. Experimental."), "ds_render_priority_enabled"),
 			});
 		}
-		list.Add(Section("Archivos del juego"));
+		list.Add(Section(L.T("Archivos del juego")));
 		// Additional content: what the emulator will load (installed DLC packages of this game).
 		var addons = Library.Addons(_emulator.GameDirs().Concat(_store.ExtraDirs), game.TitleId);
 		list.Add(addons.Count == 0
-		    ? new("Contenido adicional (DLC)", "No hay DLC instalado. Copia el .pkg del DLC en tu carpeta de juegos y Nova5 lo instalará solo, como los juegos.", () => "", _ => { })
-		    : new($"Contenido adicional (DLC): {addons.Count}", string.Join(" · ", addons.Select(a => a.Name)), () => "Instalado", _ => { }));
+		    ? new(L.T("Contenido adicional (DLC)"), L.T("No hay DLC instalado. Copia el .pkg del DLC en tu carpeta de juegos y Nova5 lo instalará solo, como los juegos."), () => "", _ => { })
+		    : new(L.F("Contenido adicional (DLC): {0}", addons.Count), string.Join(" · ", addons.Select(a => a.Name)), () => L.T("Instalado"), _ => { }));
 		if (game.Archive is null)
 		{
 			var packed = GameArchive.Packed(game);
 			if (packed is null)
 			{
 				list.Add(new("Comprimir en .zar",
-				    "Guarda el juego en un solo archivo comprimido que ocupa mucho menos (Astro Bot pasa de 148 a 44 GB). Se juega igual, sin descomprimir. La carpeta original no se toca.",
-				    () => _packing == game ? $"Comprimiendo {_packProgress * 100:0} %" : _packing is not null ? "Espera…" : "Comprimir ›", _ => PackGame(game)));
+				    L.T("Guarda el juego en un solo archivo comprimido que ocupa mucho menos (Astro Bot pasa de 148 a 44 GB). Se juega igual, sin descomprimir. La carpeta original no se toca."),
+				    () => _packing == game ? L.F("Comprimiendo {0:0} %", _packProgress * 100) : _packing is not null ? L.T("Espera…") : L.T("Comprimir ›"), _ => PackGame(game)));
 			}
 			else
 			{
-				list.Add(new("Borrar la carpeta original",
-				    $"Ya está comprimido en {System.IO.Path.GetFileName(packed)}: lleva la carpeta a la papelera para liberar espacio. El juego comprimido aparece en la biblioteca.",
-				    () => _confirmDelete == game.Dir ? "¿Seguro? Pulsa otra vez" : "Borrar ›", _ =>
+				list.Add(new(L.T("Borrar la carpeta original"),
+				    L.F("Ya está comprimido en {0}: lleva la carpeta a la papelera para liberar espacio. El juego comprimido aparece en la biblioteca.", System.IO.Path.GetFileName(packed)),
+				    () => _confirmDelete == game.Dir ? L.T("¿Seguro? Pulsa otra vez") : L.T("Borrar ›"), _ =>
 				    {
 					    if (_confirmDelete != game.Dir)
 					    {
@@ -1218,21 +1233,21 @@ public sealed class MainWindow : Window
 						    GameArchive.RecycleFolder(game.Dir);
 						    CloseGameOptions();
 						    Reload();
-						    ShowToast("Carpeta original en la papelera");
+						    ShowToast(L.T("Carpeta original en la papelera"));
 					    }
 					    catch (Exception e) when (e is IOException or UnauthorizedAccessException or OperationCanceledException)
 					    {
-						    ShowToast("No se pudo borrar: " + e.Message);
+						    ShowToast(L.T("No se pudo borrar: ") + e.Message);
 					    }
 				    }));
 			}
 		}
-		list.Add(new("Abrir la carpeta del juego", game.Dir, () => "Abrir ›",
+		list.Add(new(L.T("Abrir la carpeta del juego"), game.Dir, () => L.T("Abrir ›"),
 		    _ => Process.Start(new ProcessStartInfo(game.Dir) { UseShellExecute = true })));
-		list.Add(new("Copiar el ID del título", $"{game.TitleId} · versión {game.Version}", () => "Copiar ›", _ =>
+		list.Add(new(L.T("Copiar el ID del título"), L.F("{0} · versión {1}", game.TitleId, game.Version), () => L.T("Copiar ›"), _ =>
 		{
 			Clipboard?.SetTextAsync(game.TitleId);
-			ShowToast($"{game.TitleId} copiado");
+			ShowToast(L.F("{0} copiado", game.TitleId));
 		}));
 		return list;
 	}
@@ -1283,21 +1298,21 @@ public sealed class MainWindow : Window
 	{
 		if (_packing is not null)
 		{
-			ShowToast($"Ya se está comprimiendo {_packing.Name}");
+			ShowToast(L.F("Ya se está comprimiendo {0}", _packing.Name));
 			return;
 		}
 		if (_running is not null)
 		{
-			ShowToast("Cierra el juego antes de comprimirlo");
+			ShowToast(L.T("Cierra el juego antes de comprimirlo"));
 			return;
 		}
 		_packing      = game;
 		_packProgress = 0;
 		_packCancel   = new CancellationTokenSource();
-		_packText.Text      = $"Comprimiendo {game.Name}: preparando…";
+		_packText.Text      = L.F("Comprimiendo {0}: preparando…", game.Name);
 		_packPill.IsVisible = true;
 		if (_zone == Zone.GameOptions) BuildGameRows();
-		ShowToast($"Comprimiendo {game.Name} en .zar. Puedes seguir usando Nova5; no lo cierres hasta que termine.");
+		ShowToast(L.F("Comprimiendo {0} en .zar. Puedes seguir usando Nova5; no lo cierres hasta que termine.", game.Name));
 		var started = DateTime.UtcNow;
 		var shown   = DateTime.MinValue;
 		var size    = 0L;
@@ -1311,7 +1326,7 @@ public sealed class MainWindow : Window
 				shown = DateTime.UtcNow;
 				var elapsed = DateTime.UtcNow - started;
 				var left    = p > 0.02 ? TimeSpan.FromSeconds(elapsed.TotalSeconds * (1 - p) / p) : (TimeSpan?)null;
-				_packText.Text = $"Comprimiendo {game.Name}: {p * 100:0} %" + (left is { } l ? $" · quedan {Math.Max(1, Math.Round(l.TotalMinutes))} min" : "");
+				_packText.Text = L.F("Comprimiendo {0}: {1:0} %", game.Name, p * 100) + (left is { } l ? L.F(" · quedan {0} min", Math.Max(1, Math.Round(l.TotalMinutes))) : "");
 				if (_zone == Zone.GameOptions && _optionsGame == game) BuildGameRows();
 			});
 			var token   = _packCancel.Token;
@@ -1324,11 +1339,11 @@ public sealed class MainWindow : Window
 		}
 		catch (OperationCanceledException)
 		{
-			ShowToast("Compresión cancelada; el juego sigue como estaba");
+			ShowToast(L.T("Compresión cancelada; el juego sigue como estaba"));
 		}
 		catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
 		{
-			ShowToast("No se pudo comprimir: " + e.Message);
+			ShowToast(L.T("No se pudo comprimir: ") + e.Message);
 		}
 		finally
 		{
@@ -1344,14 +1359,14 @@ public sealed class MainWindow : Window
 	{
 		if (_prepping is not null)
 		{
-			ShowToast($"Ya se están preparando los shaders de {_prepping.Name}");
+			ShowToast(L.F("Ya se están preparando los shaders de {0}", _prepping.Name));
 			return;
 		}
-		ShowChoice("Preparar shaders", $"Nova5 compila ahora los shaders de {game.Name} para que no se trabe al llegar a zonas nuevas. Puedes seguir usando el PC; va con prioridad baja.", new()
+		ShowChoice(L.T("Preparar shaders"), L.F("Nova5 compila ahora los shaders de {0} para que no se trabe al llegar a zonas nuevas. Puedes seguir usando el PC; va con prioridad baja.", game.Name), new()
 		{
-			new("Rápido", "Lo que ya has jugado y lo más usado del juego. Más o menos la mitad del tiempo.", () => "", _ => PrepareShaders(game, quick: true)),
-			new("Completo", "Todos los shaders del juego. Puede tardar horas la primera vez: ideal para dejarlo de noche.", () => "", _ => PrepareShaders(game, quick: false)),
-			new("Ahora no", "", () => "", _ => { }),
+			new(L.T("Rápido"), L.T("Lo que ya has jugado y lo más usado del juego. Más o menos la mitad del tiempo."), () => "", _ => PrepareShaders(game, quick: true)),
+			new(L.T("Completo"), L.T("Todos los shaders del juego. Puede tardar horas la primera vez: ideal para dejarlo de noche."), () => "", _ => PrepareShaders(game, quick: false)),
+			new(L.T("Ahora no"), "", () => "", _ => { }),
 		});
 	}
 
@@ -1362,10 +1377,10 @@ public sealed class MainWindow : Window
 		_prepProgress = 0;
 		_prepReady    = false;
 		_prepCancel   = new CancellationTokenSource();
-		_prepText.Text      = $"Shaders de {game.Name}: empezando…";
+		_prepText.Text      = L.F("Shaders de {0}: empezando…", game.Name);
 		_prepPill.IsVisible = true;
 		if (_zone == Zone.GameOptions) BuildGameRows();
-		ShowToast($"Preparando los shaders de {game.Name}. Puedes seguir usando Nova5; no lo cierres hasta que termine.");
+		ShowToast(L.F("Preparando los shaders de {0}. Puedes seguir usando Nova5; no lo cierres hasta que termine.", game.Name));
 		var started = DateTime.UtcNow;
 		try
 		{
@@ -1375,23 +1390,23 @@ public sealed class MainWindow : Window
 				_prepReady = p.Ready;
 				var elapsed = DateTime.UtcNow - started;
 				var left    = _prepProgress > 0.03 ? TimeSpan.FromSeconds(elapsed.TotalSeconds * (1 - _prepProgress) / _prepProgress) : (TimeSpan?)null;
-				_prepText.Text = $"Shaders de {game.Name}: {_prepProgress * 100:0.0} %" + (_prepReady ? " · ya se puede jugar" : "") +
-				                 (left is { } l ? $" · quedan {(l.TotalHours >= 1 ? $"{l.TotalHours:0.#} h" : $"{Math.Max(1, Math.Round(l.TotalMinutes))} min")}" : "");
+				_prepText.Text = L.F("Shaders de {0}: {1:0.0} %", game.Name, _prepProgress * 100) + (_prepReady ? L.T(" · ya se puede jugar") : "") +
+				                 (left is { } l ? L.F(" · quedan {0}", (l.TotalHours >= 1 ? $"{l.TotalHours:0.#} h" : $"{Math.Max(1, Math.Round(l.TotalMinutes))} min")) : "");
 				if (_zone == Zone.GameOptions && _optionsGame == game) BuildGameRows();
 			});
 			ShowToast(await ShaderPrep.RunAsync(game, quick, progress, _prepCancel.Token)
-			    ? $"Shaders de {game.Name} preparados: ya no debería trabarse al llegar a zonas nuevas"
-			    : $"{game.Name} no tiene shaders que preparar por adelantado: los compila el juego al usarlos");
+			    ? L.F("Shaders de {0} preparados: ya no debería trabarse al llegar a zonas nuevas", game.Name)
+			    : L.F("{0} no tiene shaders que preparar por adelantado: los compila el juego al usarlos", game.Name));
 		}
 		catch (OperationCanceledException)
 		{
-			ShowToast("Preparación de shaders cancelada; lo ya preparado se conserva");
+			ShowToast(L.T("Preparación de shaders cancelada; lo ya preparado se conserva"));
 		}
 		catch (Exception e)
 		{
 			// In a box that stays: the run may have gone on for hours. What the script said is in logs\preparar-shaders-<id>.txt.
-			ShowChoice("No se pudieron preparar los shaders", $"{e.Message}\n\nLo ya preparado se conserva. El detalle está en logs\\preparar-shaders-{game.TitleId}.txt.",
-			    new() { new("Aceptar", "", () => "", _ => { }) });
+			ShowChoice(L.T("No se pudieron preparar los shaders"), L.F("{0}\n\nLo ya preparado se conserva. El detalle está en logs\\preparar-shaders-{1}.txt.", e.Message, game.TitleId),
+			    new() { new(L.T("Aceptar"), "", () => "", _ => { }) });
 		}
 		finally
 		{
@@ -1406,20 +1421,20 @@ public sealed class MainWindow : Window
 	private void AskCancelPrep()
 	{
 		if (_prepping is not { } game || _zone is Zone.Choice or Zone.TextEntry) return;
-		ShowChoice("¿Cancelar la preparación de shaders?", $"Se están preparando los shaders de {game.Name} ({_prepProgress * 100:0.0} %). Lo ya preparado se conserva y la próxima vez sigue desde ahí.", new()
+		ShowChoice(L.T("¿Cancelar la preparación de shaders?"), L.F("Se están preparando los shaders de {0} ({1:0.0} %). Lo ya preparado se conserva y la próxima vez sigue desde ahí.", game.Name, _prepProgress * 100), new()
 		{
-			new("Seguir preparando", "", () => "", _ => { }),
-			new("Cancelar", "", () => "", _ => _prepCancel?.Cancel()),
+			new(L.T("Seguir preparando"), "", () => "", _ => { }),
+			new(L.T("Cancelar"), "", () => "", _ => _prepCancel?.Cancel()),
 		});
 	}
 
 	private void AskCancelPack()
 	{
 		if (_packing is not { } game || _zone is Zone.Choice or Zone.TextEntry) return;
-		ShowChoice("¿Cancelar la compresión?", $"Se está comprimiendo {game.Name} ({_packProgress * 100:0} %). Si cancelas se borra el .zar a medias y el juego queda como estaba.", new()
+		ShowChoice(L.T("¿Cancelar la compresión?"), L.F("Se está comprimiendo {0} ({1:0} %). Si cancelas se borra el .zar a medias y el juego queda como estaba.", game.Name, _packProgress * 100), new()
 		{
-			new("Seguir comprimiendo", "", () => "", _ => { }),
-			new("Cancelar la compresión", "", () => "", _ => _packCancel?.Cancel()),
+			new(L.T("Seguir comprimiendo"), "", () => "", _ => { }),
+			new(L.T("Cancelar la compresión"), "", () => "", _ => _packCancel?.Cancel()),
 		});
 	}
 
@@ -1427,14 +1442,14 @@ public sealed class MainWindow : Window
 	private void AfterPack(Game folder, string archive, long folderSize)
 	{
 		var packedSize = new FileInfo(archive).Length;
-		ShowChoice($"{folder.Name} ya está comprimido",
-		    $"El .zar ocupa {packedSize / 1e9:0.0} GB (la carpeta, {folderSize / 1e9:0.0} GB). ¿Qué hacemos con la carpeta original?", new()
+		ShowChoice(L.F("{0} ya está comprimido", folder.Name),
+		    L.F("El .zar ocupa {0:0.0} GB (la carpeta, {1:0.0} GB). ¿Qué hacemos con la carpeta original?", packedSize / 1e9, folderSize / 1e9), new()
 		{
-			new("Probar primero el .zar", "Abre ahora el juego comprimido. Al cerrarlo te pregunto si funcionó bien antes de borrar nada.",
+			new("Probar primero el .zar", L.T("Abre ahora el juego comprimido. Al cerrarlo te pregunto si funcionó bien antes de borrar nada."),
 			    () => "", _ => TryArchive(folder.Dir, archive)),
-			new("Borrar la carpeta y quedarme con el .zar", $"La carpeta va a la papelera y liberas unos {folderSize / 1e9:0} GB.",
+			new("Borrar la carpeta y quedarme con el .zar", L.F("La carpeta va a la papelera y liberas unos {0:0} GB.", folderSize / 1e9),
 			    () => "", _ => RecycleOriginal(folder.Dir)),
-			new("Decidir más tarde", "Se quedan las dos versiones. Puedes borrar la carpeta luego con clic derecho en el juego.",
+			new(L.T("Decidir más tarde"), L.T("Se quedan las dos versiones. Puedes borrar la carpeta luego con clic derecho en el juego."),
 			    () => "", _ => { }),
 		});
 	}
@@ -1443,7 +1458,7 @@ public sealed class MainWindow : Window
 	{
 		if (_games.FirstOrDefault(g => string.Equals(g.Archive, archive, StringComparison.OrdinalIgnoreCase)) is not { } packed)
 		{
-			ShowToast("No encuentro el juego comprimido en la biblioteca");
+			ShowToast(L.T("No encuentro el juego comprimido en la biblioteca"));
 			return;
 		}
 		_zarTest = (folder, archive);
@@ -1461,7 +1476,7 @@ public sealed class MainWindow : Window
 		}
 		catch (Exception e) when (e is IOException or UnauthorizedAccessException or OperationCanceledException)
 		{
-			ShowToast("No se pudo borrar la carpeta: " + e.Message);
+			ShowToast(L.T("No se pudo borrar la carpeta: ") + e.Message);
 		}
 	}
 
@@ -1473,11 +1488,11 @@ public sealed class MainWindow : Window
 			    Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
 			if (Directory.Exists(GameArchive.Meta(archive))) GameArchive.RecycleFolder(GameArchive.Meta(archive));
 			Reload();
-			ShowToast(".zar en la papelera; te queda la carpeta");
+			ShowToast(L.T(".zar en la papelera; te queda la carpeta"));
 		}
 		catch (Exception e) when (e is IOException or UnauthorizedAccessException or OperationCanceledException)
 		{
-			ShowToast("No se pudo borrar el .zar: " + e.Message);
+			ShowToast(L.T("No se pudo borrar el .zar: ") + e.Message);
 		}
 	}
 
@@ -1486,11 +1501,11 @@ public sealed class MainWindow : Window
 	{
 		if (_zarTest is not { } test || !string.Equals(closed.Archive, test.Archive, StringComparison.OrdinalIgnoreCase)) return;
 		_zarTest = null;
-		ShowChoice("¿Funcionó bien el juego comprimido?", "Si se jugó igual que siempre, puedes borrar la carpeta original y quedarte solo con el .zar.", new()
+		ShowChoice(L.T("¿Funcionó bien el juego comprimido?"), L.T("Si se jugó igual que siempre, puedes borrar la carpeta original y quedarte solo con el .zar."), new()
 		{
-			new("Sí: borrar la carpeta original", "La carpeta va a la papelera; te quedas con el .zar.", () => "", _ => RecycleOriginal(test.Folder)),
-			new("No: borrar el .zar y quedarme con la carpeta", "El .zar va a la papelera; el juego queda como antes.", () => "", _ => RecycleArchive(test.Archive)),
-			new("Decidir más tarde", "Se quedan las dos versiones.", () => "", _ => { }),
+			new(L.T("Sí: borrar la carpeta original"), L.T("La carpeta va a la papelera; te quedas con el .zar."), () => "", _ => RecycleOriginal(test.Folder)),
+			new(L.T("No: borrar el .zar y quedarme con la carpeta"), L.T("El .zar va a la papelera; el juego queda como antes."), () => "", _ => RecycleArchive(test.Archive)),
+			new(L.T("Decidir más tarde"), L.T("Se quedan las dos versiones."), () => "", _ => { }),
 		});
 	}
 
@@ -1505,7 +1520,7 @@ public sealed class MainWindow : Window
 		content.Children.Add(_choiceList);
 		_choiceTitle.TextWrapping = TextWrapping.Wrap;
 		_choiceMessage.Foreground = Palette.Brush(Palette.Muted);
-		var sheet = Sheet("", "▲ ▼ elegir     A aceptar", content, () => PickChoice(_choices.Count - 1), "B  Cerrar");
+		var sheet = Sheet("", L.T("▲ ▼ elegir     A aceptar"), content, () => PickChoice(_choices.Count - 1), L.T("B  Cerrar"));
 		sheet.Width = 1200;
 		sheet.HorizontalAlignment = HorizontalAlignment.Center;
 		sheet.VerticalAlignment   = VerticalAlignment.Center;
@@ -1572,22 +1587,22 @@ public sealed class MainWindow : Window
 			items.Add(item);
 			return item;
 		}
-		Item("Jugar", () => Launch(game));
-		Item("Opciones del juego", () => ShowGameOptions(game));
+		Item(L.T("Jugar"), () => Launch(game));
+		Item(L.T("Opciones del juego"), () => ShowGameOptions(game));
 		if (game.Archive is null)
 		{
-			if (_packing == game) Item($"Comprimiendo… {_packProgress * 100:0} %", () => { }, enabled: false);
-			else if (GameArchive.Packed(game) is { } packed) Item("Borrar la carpeta original (ya está en .zar)", () => ShowChoice("¿Borrar la carpeta original?",
-			    $"{game.Name} ya está comprimido en {System.IO.Path.GetFileName(packed)}. La carpeta va a la papelera.", new()
+			if (_packing == game) Item(L.F("Comprimiendo… {0:0} %", _packProgress * 100), () => { }, enabled: false);
+			else if (GameArchive.Packed(game) is { } packed) Item(L.T("Borrar la carpeta original (ya está en .zar)"), () => ShowChoice(L.T("¿Borrar la carpeta original?"),
+			    L.F("{0} ya está comprimido en {1}. La carpeta va a la papelera.", game.Name, System.IO.Path.GetFileName(packed)), new()
 			    {
-				    new("Sí, borrar la carpeta", "", () => "", _ => RecycleOriginal(game.Dir)),
+				    new(L.T("Sí, borrar la carpeta"), "", () => "", _ => RecycleOriginal(game.Dir)),
 				    new("No", "", () => "", _ => { }),
 			    }));
 			else Item("Comprimir en .zar", () => PackGame(game), enabled: _packing is null);
 		}
 		else
 		{
-			Item("Borrar este .zar", () => ShowChoice("¿Borrar el juego comprimido?", $"{System.IO.Path.GetFileName(game.Archive)} va a la papelera.", new()
+			Item("Borrar este .zar", () => ShowChoice(L.T("¿Borrar el juego comprimido?"), L.F("{0} va a la papelera.", System.IO.Path.GetFileName(game.Archive)), new()
 			{
 				new("Sí, borrar el .zar", "", () => "", _ => RecycleArchive(game.Archive)),
 				new("No", "", () => "", _ => { }),
@@ -1595,11 +1610,11 @@ public sealed class MainWindow : Window
 		}
 		if (ShaderPrep.Available)
 		{
-			if (_prepping == game) Item(_prepReady ? $"Preparando shaders… {_prepProgress * 100:0.0} % (ya se puede jugar)" : $"Preparando shaders… {_prepProgress * 100:0.0} %", AskCancelPrep);
-			else Item("Preparar shaders", () => AskPrep(game), enabled: _prepping is null);
+			if (_prepping == game) Item(_prepReady ? L.F("Preparando shaders… {0:0.0} % (ya se puede jugar)", _prepProgress * 100) : L.F("Preparando shaders… {0:0.0} %", _prepProgress * 100), AskCancelPrep);
+			else Item(L.T("Preparar shaders"), () => AskPrep(game), enabled: _prepping is null);
 		}
-		Item("Abrir la carpeta", () => Process.Start(new ProcessStartInfo(game.Archive is null ? game.Dir : System.IO.Path.GetDirectoryName(game.Archive)!) { UseShellExecute = true }));
-		Item("Copiar el ID del título", () => { Clipboard?.SetTextAsync(game.TitleId); ShowToast($"{game.TitleId} copiado"); });
+		Item(L.T("Abrir la carpeta"), () => Process.Start(new ProcessStartInfo(game.Archive is null ? game.Dir : System.IO.Path.GetDirectoryName(game.Archive)!) { UseShellExecute = true }));
+		Item(L.T("Copiar el ID del título"), () => { Clipboard?.SetTextAsync(game.TitleId); ShowToast(L.F("{0} copiado", game.TitleId)); });
 		var menu = new ContextMenu { ItemsSource = items, FontFamily = Palette.Font };
 		menu.Open(tile);
 	}
@@ -1617,19 +1632,19 @@ public sealed class MainWindow : Window
 			{
 				_downloadingPatches = false;
 				if (found == 0)
-					PatchesBox(game, "No se encontraron parches para este juego",
-					    $"La colección de parches de la comunidad no tiene ninguno para {game.Name} (versión {game.Version}). Puedes volver a buscar más adelante.");
+					PatchesBox(game, L.T("No se encontraron parches para este juego"),
+					    L.F("La colección de parches de la comunidad no tiene ninguno para {0} (versión {1}). Puedes volver a buscar más adelante.", game.Name, game.Version));
 				else
-					PatchesBox(game, "Ya se añadieron todos los parches disponibles",
-					    "Este juego ya tiene todos los parches de la comunidad para su versión. Actívalos o desactívalos en la lista.");
+					PatchesBox(game, L.T("Ya se añadieron todos los parches disponibles"),
+					    L.T("Este juego ya tiene todos los parches de la comunidad para su versión. Actívalos o desactívalos en la lista."));
 				return;
 			}
-			ShowToast(added > 0 ? $"{added} parche(s) nuevo(s): actívalos en la lista"
-			    : found == 0 ? "No se encontraron parches para este juego" : "Ya se añadieron todos los parches disponibles");
+			ShowToast(added > 0 ? L.F("{0} parche(s) nuevo(s): actívalos en la lista", added)
+			    : found == 0 ? L.T("No se encontraron parches para este juego") : L.T("Ya se añadieron todos los parches disponibles"));
 		}
 		catch (Exception e) when (e is HttpRequestException or TaskCanceledException or IOException or System.Text.Json.JsonException)
 		{
-			ShowToast("No se pudieron descargar los parches: " + e.Message);
+			ShowToast(L.T("No se pudieron descargar los parches: ") + e.Message);
 		}
 		finally
 		{
@@ -1642,7 +1657,7 @@ public sealed class MainWindow : Window
 	private void PatchesBox(Game game, string title, string message)
 	{
 		var option = _gameOption;
-		ShowChoice(title, message, new() { new("Aceptar", "", () => "", _ =>
+		ShowChoice(title, message, new() { new(L.T("Aceptar"), "", () => "", _ =>
 		{
 			ShowGameOptions(game);
 			_gameOption = option;
@@ -1682,7 +1697,7 @@ public sealed class MainWindow : Window
 				TileClicked(index);
 			};
 		}
-		if (!_emulator.Exists) ShowToast("No se encontró Nova5Emulator junto al lanzador");
+		if (!_emulator.Exists) ShowToast(L.T("No se encontró Nova5Emulator junto al lanzador"));
 		Select(_index, force: true);
 		WatchFolders(roots);
 		InstallPendingPackages();
@@ -1706,7 +1721,7 @@ public sealed class MainWindow : Window
 		{
 			while (_games.FirstOrDefault(g => g.Package is { } p && !_packageFailed.Contains(p)) is { Package: { } package } game)
 			{
-				SetPackageProgress(package, new Packages.InstallProgress("Esperando a que termine de copiarse…", null));
+				SetPackageProgress(package, new Packages.InstallProgress(L.T("Esperando a que termine de copiarse…"), null));
 				if (!await Packages.WaitUntilStableAsync(package, CancellationToken.None))
 				{
 					_packageProgress.Remove(package);
@@ -1714,7 +1729,7 @@ public sealed class MainWindow : Window
 					continue;
 				}
 				var archive = Archives.IsArchive(package);
-				ShowToast(archive ? $"Descomprimiendo {game.Name}…" : $"Instalando {game.Name}…");
+				ShowToast(archive ? L.F("Descomprimiendo {0}…", game.Name) : L.F("Instalando {0}…", game.Name));
 				try
 				{
 					var progress = new Progress<Packages.InstallProgress>(p => SetPackageProgress(package, p));
@@ -1724,7 +1739,7 @@ public sealed class MainWindow : Window
 					_packageProgress.Remove(package);
 					Reload();
 					ShowToast(archive && Directory.EnumerateFiles(Archives.OutputFor(package), "*.pkg", SearchOption.AllDirectories).Any()
-					    ? $"{game.Name} descomprimido; ahora se instala su PKG" : $"{game.Name} está listo para jugar");
+					    ? L.F("{0} descomprimido; ahora se instala su PKG", game.Name) : L.F("{0} está listo para jugar", game.Name));
 				}
 				catch (Exception e) when (e is IOException or InvalidDataException or InvalidOperationException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
 				{
@@ -1736,8 +1751,8 @@ public sealed class MainWindow : Window
 					catch (IOException) { }
 					_packageFailed.Add(package);
 					_packageProgress.Remove(package);
-					SetPackageStatus(package, (archive ? "No se pudo descomprimir: " : "No se pudo instalar: ") + e.Message);
-					ShowToast(archive ? $"No se pudo descomprimir {game.Name}" : $"No se pudo instalar {game.Name}");
+					SetPackageStatus(package, (archive ? L.T("No se pudo descomprimir: ") : L.T("No se pudo instalar: ")) + e.Message);
+					ShowToast(archive ? L.F("No se pudo descomprimir {0}", game.Name) : L.F("No se pudo instalar {0}", game.Name));
 				}
 			}
 		}
@@ -1767,18 +1782,18 @@ public sealed class MainWindow : Window
 	}
 
 	// The tile shows the percentage and the time left; the details line under the title shows everything.
-	private static readonly System.Globalization.CultureInfo Es = System.Globalization.CultureInfo.GetCultureInfo("es-ES");
+	private static readonly System.Globalization.CultureInfo Es = System.Globalization.CultureInfo.GetCultureInfo(L.T("es-ES"));
 
 	private static string ShortProgress(Packages.InstallProgress p) =>
-	    p.Fraction is { } f && p.Total > 0 ? $"{(p.Step == "Descomprimiendo" ? "Descomprimiendo" : "Instalando")} {f * 100:0} %" + (p.Remaining is { } r ? " · " + TimeLeft(r) : "") : p.Step;
+	    p.Fraction is { } f && p.Total > 0 ? $"{(p.Step == "Descomprimiendo" ? L.T("Descomprimiendo") : L.T("Instalando"))} {f * 100:0} %" + (p.Remaining is { } r ? " · " + TimeLeft(r) : "") : L.T(p.Step);
 
 	private static string LongProgress(Packages.InstallProgress p)
 	{
-		if (p.Total == 0) return p.Step;
-		var parts = new List<string> { $"{p.Step}: {Gb(p.Done)} de {Gb(p.Total)} GB ({(p.Fraction ?? 0) * 100:0} %)" };
+		if (p.Total == 0) return L.T(p.Step);
+		var parts = new List<string> { L.F("{0}: {1} de {2} GB ({3:0} %)", L.T(p.Step), Gb(p.Done), Gb(p.Total), (p.Fraction ?? 0) * 100) };
 		if (p.Speed > 0) parts.Add((p.Speed / (1 << 20)).ToString("0", Es) + " MB/s");
 		if (p.Remaining is { } r) parts.Add(TimeLeft(r));
-		if (p.FilesTotal > 0) parts.Add($"{p.FilesDone.ToString("N0", Es)} de {p.FilesTotal.ToString("N0", Es)} archivos");
+		if (p.FilesTotal > 0) parts.Add(L.F("{0} de {1} archivos", p.FilesDone.ToString("N0", Es), p.FilesTotal.ToString("N0", Es)));
 		return string.Join(" · ", parts);
 	}
 
@@ -1786,7 +1801,7 @@ public sealed class MainWindow : Window
 	private static string Gb(long bytes) => (bytes / (double)(1L << 30)).ToString("0.0", Es);
 
 	private static string TimeLeft(TimeSpan left) =>
-	    left.TotalMinutes < 1 ? "menos de 1 min" : left.TotalHours < 1 ? $"quedan {Math.Ceiling(left.TotalMinutes):0} min" : $"quedan {(int)left.TotalHours} h {left.Minutes} min";
+	    left.TotalMinutes < 1 ? L.T("menos de 1 min") : left.TotalHours < 1 ? L.F("quedan {0:0} min", Math.Ceiling(left.TotalMinutes)) : L.F("quedan {0} h {1} min", (int)left.TotalHours, left.Minutes);
 
 	private static ProgressBar ProgressLine(double width) => new()
 	{
@@ -1828,7 +1843,7 @@ public sealed class MainWindow : Window
 		_rowShift.X = -Math.Max(0, _index - (VisibleTiles - 2)) * (TileSize + TileGap);
 
 		var game = Current;
-		_title.Text = game?.Name ?? "Añadir juegos";
+		_title.Text = game?.Name ?? L.T("Añadir juegos");
 		_meta.Children.Clear();
 		_stats.Children.Clear();
 		foreach (var button in _buttons) button.IsVisible = game is not null;
@@ -1836,7 +1851,7 @@ public sealed class MainWindow : Window
 		if (game is null)
 		{
 			_gameTrophies.IsVisible = false;
-			_meta.Children.Add(Text("Elige la carpeta donde tienes tus juegos de PS5 extraídos", 22, FontWeight.Normal, Palette.Muted));
+			_meta.Children.Add(Text(L.T("Elige la carpeta donde tienes tus juegos de PS5 extraídos"), 22, FontWeight.Normal, Palette.Muted));
 			SetBackground(null);
 			_music.Stop();
 			return;
@@ -1846,7 +1861,7 @@ public sealed class MainWindow : Window
 			foreach (var button in _buttons) button.IsVisible = false;
 			if (_statsBox is not null) _statsBox.IsVisible = false;
 			_gameTrophies.IsVisible = false;
-			_meta.Children.Add(Badge(Archives.IsArchive(package) ? "Archivo " + Archives.Label(package) : "Paquete PKG"));
+			_meta.Children.Add(Badge(Archives.IsArchive(package) ? L.T("Archivo ") + Archives.Label(package) : L.T("Paquete PKG")));
 			_meta.Children.Add(Text($"{new FileInfo(package).Length / 1e9:0.0} GB", 22, FontWeight.Normal, Palette.Muted));
 			if (_packageProgress.GetValueOrDefault(package) is { } progress)
 			{
@@ -1858,27 +1873,27 @@ public sealed class MainWindow : Window
 					Children = { Text(LongProgress(progress), 22, FontWeight.Normal, Palette.Muted), bar },
 				});
 			}
-			else _meta.Children.Add(Text(_packageStatus.GetValueOrDefault(package, Archives.IsArchive(package) ? "Pendiente de descomprimir" : "Pendiente de instalar"), 22, FontWeight.Normal, Palette.Muted));
-			if (_packageFailed.Contains(package)) _meta.Children.Add(Text("· pulsa A para reintentar", 22, FontWeight.Normal, Palette.AuroraA));
+			else _meta.Children.Add(Text(_packageStatus.GetValueOrDefault(package, Archives.IsArchive(package) ? L.T("Pendiente de descomprimir") : L.T("Pendiente de instalar")), 22, FontWeight.Normal, Palette.Muted));
+			if (_packageFailed.Contains(package)) _meta.Children.Add(Text(L.T("· pulsa A para reintentar"), 22, FontWeight.Normal, Palette.AuroraA));
 			SetBackground(null);
 			_music.Stop();
 			return;
 		}
 		ShowGameTrophies(game);
 		var patches = GamePatches.Load(_emulator.BaseDir, game);
-		_meta.Children.Add(Badge(patches is { HasModes: true } ? $"Modo {ModeLabel(patches.Mode)}"
-		    : patches?.Mods.Any(m => m.Enabled) == true ? "Parches activos" : "Instalado"));
-		if (game.Archive is not null) _meta.Children.Add(Badge("Comprimido .zar"));
+		_meta.Children.Add(Badge(patches is { HasModes: true } ? L.F("Modo {0}", ModeLabel(patches.Mode))
+		    : patches?.Mods.Any(m => m.Enabled) == true ? L.T("Parches activos") : L.T("Instalado")));
+		if (game.Archive is not null) _meta.Children.Add(Badge(L.T("Comprimido .zar")));
 		foreach (var part in new[] { game.TitleId, "v" + game.Version, LastPlayedText(game) })
 		{
 			if (part.Length == 0) continue;
 			_meta.Children.Add(Text(part, 22, FontWeight.Normal, Palette.Muted));
 		}
-		_stats.Children.Add(new TextBlock { Text = "EN ESTE PC", FontSize = 18, Foreground = Palette.Brush(Palette.Muted), LetterSpacing = 1.5, Margin = new Thickness(0, 0, 0, 14) });
-		Stat("Tiempo jugado", PlayTimeText(game));
-		Stat("Caché de shaders", _emulator.ShaderStoreFor(game.TitleId) is { } store ? $"Lista · {new FileInfo(store).Length / 1048576.0:0} MB" : "Se crea al jugar");
-		Stat("Parche del juego", _emulator.PatchFor(game.TitleId) is null ? "Ninguno" : "Activo");
-		Stat("Música del menú", game.Music is null ? "No incluida" : _store.Music ? "Sonando" : "Desactivada");
+		_stats.Children.Add(new TextBlock { Text = L.T("EN ESTE PC"), FontSize = 18, Foreground = Palette.Brush(Palette.Muted), LetterSpacing = 1.5, Margin = new Thickness(0, 0, 0, 14) });
+		Stat(L.T("Tiempo jugado"), PlayTimeText(game));
+		Stat(L.T("Caché de shaders"), _emulator.ShaderStoreFor(game.TitleId) is { } store ? L.F("Lista · {0:0} MB", new FileInfo(store).Length / 1048576.0) : L.T("Se crea al jugar"));
+		Stat(L.T("Parche del juego"), _emulator.PatchFor(game.TitleId) is null ? L.T("Ninguno") : L.T("Activo"));
+		Stat(L.T("Música del menú"), game.Music is null ? L.T("No incluida") : _store.Music ? L.T("Sonando") : L.T("Desactivada"));
 		SetBackground(game.Background);
 		_music.Play(_store.Music ? game.Music : null);
 	}
@@ -1896,7 +1911,7 @@ public sealed class MainWindow : Window
 	private string PlayTimeText(Game game)
 	{
 		var seconds = _store.PlaySeconds.GetValueOrDefault(game.TitleId);
-		if (seconds < 60) return "Sin jugar";
+		if (seconds < 60) return L.T("Sin jugar");
 		var time = TimeSpan.FromSeconds(seconds);
 		return time.TotalHours >= 1 ? $"{(int)time.TotalHours} h {time.Minutes} min" : $"{time.Minutes} min";
 	}
@@ -1905,7 +1920,7 @@ public sealed class MainWindow : Window
 	{
 		if (!_store.LastPlayed.TryGetValue(game.TitleId, out var when)) return "";
 		var days = (DateTime.Now.Date - when.ToLocalTime().Date).Days;
-		return days switch { 0 => "Última vez: hoy", 1 => "Última vez: ayer", _ => $"Última vez: hace {days} días" };
+		return days switch { 0 => L.T("Última vez: hoy"), 1 => L.T("Última vez: ayer"), _ => L.F("Última vez: hace {0} días", days) };
 	}
 
 	private async void SetBackground(string? path)
@@ -1978,7 +1993,7 @@ public sealed class MainWindow : Window
 		}
 		if (e.Key == Key.Escape)
 		{
-			ShowChrome(_chrome.Opacity == 0, pin: true);
+			if (WindowState == WindowState.FullScreen) WindowState = _windowedState; // Escape leaves full screen.
 			e.Handled = true;
 			return;
 		}
@@ -2131,6 +2146,7 @@ public sealed class MainWindow : Window
 		_settingsPage.IsVisible = tab == SettingsTab;
 		_trophiesPage.IsVisible = tab == TrophiesTab;
 		_novas.IsVisible        = tab == NovaSTab;
+		UpdateNovaSWindow();
 		if (tab == NovaSTab)
 		{
 			_zone = Zone.NovaS;
@@ -2164,6 +2180,51 @@ public sealed class MainWindow : Window
 
 	private static Setting Section(string title) => new(title, "", () => "", _ => { }) { Header = true };
 
+	// ---- Language (Nova5's settings and NovaS's): auto (the PC's), Spanish or English; it applies on restart ----
+
+	private static readonly string[] Languages = { "auto", "es", "en" };
+
+	public static string LanguageName(string language) => language switch
+	{
+		"es" => "Español (Latinoamérica)",
+		"en" => "English",
+		_    => L.T("Automático (el del PC)"),
+	};
+
+	private void ChangeLanguage(int step)
+	{
+		var at = Math.Max(0, Array.IndexOf(Languages, _store.Language));
+		_store.Language = Languages[(at + step + Languages.Length) % Languages.Length];
+		_store.Save();
+		if (_tab == SettingsTab) BuildSettings();
+		_novas.RefreshSettings();
+		AskRestartForLanguage();
+	}
+
+	// The texts are set when the windows are built: the new language shows after restarting the launcher.
+	private void AskRestartForLanguage()
+	{
+		var english = _store.Language switch { "en" => true, "es" => false, _ => !System.Globalization.CultureInfo.CurrentUICulture.TwoLetterISOLanguageName.Equals("es", StringComparison.OrdinalIgnoreCase) };
+		if (english == L.English) return;
+		ShowChoice(english ? "Language" : "Idioma", english ? "Restart now to see everything in English?" : "¿Reiniciar ahora para verlo todo en español?", new()
+		{
+			new(english ? "Restart now" : "Reiniciar ahora", "", () => "", _ => RestartLauncher()),
+			new(english ? "Later" : "Más tarde", "", () => "", _ => { }),
+		});
+	}
+
+	private void RestartLauncher()
+	{
+		if (_running is not null) return;
+		if (Environment.ProcessPath is { } exe)
+		{
+			var info = new ProcessStartInfo(exe) { UseShellExecute = false };
+			if (Edition.NovaSOnly && !System.IO.Path.GetFileNameWithoutExtension(exe).StartsWith("NovaS", StringComparison.OrdinalIgnoreCase)) info.ArgumentList.Add("--novas");
+			Process.Start(info);
+		}
+		Close();
+	}
+
 	private static readonly string[] Resolutions = { "R1280X720", "R1920X1080", "R2560X1440", "R3840X2160" };
 	private static readonly int[] RefreshRates = { 60, 120, 144 };
 
@@ -2173,21 +2234,23 @@ public sealed class MainWindow : Window
 	private List<Setting> Settings() => new()
 	{
 		Section("Nova5"),
-		new("Información de la versión", $"Tienes Nova5 {Updates.Current}. Abre las novedades de esta versión y de las anteriores.",
-		    () => "Ver ›", _ => ShowNotes(ReleaseNotes.All.Where(n => n.Version <= Updates.Current).ToList(), firstTime: false)),
-		new(_update is null ? "Buscar actualizaciones" : $"Actualizar a Nova5 {_update.Version}",
-		    _update is null ? "Consulta en GitHub si hay una versión nueva de Nova5." : "Descarga e instala la versión nueva; tus partidas y ajustes se conservan.",
-		    () => _updating ? "Actualizando…" : _update is null ? "Buscar ›" : "Actualizar ›", _ => { if (_update is null) CheckUpdates(true); else StartUpdate(); }),
-		new("Actualizaciones", "Avisar: te pregunta antes de instalar. Automáticas: se instalan al abrir Nova5. Desactivadas: no se conecta para esto.",
-		    () => _store.UpdateMode switch { "auto" => "Automáticas", "no" => "Desactivadas", _ => "Avisar" }, step =>
+		new("Idioma / Language", L.T("Idioma de Nova5 y NovaS. Automático usa el de tu PC. Se aplica al reiniciar."),
+		    () => LanguageName(_store.Language), step => ChangeLanguage(step)),
+		new(L.T("Información de la versión"), L.F("Tienes Nova5 {0}. Abre las novedades de esta versión y de las anteriores.", Updates.Current),
+		    () => L.T("Ver ›"), _ => ShowNotes(ReleaseNotes.All.Where(n => n.Version <= Updates.Current).ToList(), firstTime: false)),
+		new(_update is null ? L.T("Buscar actualizaciones") : L.F("Actualizar a Nova5 {0}", _update.Version),
+		    _update is null ? L.T("Consulta en GitHub si hay una versión nueva de Nova5.") : L.T("Descarga e instala la versión nueva; tus partidas y ajustes se conservan."),
+		    () => _updating ? L.T("Actualizando…") : _update is null ? L.T("Buscar ›") : L.T("Actualizar ›"), _ => { if (_update is null) CheckUpdates(true); else StartUpdate(); }),
+		new(L.T("Actualizaciones"), L.T("Avisar: te pregunta antes de instalar. Automáticas: se instalan al abrir Nova5. Desactivadas: no se conecta para esto."),
+		    () => _store.UpdateMode switch { "auto" => L.T("Automáticas"), "no" => L.T("Desactivadas"), _ => L.T("Avisar") }, step =>
 		{
 			string[] modes = { "avisar", "auto", "no" };
 			_store.UpdateMode = modes[(Math.Max(Array.IndexOf(modes, _store.UpdateMode), 0) + step + modes.Length) % modes.Length];
 			_store.Save();
 		}),
-		Section("Gráficos"),
-		Toggle("Pantalla completa al jugar", "Los juegos se abren a pantalla completa; si no, en una ventana.", "fullscreen_enabled", true),
-		new("Resolución", "Resolución a la que se dibujan los juegos. Elige la de tu monitor para que se vean nítidos; más alta exige más a la gráfica.",
+		Section(L.T("Gráficos")),
+		Toggle(L.T("Pantalla completa al jugar"), L.T("Los juegos se abren a pantalla completa; si no, en una ventana."), "fullscreen_enabled", true),
+		new(L.T("Resolución"), L.T("Resolución a la que se dibujan los juegos. Elige la de tu monitor para que se vean nítidos; más alta exige más a la gráfica."),
 		    () => _emulator.Ini.Get("GlobalConfiguration", "screen_resolution")?.TrimStart('R').Replace('X', '×') ?? "1920×1080",
 		    step =>
 		    {
@@ -2196,68 +2259,68 @@ public sealed class MainWindow : Window
 		    }),
 		// Emulated display refresh. At 119 Hz or more games are told the screen is 120 Hz, so
 		// those with a 120 Hz mode can pass 60 FPS; games that count vblanks could run faster.
-		new("Frecuencia de pantalla", "Los juegos con modo de 120 Hz pueden pasar de 60 FPS con 120 o 144 Hz. Si un juego va acelerado, vuelve a 60 Hz.",
+		new(L.T("Frecuencia de pantalla"), L.T("Los juegos con modo de 120 Hz pueden pasar de 60 FPS con 120 o 144 Hz. Si un juego va acelerado, vuelve a 60 Hz."),
 		    () => $"{RefreshRate()} Hz", step =>
 		{
 			var current = Array.IndexOf(RefreshRates, RefreshRate());
 			SetIni("vblank_frequency", RefreshRates[(Math.Max(current, 0) + step + RefreshRates.Length) % RefreshRates.Length].ToString());
 		}),
-		Cycle("Sincronización (VSync)", "Mailbox: fluido y sin cortes, recomendado. VSync: sin cortes pero con algo más de retraso. Sin límite: el menor retraso, puede verse cortada la imagen.",
-		    "present_mode", "Mailbox", ("Mailbox", "Mailbox"), ("Fifo", "VSync"), ("Immediate", "Sin límite")),
-		Toggle("HDR", "Imagen HDR si tu monitor y el juego lo admiten.", "hdr_enabled", false),
-		Toggle("Contador de FPS en pantalla", "Muestra los FPS y el uso de la gráfica y el procesador mientras juegas.", "perf_overlay_enabled", false),
-		Toggle("Ocultar el cursor", "Oculta el puntero del ratón dentro del juego.", "hide_cursor_enabled", false),
-		Section("Sistema"),
-		new("Nombre de usuario", "El nombre que ven los juegos, por ejemplo al guardar o en los marcadores. Se escribe con el teclado.",
+		Cycle(L.T("Sincronización (VSync)"), L.T("Mailbox: fluido y sin cortes, recomendado. VSync: sin cortes pero con algo más de retraso. Sin límite: el menor retraso, puede verse cortada la imagen."),
+		    "present_mode", "Mailbox", ("Mailbox", "Mailbox"), ("Fifo", "VSync"), ("Immediate", L.T("Sin límite"))),
+		Toggle("HDR", L.T("Imagen HDR si tu monitor y el juego lo admiten."), "hdr_enabled", false),
+		Toggle(L.T("Contador de FPS en pantalla"), L.T("Muestra los FPS y el uso de la gráfica y el procesador mientras juegas."), "perf_overlay_enabled", false),
+		Toggle(L.T("Ocultar el cursor"), L.T("Oculta el puntero del ratón dentro del juego."), "hide_cursor_enabled", false),
+		Section(L.T("Sistema")),
+		new(L.T("Nombre de usuario"), L.T("El nombre que ven los juegos, por ejemplo al guardar o en los marcadores. Se escribe con el teclado."),
 		    () => _emulator.Ini.Get("GlobalConfiguration", "user_name") is { Length: > 0 } name ? name : "Nova5",
-		    _ => AskText("Nombre de usuario", _emulator.Ini.Get("GlobalConfiguration", "user_name") ?? "Nova5", value => SetIni("user_name", value))),
-		Cycle("Idioma de la consola", "El idioma que los juegos usan para textos y voces, si lo tienen.", "console_language", "1", ConsoleLanguages),
-		Toggle("Saltar avisos de inicio", "Pide a los juegos que se salten las pantallas de aviso del principio, si lo permiten.", "skip_notice_screen", false),
-		Section("Rendimiento"),
-		Toggle("Caché de shaders", "Guarda los shaders ya preparados para que los juegos carguen más rápido y tengan menos tirones.", "shader_cache_enabled", true),
-		Toggle("Compatibilidad de CPU", "Solo si un juego se cierra al arrancar en tu procesador. Puede bajar el rendimiento.", "amd_cpu_enabled", false),
-		Section("Mando"),
-		new("Teclado y ratón", "Qué tecla o botón del ratón hace cada botón del DualSense. Por defecto L2 y R2 van en Z y C.", () => "Configurar ›", _ => ShowKeys()),
-		Percent("Vibración del mando", "Intensidad de la vibración (0 % la apaga).", "controller_vibration_intensity", 100),
-		Percent("Altavoz del mando", "Volumen del altavoz del DualSense.", "controller_speaker_volume", 50),
-		Cycle("Color de la barra de luz", "Color de la luz del DualSense. Automático: el que pida el juego.", "controller_color", "",
-		    ("", "Automático"), ("#0050FF", "Azul"), ("#5EEAD4", "Aurora"), ("#8B5CF6", "Morado"), ("#FF2D55", "Rojo"), ("#30D158", "Verde"), ("#FFFFFF", "Blanco")),
-		Section("Trofeos"),
-		Toggle("Avisos de trofeos", "Muestra un aviso con sonido al conseguir un trofeo mientras juegas.", "trophy_enabled", true),
-		Cycle("Duración del aviso", "Cuánto tiempo se queda el aviso de trofeo en pantalla.", "trophy_duration_seconds", "6",
+		    _ => AskText(L.T("Nombre de usuario"), _emulator.Ini.Get("GlobalConfiguration", "user_name") ?? "Nova5", value => SetIni("user_name", value))),
+		Cycle(L.T("Idioma de la consola"), L.T("El idioma que los juegos usan para textos y voces, si lo tienen."), "console_language", "1", ConsoleLanguages),
+		Toggle(L.T("Saltar avisos de inicio"), L.T("Pide a los juegos que se salten las pantallas de aviso del principio, si lo permiten."), "skip_notice_screen", false),
+		Section(L.T("Rendimiento")),
+		Toggle(L.T("Caché de shaders"), L.T("Guarda los shaders ya preparados para que los juegos carguen más rápido y tengan menos tirones."), "shader_cache_enabled", true),
+		Toggle(L.T("Compatibilidad de CPU"), L.T("Solo si un juego se cierra al arrancar en tu procesador. Puede bajar el rendimiento."), "amd_cpu_enabled", false),
+		Section(L.T("Mando")),
+		new(L.T("Teclado y ratón"), L.T("Qué tecla o botón del ratón hace cada botón del DualSense. Por defecto L2 y R2 van en Z y C."), () => L.T("Configurar ›"), _ => ShowKeys()),
+		Percent(L.T("Vibración del mando"), L.T("Intensidad de la vibración (0 % la apaga)."), "controller_vibration_intensity", 100),
+		Percent(L.T("Altavoz del mando"), L.T("Volumen del altavoz del DualSense."), "controller_speaker_volume", 50),
+		Cycle(L.T("Color de la barra de luz"), L.T("Color de la luz del DualSense. Automático: el que pida el juego."), "controller_color", "",
+		    ("", L.T("Automático")), ("#0050FF", L.T("Azul")), ("#5EEAD4", "Aurora"), ("#8B5CF6", L.T("Morado")), ("#FF2D55", L.T("Rojo")), ("#30D158", L.T("Verde")), ("#FFFFFF", L.T("Blanco"))),
+		Section(L.T("Trofeos")),
+		Toggle(L.T("Avisos de trofeos"), L.T("Muestra un aviso con sonido al conseguir un trofeo mientras juegas."), "trophy_enabled", true),
+		Cycle(L.T("Duración del aviso"), L.T("Cuánto tiempo se queda el aviso de trofeo en pantalla."), "trophy_duration_seconds", "6",
 		    ("5", "5 s"), ("6", "6 s"), ("8", "8 s"), ("10", "10 s")),
 		Section("Audio"),
-		new("Música del menú", "Suena la música de menú de cada juego al seleccionarlo.", () => _store.Music ? "Sí" : "No", _ =>
+		new(L.T("Música del menú"), L.T("Suena la música de menú de cada juego al seleccionarlo."), () => _store.Music ? L.T("Sí") : "No", _ =>
 		{
 			_store.Music   = !_store.Music;
 			_music.Enabled = _store.Music;
 			_store.Save();
 		}),
-		new("Volumen de la música", "Volumen de la música del menú.", () => $"{_store.MusicVolume * 100:0} %", step =>
+		new(L.T("Volumen de la música"), L.T("Volumen de la música del menú."), () => $"{_store.MusicVolume * 100:0} %", step =>
 		{
 			_store.MusicVolume = Math.Clamp(Math.Round(_store.MusicVolume + step * 0.1, 1), 0, 1);
 			_music.Volume      = _store.MusicVolume;
 			_store.Save();
 		}),
-		Section("Biblioteca"),
-		new("Añadir carpeta de juegos", "Elige otra carpeta con juegos de PS5, archivos .pkg o juegos en .rar, .zip o .7z para añadirlos a la biblioteca.", () => "Elegir ›", _ => AddFolder()),
-		new("Donar", "Nova5 es gratis. Si te resulta útil, puedes apoyarlo en ko-fi.com/nova5emu.", () => "Ko-fi ›",
+		Section(L.T("Biblioteca")),
+		new(L.T("Añadir carpeta de juegos"), L.T("Elige otra carpeta con juegos de PS5, archivos .pkg o juegos en .rar, .zip o .7z para añadirlos a la biblioteca."), () => L.T("Elegir ›"), _ => AddFolder()),
+		new(L.T("Donar"), L.T("Nova5 es gratis. Si te resulta útil, puedes apoyarlo en ko-fi.com/nova5emu."), () => "Ko-fi ›",
 		    _ => Process.Start(new ProcessStartInfo("https://ko-fi.com/nova5emu") { UseShellExecute = true })),
-		new("Salir de Nova5", "Cierra el lanzador.", () => "Salir ›", _ => ShowPrompt(true)),
+		new(L.T("Salir de Nova5"), L.T("Cierra el lanzador."), () => L.T("Salir ›"), _ => ShowPrompt(true)),
 	};
 
 	private Setting DemonsSoulsToggle(string label, string detail, string key)
 	{
 		var variable = DemonsSoulsOptions.Switches.Single(s => s.Key == key).Variable;
 		bool Enabled() => DemonsSoulsOptions.Effective(_emulator.Ini.Get("GlobalConfiguration", key), Environment.GetEnvironmentVariable(variable));
-		return new(label, detail, () => Enabled() ? "Sí" : "No", _ => SetIni(key, Enabled() ? "false" : "true"));
+		return new(label, detail, () => Enabled() ? L.T("Sí") : "No", _ => SetIni(key, Enabled() ? "false" : "true"));
 	}
 
 	private static readonly (string, string)[] ConsoleLanguages =
 	{
-		("20", "Español (Latinoamérica)"), ("3", "Español (España)"), ("1", "Inglés (EE. UU.)"), ("18", "Inglés (Reino Unido)"),
-		("17", "Portugués (Brasil)"), ("7", "Portugués (Portugal)"), ("2", "Francés"), ("4", "Alemán"), ("5", "Italiano"),
-		("0", "Japonés"), ("9", "Coreano"), ("11", "Chino simplificado"), ("10", "Chino tradicional"), ("8", "Ruso"), ("16", "Polaco"),
+		("20", L.T("Español (Latinoamérica)")), ("3", L.T("Español (España)")), ("1", L.T("Inglés (EE. UU.)")), ("18", L.T("Inglés (Reino Unido)")),
+		("17", L.T("Portugués (Brasil)")), ("7", L.T("Portugués (Portugal)")), ("2", L.T("Francés")), ("4", L.T("Alemán")), ("5", L.T("Italiano")),
+		("0", L.T("Japonés")), ("9", L.T("Coreano")), ("11", L.T("Chino simplificado")), ("10", L.T("Chino tradicional")), ("8", L.T("Ruso")), ("16", L.T("Polaco")),
 	};
 
 	// A Nova5.ini value chosen from a list: left and right move through it.
@@ -2284,7 +2347,7 @@ public sealed class MainWindow : Window
 	}
 
 	private Setting GameToggle(string titleId, string label, string detail, string key, bool fallback) =>
-	    GameCycle(titleId, label, detail, key, fallback ? "true" : "false", ("true", "Sí"), ("false", "No"));
+	    GameCycle(titleId, label, detail, key, fallback ? "true" : "false", ("true", L.T("Sí")), ("false", "No"));
 
 	private Setting Percent(string label, string detail, string key, int fallback)
 	{
@@ -2293,7 +2356,7 @@ public sealed class MainWindow : Window
 	}
 
 	private Setting Toggle(string label, string detail, string key, bool fallback) =>
-	    new(label, detail, () => _emulator.Ini.GetBool("GlobalConfiguration", key, fallback) ? "Sí" : "No",
+	    new(label, detail, () => _emulator.Ini.GetBool("GlobalConfiguration", key, fallback) ? L.T("Sí") : "No",
 	        _ => SetIni(key, _emulator.Ini.GetBool("GlobalConfiguration", key, fallback) ? "false" : "true"));
 
 	private void SetIni(string key, string value)
@@ -2380,7 +2443,7 @@ public sealed class MainWindow : Window
 		if (setting.Detail.Length > 0)
 			text.Children.Add(new TextBlock { Text = setting.Detail, FontSize = 18, Foreground = Palette.Brush(Palette.Muted), TextWrapping = TextWrapping.Wrap });
 		var shown = setting.Value();
-		var on    = shown == "Sí";
+		var on    = shown == L.T("Sí");
 		var value = new Border
 		{
 			Padding = new Thickness(18, 7), CornerRadius = new CornerRadius(999), MinWidth = 76, VerticalAlignment = VerticalAlignment.Center,
@@ -2454,14 +2517,14 @@ public sealed class MainWindow : Window
 	}
 	private async void AddFolder()
 	{
-		var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions { Title = "Carpeta con tus juegos de PS5", AllowMultiple = false });
+		var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions { Title = L.T("Carpeta con tus juegos de PS5"), AllowMultiple = false });
 		var path    = folders.FirstOrDefault()?.TryGetLocalPath();
 		if (path is null) return;
 		if (!_store.ExtraDirs.Contains(path, StringComparer.OrdinalIgnoreCase)) _store.ExtraDirs.Add(path);
 		_store.Save();
 		var before = _games.Count;
 		Reload();
-		ShowToast(_games.Count > before ? $"{_games.Count - before} juego(s) añadido(s)" : "No se encontraron juegos en esa carpeta");
+		ShowToast(_games.Count > before ? L.F("{0} juego(s) añadido(s)", _games.Count - before) : L.T("No se encontraron juegos en esa carpeta"));
 		if (_tab != 0) ShowTab(0);
 	}
 
@@ -2469,21 +2532,21 @@ public sealed class MainWindow : Window
 
 	private async void CheckUpdates(bool manual)
 	{
-		if (manual) ShowToast("Buscando actualizaciones…");
+		if (manual) ShowToast(L.T("Buscando actualizaciones…"));
 		_update = await Updates.CheckAsync();
 		if (_tab == SettingsTab) BuildSettings();
 		if (_update is null)
 		{
-			if (manual) ShowToast($"Tienes la última versión ({Updates.Current})");
+			if (manual) ShowToast(L.F("Tienes la última versión ({0})", Updates.Current));
 			return;
 		}
-		_updateText.Text      = $"Actualizar a {_update.Version}";
+		_updateText.Text      = L.F("Actualizar a {0}", _update.Version);
 		_updatePill.IsVisible = true;
 		// NovaS on its own shows the update as one more round button on its home.
-		if (Edition.NovaSOnly) _novas.OfferUpdate($"Actualizar a {_update.Version}", StartUpdate);
+		if (Edition.NovaSOnly) _novas.OfferUpdate(L.F("Actualizar a {0}", _update.Version), StartUpdate);
 		if (_store.UpdateMode == "auto" && !manual) StartUpdate();
-		else if (Edition.NovaSOnly) _novas.Toast($"NovaS {_update.Version} está disponible: pulsa «Actualizar a {_update.Version}»");
-		else ShowToast($"Nova5 {_update.Version} está disponible: pulsa «Actualizar» arriba o en Ajustes");
+		else if (Edition.NovaSOnly) _novas.Toast(L.F("NovaS {0} está disponible: pulsa «Actualizar a {1}»", _update.Version, _update.Version));
+		else ShowToast(L.F("Nova5 {0} está disponible: pulsa «Actualizar» arriba o en Ajustes", _update.Version));
 	}
 
 	private async void StartUpdate()
@@ -2491,8 +2554,8 @@ public sealed class MainWindow : Window
 		if (_update is not { } update || _updating) return;
 		if (_running is not null)
 		{
-			if (Edition.NovaSOnly) _novas.Toast("Cierra el juego para actualizar NovaS");
-			else ShowToast("Cierra el juego para actualizar Nova5");
+			if (Edition.NovaSOnly) _novas.Toast(L.T("Cierra el juego para actualizar NovaS"));
+			else ShowToast(L.T("Cierra el juego para actualizar Nova5"));
 			return;
 		}
 		_updating = true;
@@ -2501,19 +2564,19 @@ public sealed class MainWindow : Window
 		{
 			var progress = new Progress<double>(p =>
 			{
-				_updateText.Text = $"Descargando {p * 100:0} %";
-				if (Edition.NovaSOnly) _novas.Toast($"Descargando NovaS {update.Version}: {p * 100:0} %");
+				_updateText.Text = L.F("Descargando {0:0} %", p * 100);
+				if (Edition.NovaSOnly) _novas.Toast(L.F("Descargando NovaS {0}: {1:0} %", update.Version, p * 100));
 			});
 			var setup    = await Updates.DownloadAsync(update, progress);
-			_updateText.Text = "Instalando…";
+			_updateText.Text = L.T("Instalando…");
 			Updates.Install(setup, _emulator.BaseDir);
 			Close(); // The setup replaces the files and opens Nova5 again.
 		}
 		catch (Exception e) when (e is HttpRequestException or IOException or InvalidDataException or TaskCanceledException or System.ComponentModel.Win32Exception)
 		{
 			_updating        = false;
-			_updateText.Text = $"Actualizar a {update.Version}";
-			ShowToast("No se pudo actualizar: " + e.Message);
+			_updateText.Text = L.F("Actualizar a {0}", update.Version);
+			ShowToast(L.T("No se pudo actualizar: ") + e.Message);
 		}
 	}
 
@@ -2523,7 +2586,7 @@ public sealed class MainWindow : Window
 	{
 		if (!_emulator.Exists)
 		{
-			ShowToast("No se encontró Nova5Emulator junto al lanzador");
+			ShowToast(L.T("No se encontró Nova5Emulator junto al lanzador"));
 			return;
 		}
 		try
@@ -2539,7 +2602,7 @@ public sealed class MainWindow : Window
 		catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception)
 		{
 			_running = null;
-			ShowToast("No se pudo abrir el emulador: " + e.Message);
+			ShowToast(L.T("No se pudo abrir el emulador: ") + e.Message);
 		}
 	}
 
@@ -2554,19 +2617,19 @@ public sealed class MainWindow : Window
 	{
 		var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
 		{
-			Title = $"Portada para {game.Name}", AllowMultiple = false,
-			FileTypeFilter = new[] { new FilePickerFileType("Imágenes") { Patterns = new[] { "*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp" } } },
+			Title = L.F("Portada para {0}", game.Name), AllowMultiple = false,
+			FileTypeFilter = new[] { new FilePickerFileType(L.T("Imágenes")) { Patterns = new[] { "*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp" } } },
 		});
 		var path = files.FirstOrDefault()?.TryGetLocalPath();
 		if (path is null) return;
 		try
 		{
 			SwitchGames.SetCover(game, path);
-			ShowToast($"Portada de {game.Name} cambiada");
+			ShowToast(L.F("Portada de {0} cambiada", game.Name));
 		}
 		catch (Exception e) when (e is IOException or UnauthorizedAccessException)
 		{
-			ShowToast("No se pudo guardar la portada: " + e.Message);
+			ShowToast(L.T("No se pudo guardar la portada: ") + e.Message);
 		}
 		_novas.Load(SwitchGames.Scan(SwitchRoots()));
 	}
@@ -2576,19 +2639,19 @@ public sealed class MainWindow : Window
 	{
 		var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
 		{
-			Title = "Claves de tu consola (prod.keys y title.keys)", AllowMultiple = true,
-			FileTypeFilter = new[] { new FilePickerFileType("Claves") { Patterns = new[] { "*.keys" } } },
+			Title = L.T("Claves de tu consola (prod.keys y title.keys)"), AllowMultiple = true,
+			FileTypeFilter = new[] { new FilePickerFileType(L.T("Claves")) { Patterns = new[] { "*.keys" } } },
 		});
 		var paths = files.Select(f => f.TryGetLocalPath()).OfType<string>().ToList();
 		if (paths.Count == 0) return;
 		try
 		{
 			var copied = SwitchGames.InstallKeys(paths);
-			ShowToast(copied > 0 ? $"Claves instaladas ({copied})" : "Elige archivos .keys (prod.keys, title.keys)");
+			ShowToast(copied > 0 ? L.F("Claves instaladas ({0})", copied) : L.T("Elige archivos .keys (prod.keys, title.keys)"));
 		}
 		catch (Exception e) when (e is IOException or UnauthorizedAccessException)
 		{
-			ShowToast("No se pudieron copiar las claves: " + e.Message);
+			ShowToast(L.T("No se pudieron copiar las claves: ") + e.Message);
 		}
 		_novas.Load(SwitchGames.Scan(SwitchRoots()));
 	}
@@ -2598,28 +2661,28 @@ public sealed class MainWindow : Window
 	{
 		var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
 		{
-			Title = "Firmware de tu consola: su .zip o cualquier .nca de su carpeta", AllowMultiple = false,
+			Title = L.T("Firmware de tu consola: su .zip o cualquier .nca de su carpeta"), AllowMultiple = false,
 			FileTypeFilter = new[] { new FilePickerFileType("Firmware") { Patterns = new[] { "*.zip", "*.nca" } } },
 		});
 		var path = files.FirstOrDefault()?.TryGetLocalPath();
 		if (path is null) return;
 		var source = path.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) ? path : System.IO.Path.GetDirectoryName(path)!;
-		ShowToast("Instalando el firmware…");
+		ShowToast(L.T("Instalando el firmware…"));
 		var last = -1;
 		var progress = new Progress<double>(p =>
 		{
 			var percent = (int)(p * 100);
-			if (percent / 10 != last / 10) ShowToast($"Instalando el firmware… {percent} %");
+			if (percent / 10 != last / 10) ShowToast(L.F("Instalando el firmware… {0} %", percent));
 			last = percent;
 		});
 		try
 		{
 			var count = await Task.Run(() => SwitchGames.InstallFirmware(source, progress));
-			ShowToast($"Firmware instalado ({count} archivos)");
+			ShowToast(L.F("Firmware instalado ({0} archivos)", count));
 		}
 		catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException)
 		{
-			ShowToast("No se pudo instalar el firmware: " + e.Message);
+			ShowToast(L.T("No se pudo instalar el firmware: ") + e.Message);
 		}
 		_novas.Load(SwitchGames.Scan(SwitchRoots()));
 	}
@@ -2630,7 +2693,26 @@ public sealed class MainWindow : Window
 		if (_running is not null) return;
 		if (!SwitchGames.HasEngine)
 		{
-			ShowToast("Falta el motor de NovaS: actualiza Nova5");
+			ShowToast(L.T("Falta el motor de NovaS: actualiza Nova5"));
+			return;
+		}
+		if (_packingNup is not null)
+		{
+			_novas.Toast(L.T("Espera a que termine de empaquetarse el juego"));
+			return;
+		}
+		// A loose dump with its update or DLC: packed into a .nup they come along (once; it then opens like any .nup).
+		if (game is { DumpRoot: { } root, HasExtras: true } && !_askedPack.Contains(root))
+		{
+			_askedPack.Add(root);
+			ShowChoice(game.Name, L.T("Este juego está en carpetas sueltas con su actualización y su DLC. Para jugarlo con ellos, NovaS lo ") +
+			    L.T("empaqueta una vez en un archivo .nup junto a la carpeta (tarda unos minutos y ocupa algo menos que la carpeta). ") +
+			    L.T("La carpeta original no se toca."), new()
+			{
+				new(L.T("Empaquetar y jugar"), L.T("Recomendado: con la última actualización y el DLC."), () => "", _ => PackAndPlay(game, root)),
+				new(L.T("Jugar sin actualización"), L.T("Abre el juego base tal cual, ahora."), () => "", _ => LaunchSwitch(game)),
+				new(L.T("Ahora no"), "", () => "", _ => _askedPack.Remove(root)),
+			});
 			return;
 		}
 		try
@@ -2646,20 +2728,69 @@ public sealed class MainWindow : Window
 		catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception)
 		{
 			_running = null;
-			ShowToast("No se pudo abrir NovaS: " + e.Message);
+			ShowToast(L.T("No se pudo abrir NovaS: ") + e.Message);
 		}
+	}
+
+	private readonly HashSet<string> _askedPack = new(StringComparer.OrdinalIgnoreCase);
+	private Process? _packingNup;
+
+	// Packs a loose dump into its .nup with the engine, showing the progress, then plays the .nup.
+	private async void PackAndPlay(SwitchGame game, string root)
+	{
+		var drive = new DriveInfo(System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(root))!);
+		if (drive.IsReady && drive.AvailableFreeSpace < game.Size)
+		{
+			_novas.Toast(L.F("No hay espacio: hacen falta unos {0:0} GB libres en {1}", game.Size / 1e9, drive.Name));
+			_askedPack.Remove(root);
+			return;
+		}
+		try
+		{
+			_packingNup = SwitchGames.PackNup(root);
+		}
+		catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception)
+		{
+			_novas.Toast(L.T("No se pudo empaquetar: ") + e.Message);
+			return;
+		}
+		_novas.Toast(L.F("Empaquetando {0}…", game.Name));
+		var process = _packingNup;
+		var nup = SwitchGames.NupOf(root);
+		_ = process.StandardOutput.ReadToEndAsync();
+		_ = process.StandardError.ReadToEndAsync();
+		// The engine writes <name>.nup.part while it packs: its size against the dump's tells how far it is (the .nup
+		// is compressed, so this runs a little behind and jumps at the end).
+		var timer = new DispatcherTimer(TimeSpan.FromSeconds(2), DispatcherPriority.Background, (_, _) =>
+		{
+			var part = new FileInfo(nup + ".part");
+			if (part.Exists && game.Size > 0) _novas.Toast(L.F("Empaquetando {0}: {1} %", game.Name, Math.Min(99, part.Length * 100 / game.Size)));
+		});
+		timer.Start();
+		await process.WaitForExitAsync();
+		timer.Stop();
+		_packingNup = null;
+		var games = SwitchGames.Scan(SwitchRoots());
+		_novas.Load(games);
+		if (process.ExitCode != 0 || !File.Exists(nup))
+		{
+			_novas.Toast(L.T("No se pudo empaquetar el juego. Puedes jugarlo sin actualización."));
+			return;
+		}
+		_novas.Toast(L.F("{0} empaquetado", game.Name));
+		if (games.FirstOrDefault(g => g.Path.Equals(nup, StringComparison.OrdinalIgnoreCase)) is { } packed) LaunchSwitch(packed);
 	}
 
 	private async void AddSwitchFolder()
 	{
-		var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions { Title = "Carpeta con tus juegos de Switch 2 (.nsp, .xci, .nup o descifrados)", AllowMultiple = false });
+		var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions { Title = L.T("Carpeta con tus juegos de Switch 2 (.nsp, .xci, .nup o descifrados)"), AllowMultiple = false });
 		var path    = folders.FirstOrDefault()?.TryGetLocalPath();
 		if (path is null) return;
 		if (!_store.SwitchDirs.Contains(path, StringComparer.OrdinalIgnoreCase)) _store.SwitchDirs.Add(path);
 		_store.Save();
 		var games = SwitchGames.Scan(SwitchRoots());
 		_novas.Load(games);
-		ShowToast(games.Any(g => g.Path.StartsWith(path, StringComparison.OrdinalIgnoreCase)) ? "Juegos de Switch 2 añadidos" : "No se encontraron juegos de Switch 2 en esa carpeta");
+		ShowToast(games.Any(g => g.Path.StartsWith(path, StringComparison.OrdinalIgnoreCase)) ? L.T("Juegos de Switch 2 añadidos") : L.T("No se encontraron juegos de Switch 2 en esa carpeta"));
 	}
 
 	private void GameExited()
@@ -2677,8 +2808,9 @@ public sealed class MainWindow : Window
 		_runningGame = null;
 		WindowState  = _shownState; // As the player had it before the game.
 		Activate();
-		Select(_index, force: true);
+		// Back on NovaS: its own list again, and no PS5 menu music (selecting the PS5 game would start it).
 		if (_tab == NovaSTab) _novas.Load(SwitchGames.Scan(SwitchRoots()));
+		else Select(_index, force: true);
 		if (closed is not null) AfterArchiveTest(closed);
 		if (crashed && closed is not null && _zone != Zone.Choice)
 			ShowToast($"{closed.Name} se cerró por un error. El motivo queda en _Logs\\{closed.TitleId}.txt");
@@ -2699,7 +2831,7 @@ public sealed class MainWindow : Window
 			var panel = new StackPanel { Margin = new Thickness(14), VerticalAlignment = VerticalAlignment.Bottom, Spacing = 6 };
 			panel.Children.Add(Text(Archives.IsArchive(package) ? Archives.Label(package) : "PKG", 16, FontWeight.Bold, Palette.AuroraA));
 			panel.Children.Add(new TextBlock { Text = game.Name, FontSize = 17, FontWeight = FontWeight.SemiBold, TextWrapping = TextWrapping.Wrap, MaxLines = 3, Foreground = Palette.Brush(Palette.Text) });
-			panel.Children.Add(new TextBlock { Text = _packageStatus.GetValueOrDefault(package, "Pendiente"), FontSize = 14, TextWrapping = TextWrapping.Wrap, MaxLines = 2, Foreground = Palette.Brush(Palette.Muted) });
+			panel.Children.Add(new TextBlock { Text = _packageStatus.GetValueOrDefault(package, L.T("Pendiente")), FontSize = 14, TextWrapping = TextWrapping.Wrap, MaxLines = 2, Foreground = Palette.Brush(Palette.Muted) });
 			var bar = ProgressLine(double.NaN);
 			ShowProgress(bar, _packageProgress.GetValueOrDefault(package));
 			panel.Children.Add(bar);
@@ -2827,12 +2959,31 @@ public sealed class MainWindow : Window
 	public static Control Logo(double size)
 	{
 		if (Edition.NovaSOnly) return NovaSMark(size); // NovaS on its own: its own mark.
-		var canvas = new Canvas { Width = 64, Height = 64 };
-		canvas.Children.Add(new Ellipse { Width = 56, Height = 56, Stroke = Palette.Aurora(), StrokeThickness = 4, [Canvas.LeftProperty] = 4, [Canvas.TopProperty] = 4 });
-		canvas.Children.Add(new Avalonia.Controls.Shapes.Path { Data = Geometry.Parse("M21,44 V20 L43,44 V20"), Stroke = Brushes.White, StrokeThickness = 5, StrokeLineCap = PenLineCap.Round, StrokeJoin = PenLineJoin.Round });
-		canvas.Children.Add(new Ellipse { Width = 10, Height = 10, Fill = Palette.Brush(Palette.AuroraA), [Canvas.LeftProperty] = 45, [Canvas.TopProperty] = 8 });
-		return new Viewbox { Width = size, Height = size, Child = canvas };
+		// Nova5's N in red, white and blue (the one of its X banner).
+		return new Image { Width = size, Height = size, Source = new Bitmap(Avalonia.Platform.AssetLoader.Open(new Uri("avares://Nova5/Assets/nova5-mark.png"))) };
 	}
+
+	// The window's icon (title bar and taskbar): NovaS's mark while the window is NovaS's console, Nova5's otherwise.
+	private static WindowIcon EditionIcon(bool novas) =>
+	    new(Avalonia.Platform.AssetLoader.Open(new Uri(novas ? "avares://Nova5/Assets/novas.ico" : "avares://Nova5/Assets/nova5.ico")));
+
+	// The main screen's work area width in window units (Screens is still empty while the window is being built).
+	private static double? WorkAreaWidth()
+	{
+		var area = new WorkArea();
+		if (!SystemParametersInfo(0x30 /* SPI_GETWORKAREA */, 0, ref area, 0) || area.Right <= area.Left) return null;
+		var dpi = GetDpiForSystem();
+		return (area.Right - area.Left) / (dpi > 0 ? dpi / 96.0 : 1);
+	}
+
+	[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+	private struct WorkArea { public int Left, Top, Right, Bottom; }
+
+	[System.Runtime.InteropServices.DllImport("user32.dll")]
+	private static extern bool SystemParametersInfo(uint action, uint param, ref WorkArea area, uint winIni);
+
+	[System.Runtime.InteropServices.DllImport("user32.dll")]
+	private static extern uint GetDpiForSystem();
 
 	// NovaS's mark (as in novas.ico): a rounded square, half red and half blue, with a white S.
 	public static Control NovaSMark(double size)
