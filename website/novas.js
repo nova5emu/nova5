@@ -260,6 +260,17 @@
 		video.play().then(() => video.closest('.tv').classList.add('playing')).catch(() => {});
 	});
 
+	// ---- Download counter: every file of every release, as GitHub counts them ----
+	fetch(`https://api.github.com/repos/${REPO}/releases?per_page=100`, { headers: { Accept: 'application/vnd.github+json' } })
+		.then(r => (r.ok ? r.json() : Promise.reject(r.status)))
+		.then(releases => {
+			const total = releases.flatMap(r => r.assets || []).reduce((sum, a) => sum + (a.download_count || 0), 0);
+			if (!total) return;
+			$$('[data-download-count]').forEach(b => { b.textContent = total.toLocaleString('es'); });
+			$$('[data-downloads]').forEach(s => { s.hidden = false; });
+		})
+		.catch(() => {});
+
 	// ---- Downloads: the latest release's files, version and size ----
 	fetch(`https://api.github.com/repos/${REPO}/releases/latest`, { headers: { Accept: 'application/vnd.github+json' } })
 		.then(r => (r.ok ? r.json() : Promise.reject(r.status)))

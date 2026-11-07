@@ -73,6 +73,9 @@ p { margin: 0; }
 .lede { margin-top: 18px; font-size: clamp(18px, 2vw, 21px); color: var(--muted); max-width: 62ch; }
 .hero-actions { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 30px; }
 .hero-meta { margin-top: 16px; font-size: 14px; color: var(--muted); }
+.downloads { display: inline-block; margin-left: 6px; padding: 2px 10px; border-radius: 99px; background: var(--white); border: 1px solid var(--line); color: var(--ink); font-weight: 700; }
+.downloads[hidden] { display: none; }
+.downloads b { color: var(--red-deep); }
 
 /* The console */
 .console {
