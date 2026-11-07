@@ -246,3 +246,7 @@ details p { color: var(--muted); margin: 0 0 20px; }
 .gallery figcaption { color: var(--muted); font-size: 15px; margin-top: 12px; }
 .changelog details ul { margin: 0 0 20px; }
 .changelog summary .muted { color: var(--muted); font-weight: 400; font-size: 14px; margin-left: 6px; }
+/* Reviews and comments (giscus) */
+.comments { max-width: 900px; }
+.comments-lede { color: var(--muted); margin: 8px 0 24px; }
+.comments .giscus { min-height: 160px; }

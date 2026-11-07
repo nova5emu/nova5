@@ -314,3 +314,8 @@ kbd {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* Reviews and comments (giscus) */
+.comments { max-width: 900px; }
+.comments-lede { color: var(--muted); margin: 8px 0 24px; }
+.comments .giscus { min-height: 160px; }
