@@ -26,6 +26,7 @@ internal static class Program
 		{
 			Environment.Exit(Play(args[play + 1]));
 		}
+		if (args.Contains("--novas")) Edition.NovaSOnly = true; // NovaS on its own without renaming the exe (tests, snapshots).
 		var snapshot = Array.IndexOf(args, "--snapshot");
 		if (snapshot >= 0 && snapshot + 1 < args.Length) MainWindow.SnapshotPath = Path.GetFullPath(args[snapshot + 1]);
 		// With --snapshot: the notes box or the settings page instead of the home screen.
@@ -34,6 +35,8 @@ internal static class Program
 		MainWindow.SnapshotGame     = args.Contains("--snapshot-game");
 		MainWindow.SnapshotTrophies = args.Contains("--snapshot-trophies");
 		MainWindow.SnapshotTrophyList = args.Contains("--snapshot-trophy-list");
+		MainWindow.SnapshotNovaS    = args.Contains("--snapshot-novas");
+		MainWindow.SnapshotNovaSSettings = args.Contains("--snapshot-novas-settings");
 		BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
 	}
 

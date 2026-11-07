@@ -8,11 +8,12 @@ namespace Nova5.Services;
 
 public sealed record UpdateInfo(Version Version, string Url, long Size, string? Sha256);
 
-// Checks the latest GitHub release of Nova5 and installs it with the release's own setup.
+// Checks the latest GitHub release of Nova5 (or of NovaS, for the NovaS-only edition) and installs it with the
+// release's own setup.
 public static class Updates
 {
-	private const string LatestRelease = "https://api.github.com/repos/nova5emu/nova5/releases/latest";
-	private const string SetupAsset    = "Nova5-Setup.exe";
+	private static string LatestRelease => $"https://api.github.com/repos/{Edition.Repository}/releases/latest";
+	private static string SetupAsset    => Edition.SetupAsset;
 
 	public static Version Current { get; } =
 	    Assembly.GetEntryAssembly()?.GetName().Version is { } v ? new Version(v.Major, v.Minor, Math.Max(v.Build, 0)) : new Version(0, 0, 0);
@@ -56,7 +57,7 @@ public static class Updates
 	// Downloads the setup to %TEMP% and checks its size and, when GitHub publishes it, its SHA-256.
 	public static async Task<string> DownloadAsync(UpdateInfo update, IProgress<double> progress)
 	{
-		var path = Path.Combine(Path.GetTempPath(), $"Nova5-Setup-{update.Version}.exe");
+		var path = Path.Combine(Path.GetTempPath(), $"{Edition.Name}-Setup-{update.Version}.exe");
 		using (var response = await Http.GetAsync(update.Url, HttpCompletionOption.ResponseHeadersRead))
 		{
 			response.EnsureSuccessStatusCode();

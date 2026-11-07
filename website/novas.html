@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NovaS · Emulador de Switch 2 para PC</title>
+<meta name="description" content="NovaS es un emulador de Switch 2 gratuito y de código abierto para Windows, con lanzador de estilo consola, mando, generación de fotogramas FSR3 y resolución 4K.">
+<link rel="canonical" href="https://nova5emu.github.io/nova5/novas.html">
+<link rel="icon" href="assets/novas/novas.svg" type="image/svg+xml">
+<meta property="og:title" content="NovaS · Emulador de Switch 2 para PC">
+<meta property="og:description" content="Gratis y de código abierto. Zelda: Ocarina of Time a 60 FPS reales y hasta 120 con FSR3.">
+<meta property="og:image" content="https://nova5emu.github.io/nova5/assets/novas/zelda-poster.jpg">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#F2F3F5">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@400;500;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="novas.css?v=20261107a">
+</head>
+<body>
+<a class="skip" href="#principal">Saltar al contenido</a>
+
+<header class="bar">
+  <a class="mark" href="#inicio" aria-label="NovaS, inicio">
+    <img src="assets/novas/novas.svg" width="36" height="36" alt="">
+    <span>NovaS</span>
+  </a>
+  <nav class="bar-links" aria-label="Secciones">
+    <a href="#video">Vídeo</a>
+    <a href="#empezar">Cómo empezar</a>
+    <a href="#rendimiento">Rendimiento</a>
+    <a href="#juegos">Juegos</a>
+    <a href="#preguntas">Preguntas</a>
+    <a href="index.html">Nova5 (PS5)</a>
+  </nav>
+  <a class="pill pill-red" data-download href="https://github.com/nova5emu/novas/releases/latest">Descargar</a>
+</header>
+
+<main id="principal">
+
+<section class="hero" id="inicio">
+  <div class="hero-copy">
+    <h1>Tus juegos de Switch 2, en tu PC.</h1>
+    <p class="lede">NovaS es un emulador de Switch 2 gratuito y de código abierto para Windows. Lo abres, eliges tus juegos y juegas con mando, con su propio menú de consola.</p>
+    <div class="hero-actions">
+      <a class="pill pill-red big" data-download href="https://github.com/nova5emu/novas/releases/latest">
+        <svg aria-hidden="true" viewBox="0 0 24 24" width="22" height="22"><path d="M12 3v12m0 0-5-5m5 5 5-5M4 20h16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Descargar NovaS
+      </a>
+      <a class="pill pill-line big" href="#video">Ver Zelda en NovaS</a>
+    </div>
+    <p class="hero-meta"><span data-version>Versión 0.1.0</span>, para Windows 10 y 11 de 64 bits. <span data-size></span></p>
+  </div>
+
+  <!-- The console: a red and a blue controller around a screen that shows NovaS's own home screen. -->
+  <div class="console" id="consola">
+    <div class="joy joy-left" aria-hidden="true">
+      <span class="joy-minus"></span>
+      <button class="stick" type="button" tabindex="-1" data-pad="left" title="Izquierda"></button>
+      <div class="dpad">
+        <button type="button" tabindex="-1" data-pad="up" title="Arriba"></button>
+        <button type="button" tabindex="-1" data-pad="left" title="Izquierda"></button>
+        <button type="button" tabindex="-1" data-pad="right" title="Derecha"></button>
+        <button type="button" tabindex="-1" data-pad="down" title="Abajo"></button>
+      </div>
+      <span class="joy-cap"></span>
+    </div>
+
+    <div class="screen" tabindex="0" role="application" aria-roledescription="menú de consola"
+         aria-label="Vista previa del menú de NovaS. Usa las flechas para elegir un juego y Enter para abrirlo.">
+      <div class="home" data-home>
+        <div class="home-top">
+          <div class="home-user"><span class="avatar" aria-hidden="true"></span><b>Nova<i>S</i></b></div>
+          <div class="home-status"><span data-padstate>Mando conectado</span><time data-clock>12:00</time></div>
+        </div>
+        <p class="home-name" data-name aria-live="polite">The Legend of Zelda: Ocarina of Time</p>
+        <p class="home-detail" data-detail>Probado · 60 FPS reales, hasta 120 con FSR3</p>
+        <div class="home-row-wrap"><ul class="home-row" data-row></ul></div>
+        <ul class="home-buttons" data-buttons>
+          <li><button type="button" tabindex="-1" data-action="carpeta"><svg viewBox="0 0 24 24"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6H9l2 2h8.5A1.5 1.5 0 0 1 21 9.5v8A1.5 1.5 0 0 1 19.5 19h-15A1.5 1.5 0 0 1 3 17.5z"/></svg></button><span>Añadir carpeta</span></li>
+          <li><button type="button" tabindex="-1" data-action="claves"><svg viewBox="0 0 24 24"><circle cx="8" cy="12" r="4"/><path d="M12 12h9m-3 0v3m-3-3v2"/></svg></button><span>Claves</span></li>
+          <li><button type="button" tabindex="-1" data-action="firmware"><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 3v3m3-3v3m3-3v3M9 18v3m3-3v3m3-3v3M3 9h3m-3 3h3m-3 3h3m12-6h3m-3 3h3m-3 3h3"/></svg></button><span>Firmware</span></li>
+          <li><button type="button" tabindex="-1" data-action="ajustes"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.8v2.6m0 13.2v2.6M4.2 7.5l2.3 1.3m11 6.4 2.3 1.3M4.2 16.5l2.3-1.3m11-6.4 2.3-1.3"/></svg></button><span>Ajustes</span></li>
+          <li><button type="button" tabindex="-1" data-action="descargar"><svg viewBox="0 0 24 24"><path d="M12 4v11m0 0-4.5-4.5M12 15l4.5-4.5M5 20h14"/></svg></button><span>Descargar</span></li>
+        </ul>
+        <div class="home-foot">
+          <span>Juegos de Switch 2</span>
+          <span class="hints"><span><kbd>A</kbd> Abrir</span><span><kbd>B</kbd> Volver</span></span>
+        </div>
+      </div>
+      <div class="boot" data-boot hidden>
+        <img data-boot-cover alt="">
+        <div>
+          <p class="boot-name" data-boot-name></p>
+          <p class="boot-state" data-boot-state></p>
+          <p class="boot-note" data-boot-note></p>
+          <p class="boot-back"><kbd>B</kbd> Volver al menú</p>
+        </div>
+      </div>
+      <p class="toast" data-toast role="status"></p>
+    </div>
+
+    <div class="joy joy-right" aria-hidden="true">
+      <span class="joy-plus"></span>
+      <div class="abxy">
+        <button type="button" tabindex="-1" data-pad="x" title="X">X</button>
+        <button type="button" tabindex="-1" data-pad="y" title="Y: ajustes">Y</button>
+        <button type="button" tabindex="-1" data-pad="a" title="A: abrir">A</button>
+        <button type="button" tabindex="-1" data-pad="b" title="B: volver">B</button>
+      </div>
+      <button class="stick" type="button" tabindex="-1" data-pad="right" title="Derecha"></button>
+      <span class="joy-home"></span>
+    </div>
+  </div>
+  <p class="console-help">Pruébalo: haz clic en la pantalla y muévete con las flechas, o pulsa los botones de los mandos.
+    <button class="sound" type="button" data-sound aria-pressed="false">Sonido: no</button></p>
+</section>
+
+<section class="band" id="video">
+  <div class="wrap split">
+    <div class="split-text">
+      <h2>Zelda: Ocarina of Time, grabado en NovaS</h2>
+      <p>Una partida real en ventana, en un PC con RTX 4070 SUPER e i9-14900KF. El contador del título marca entre 105 y 121 imágenes por segundo en pantalla con la generación de fotogramas FSR3, y unas 60 reales del juego.</p>
+      <p class="small">El vídeo no tiene sonido para que puedas verlo aquí sin molestar.</p>
+    </div>
+    <figure class="tv">
+      <video data-video muted loop playsinline preload="none" poster="assets/novas/zelda-poster.jpg" aria-label="Gameplay de Zelda: Ocarina of Time en NovaS">
+        <source src="assets/novas/zelda-novas.mp4" type="video/mp4">
+      </video>
+      <button class="play" type="button" data-play aria-label="Reproducir el vídeo">
+        <svg viewBox="0 0 24 24" width="34" height="34" aria-hidden="true"><path d="M8 5.5v13l11-6.5z" fill="currentColor"/></svg>
+      </button>
+    </figure>
+  </div>
+</section>
+
+<section class="wrap section" id="empezar">
+  <h2>Cómo empezar</h2>
+  <p class="section-lede">Cuatro pasos, todos desde el menú de NovaS. NovaS no trae juegos, claves ni firmware: usa los de tu propia consola.</p>
+  <ol class="steps">
+    <li>
+      <span class="step-key" aria-hidden="true">1</span>
+      <h3>Descarga e instala</h3>
+      <p>Abre <b>NovaS-Setup.exe</b> y sigue el asistente. No pide permisos de administrador. Si prefieres no instalar nada, usa la versión portátil en .zip.</p>
+    </li>
+    <li>
+      <span class="step-key" aria-hidden="true">2</span>
+      <h3>Añade tus claves</h3>
+      <p>Pulsa <b>Claves</b> y elige el <b>prod.keys</b> de tu consola (y <b>title.keys</b> si lo tienes). Hacen falta para los .nsp y .xci; los juegos descifrados y los .nup arrancan sin ellas.</p>
+    </li>
+    <li>
+      <span class="step-key" aria-hidden="true">3</span>
+      <h3>Instala el firmware</h3>
+      <p>Pulsa <b>Firmware</b> y elige el .zip de tu consola o cualquier .nca de su carpeta. Es opcional, pero algunos juegos lo usan para fuentes, teclado y menús.</p>
+    </li>
+    <li>
+      <span class="step-key" aria-hidden="true">4</span>
+      <h3>Añade tus juegos</h3>
+      <p>Pulsa <b>Añadir carpeta</b> y elige dónde guardas tus .nsp, .xci, .nup o juegos descifrados. Aparecen en la fila de inicio: elige uno y pulsa A.</p>
+    </li>
+  </ol>
+</section>
+
+<section class="band band-ink" id="rendimiento">
+  <div class="wrap">
+    <h2>Lo que medimos en Zelda</h2>
+    <p class="section-lede">Imágenes por segundo reales, medidas con el banco automático de NovaS en tres sitios del Bosque Kokiri. Cambia los ajustes y mira cómo cambian.</p>
+    <div class="tuner">
+      <div class="tuner-controls">
+        <fieldset>
+          <legend>Resolución</legend>
+          <div class="seg" role="radiogroup">
+            <label><input type="radio" name="res" value="1x" checked><span>Nativa 1440p</span></label>
+            <label><input type="radio" name="res" value="4k"><span>4K</span></label>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>Generación de fotogramas FSR3</legend>
+          <div class="seg" role="radiogroup">
+            <label><input type="radio" name="fg" value="no" checked><span>No</span></label>
+            <label><input type="radio" name="fg" value="si"><span>Sí</span></label>
+          </div>
+        </fieldset>
+      </div>
+      <div class="meters" data-meters aria-live="polite">
+        <div class="meter"><span class="meter-place">Tienda</span><b data-m="tienda">60</b><span class="meter-bar"><i></i></span></div>
+        <div class="meter"><span class="meter-place">Caminando</span><b data-m="camino">52</b><span class="meter-bar"><i></i></span></div>
+        <div class="meter"><span class="meter-place">Pueblo</span><b data-m="pueblo">54–57</b><span class="meter-bar"><i></i></span></div>
+      </div>
+      <p class="tuner-note" data-tuner-note>FPS reales del juego. Con FSR3 se muestran más imágenes en pantalla de las que calcula el juego.</p>
+    </div>
+  </div>
+</section>
+
+<section class="wrap section" id="juegos">
+  <div class="games-head">
+    <h2>Juegos</h2>
+    <div class="filters" role="group" aria-label="Filtrar juegos">
+      <button type="button" class="chip on" data-filter="todos" aria-pressed="true">Todos</button>
+      <button type="button" class="chip" data-filter="probado" aria-pressed="false">Probados</button>
+      <button type="button" class="chip" data-filter="arreglos" aria-pressed="false">Con arreglos</button>
+    </div>
+  </div>
+  <p class="section-lede">La emulación de Switch 2 está empezando. Solo marcamos como probado lo que hemos jugado de verdad; el resto puede arrancar o no.</p>
+  <ul class="shelf" data-shelf></ul>
+</section>
+
+<section class="wrap section" id="requisitos">
+  <h2>Qué necesitas</h2>
+  <dl class="reqs">
+    <div><dt>Sistema</dt><dd>Windows 10 u 11 de 64 bits</dd></div>
+    <div><dt>Tarjeta gráfica</dt><dd>Con Vulkan 1.3 y controladores al día. Recomendada: NVIDIA RTX 3060 o AMD RX 6600 o superior</dd></div>
+    <div><dt>Procesador</dt><dd>De 6 núcleos o más, de los últimos años. Cuanto más rápido, mejor: es lo que más limita hoy</dd></div>
+    <div><dt>Memoria</dt><dd>16 GB de RAM, mejor 32 GB</dd></div>
+    <div><dt>Tus archivos</dt><dd>Claves, firmware y juegos sacados de tu propia consola</dd></div>
+  </dl>
+</section>
+
+<section class="wrap section" id="preguntas">
+  <h2>Preguntas</h2>
+  <div class="faq">
+    <details>
+      <summary>¿Cuesta algo?</summary>
+      <p>No. NovaS es gratis y de código abierto (GPL-3.0). Si quieres apoyar el proyecto, puedes <a href="https://ko-fi.com/nova5emu" target="_blank" rel="noopener">donar en Ko-fi</a>.</p>
+    </details>
+    <details>
+      <summary>¿Trae juegos, claves o firmware?</summary>
+      <p>No, y no los vamos a compartir. Tienes que sacarlos de tu propia consola y de juegos que tengas.</p>
+    </details>
+    <details>
+      <summary>¿Qué mando puedo usar?</summary>
+      <p>Cualquiera que reconozca Windows: Xbox, DualSense, Pro Controller u otros. Todo el menú se maneja con el mando, y también con teclado y ratón.</p>
+    </details>
+    <details>
+      <summary>Un juego no arranca o va lento. ¿Qué hago?</summary>
+      <p>Comprueba que instalaste tus claves y el firmware. En <b>Ajustes</b> prueba "Precisión de la GPU: Normal" y baja la resolución a la nativa. Si sigue fallando, avísanos en <a href="https://x.com/nova5emu" target="_blank" rel="noopener">X</a> con el nombre del juego.</p>
+    </details>
+    <details>
+      <summary>¿Qué relación tiene con Nova5?</summary>
+      <p>Son del mismo equipo. <a href="index.html">Nova5</a> es el emulador de PS5 y ya incluye NovaS en una pestaña. Esta descarga es NovaS solo, para quien únicamente quiere Switch 2.</p>
+    </details>
+    <details>
+      <summary>¿Se actualiza solo?</summary>
+      <p>Sí. Al abrirlo, NovaS mira si hay una versión nueva y te ofrece instalarla sin perder tus partidas ni ajustes.</p>
+    </details>
+  </div>
+</section>
+
+<section class="final">
+  <div class="wrap final-in">
+    <h2>Listo para jugar</h2>
+    <a class="pill pill-red big" data-download href="https://github.com/nova5emu/novas/releases/latest">Descargar NovaS para Windows</a>
+    <p class="final-alt"><a data-portable href="https://github.com/nova5emu/novas/releases/latest">Versión portátil (.zip)</a> · <a href="https://github.com/nova5emu/novas">Código fuente</a></p>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-in">
+    <p>NovaS es software libre bajo la licencia GPL-3.0. El código fuente completo y las licencias están en <a href="https://github.com/nova5emu/novas">GitHub</a>.</p>
+    <p>NovaS no está afiliado, respaldado ni patrocinado por Nintendo. Nintendo Switch 2 y los nombres y carátulas de los juegos son marcas y propiedad de sus respectivos dueños; las carátulas se muestran solo para identificar cada juego.</p>
+    <p><a href="index.html">Nova5</a> · <a href="nexo.html">Nexo</a> · <a href="https://x.com/nova5emu" target="_blank" rel="noopener">X</a> · <a href="https://ko-fi.com/nova5emu" target="_blank" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="novas.js?v=20261107a" defer></script>
+</body>
+</html>

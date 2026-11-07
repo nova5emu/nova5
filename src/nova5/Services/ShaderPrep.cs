@@ -34,6 +34,10 @@ public static partial class ShaderPrep
 		info.ArgumentList.Add((Environment.ProcessorCount >= 63 ? -1L : (1L << Environment.ProcessorCount) - 1).ToString());
 		if (quick) info.ArgumentList.Add("-Quick");
 		using var process = Process.Start(info) ?? throw new IOException("No se pudo iniciar la preparación de shaders");
+		// Everything the script says, for when it stops: logs\preparar-shaders-<title id>.txt next to Nova5.exe.
+		var logPath = Path.Combine(AppContext.BaseDirectory, "logs", $"preparar-shaders-{game.TitleId}.txt");
+		Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+		await using var log = new StreamWriter(logPath, append: false) { AutoFlush = true };
 		var errors = process.StandardError.ReadToEndAsync(cancel);
 		var ready  = false;
 		var last   = "";
@@ -42,6 +46,7 @@ public static partial class ShaderPrep
 		{
 			while (await process.StandardOutput.ReadLineAsync(cancel) is { } line)
 			{
+				await log.WriteLineAsync($"{DateTime.Now:HH:mm:ss} {line}");
 				if (line.Trim().Length > 0) last = line.Trim();
 				if (line.Contains("ready to play")) ready = true;
 				if (line.Contains("no shader bundles")) none = true;
@@ -60,12 +65,16 @@ public static partial class ShaderPrep
 		}
 		catch (OperationCanceledException)
 		{
+			await log.WriteLineAsync($"{DateTime.Now:HH:mm:ss} [Nova5] cancelado");
 			process.Kill(entireProcessTree: true);
 			throw;
 		}
+		var stderr = await errors;
+		await log.WriteLineAsync($"{DateTime.Now:HH:mm:ss} [Nova5] terminó con el código {process.ExitCode}");
+		if (stderr.Trim().Length > 0) await log.WriteLineAsync(stderr);
 		if (process.ExitCode != 0)
 		{
-			var reason = (await errors).Trim();
+			var reason = stderr.Trim();
 			throw new IOException(reason.Length > 0 ? reason.Split('\n')[^1].Trim() : last.Length > 0 ? last : $"la herramienta terminó con el código {process.ExitCode}");
 		}
 		progress.Report((1, true));

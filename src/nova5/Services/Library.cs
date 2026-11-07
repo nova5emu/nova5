@@ -5,7 +5,8 @@ namespace Nova5.Services;
 
 public sealed record Game(string TitleId, string Name, string Version, string Dir)
 {
-	// Set for a .pkg that is not installed yet; Dir then holds the package's sce_sys read ahead for its art.
+	// Set for a .pkg not installed yet, or a .rar/.zip/.7z not unpacked yet (Archives.IsArchive); Dir then holds its
+	// sce_sys read ahead for its art.
 	public string? Package { get; init; }
 
 	// Additional content (DLC): its param.json has no applicationCategoryType and no eboot.bin; TitleId is the game's.
@@ -33,6 +34,7 @@ public static class Library
 	{
 		var games    = new Dictionary<string, Game>(StringComparer.OrdinalIgnoreCase);
 		var packages = new List<string>();
+		var archives = new List<string>();
 		foreach (var root in roots.Where(Directory.Exists))
 		{
 			foreach (var dir in Candidates(root, 3))
@@ -41,7 +43,7 @@ public static class Library
 				try
 				{
 					foreach (var archive in Directory.GetFiles(dir, "*.zar"))
-						if (ReadArchive(archive) is { } packed)
+						if (GameArchive.RestoreMeta(archive) && ReadArchive(archive) is { } packed)
 							games.TryAdd(Path.GetFullPath(archive), packed);
 				}
 				catch (Exception e) when (e is UnauthorizedAccessException or IOException)
@@ -50,6 +52,8 @@ public static class Library
 				try
 				{
 					packages.AddRange(Directory.GetFiles(dir, "*.pkg"));
+					foreach (var pattern in Archives.Patterns)
+						archives.AddRange(Directory.GetFiles(dir, pattern).Where(Archives.IsFirstVolume));
 				}
 				catch (Exception e) when (e is UnauthorizedAccessException or IOException)
 				{
@@ -69,12 +73,23 @@ public static class Library
 			    ? new Game("", PackageName(package), "", Path.GetDirectoryName(package)!) { Package = package }
 			    : info with { Package = package, Name = info.IsAddon ? "DLC · " + info.Name : info.Name });
 		}
+		// Archives holding a game or a .pkg, not unpacked yet; their art when it can be read without unpacking.
+		foreach (var archive in archives.Distinct(StringComparer.OrdinalIgnoreCase))
+		{
+			if (Archives.IsExtracted(archive) || !Archives.HoldsGame(archive)) continue;
+			var info = Archives.ReadInfo(archive) is { } dir ? Read(dir, requireEboot: false) : null;
+			if (info is not null && !info.IsAddon && installed.Contains(info.TitleId)) continue;
+			pending.Add(info is null
+			    ? new Game("", CleanName(Archives.BaseName(archive)), "", Path.GetDirectoryName(archive)!) { Package = archive }
+			    : info with { Package = archive, Name = info.IsAddon ? "DLC · " + info.Name : info.Name });
+		}
 		return games.Values.OrderBy(g => g.Name, StringComparer.CurrentCultureIgnoreCase).Concat(pending).ToList();
 	}
 
-	private static string PackageName(string package)
+	private static string PackageName(string package) => CleanName(Path.GetFileNameWithoutExtension(package));
+
+	private static string CleanName(string name)
 	{
-		var name = Path.GetFileNameWithoutExtension(package);
 		name = Regex.Replace(name, @"^\[[^\]]*\]-?", "");                      // Release group tags such as [Group]-
 		name = Regex.Replace(name, @"^[A-Z]{2}\d{4}-[A-Z]{4}\d{5}_\d{2}-", ""); // Content ID prefix
 		return name.Replace('_', ' ').Replace('.', ' ').Trim();

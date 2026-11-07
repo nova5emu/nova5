@@ -8,6 +8,7 @@ public sealed class Store
 	public Dictionary<string, double>   PlaySeconds { get; set; } = new();
 	public Dictionary<string, DateTime> LastPlayed  { get; set; } = new();
 	public List<string>                 ExtraDirs   { get; set; } = new();
+	public List<string>                 SwitchDirs  { get; set; } = new(); // NovaS: folders with Switch 2 games.
 	public bool                         Music       { get; set; } = true;
 	public double                       MusicVolume { get; set; } = 0.6;
 	// "avisar" shows an update and waits for the player, "auto" installs it at startup, "no" never checks.

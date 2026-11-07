@@ -1,0 +1,51 @@
+﻿NovaS - emulador de Switch 2 para PC
+====================================
+
+NovaS es un emulador de Switch 2 gratuito y de código abierto para Windows,
+con un menú propio de estilo consola que se maneja entero con mando.
+
+Requisitos
+----------
+- Windows 10 u 11 de 64 bits.
+- Tarjeta gráfica con Vulkan 1.3 y controladores actualizados
+  (recomendadas NVIDIA RTX 3060 o AMD RX 6600 o superiores).
+- Procesador moderno de 6 núcleos o más y 16 GB de RAM.
+- Las claves (prod.keys), el firmware y los juegos de TU propia consola.
+  NovaS no incluye juegos, firmware ni claves de ninguna consola.
+
+Primeros pasos
+--------------
+1. Abre NovaS desde el menú Inicio o el acceso directo del escritorio.
+2. Pulsa "Claves" y elige el prod.keys de tu consola (y title.keys si lo
+   tienes). Los .nup y los juegos descifrados no las necesitan.
+3. Pulsa "Firmware" y elige el .zip del firmware de tu consola o cualquier
+   .nca de su carpeta (recomendado).
+4. Pulsa "Añadir carpeta" y elige dónde tienes tus .nsp, .xci o .nup.
+5. Elige un juego y pulsa A (o Enter).
+
+En "Ajustes NovaS" (botón Y) tienes la resolución, la generación de
+fotogramas FSR3, la precisión de la GPU y opciones para algunos juegos.
+
+Controles del menú
+------------------
+Mando: cruceta o stick para moverte, A aceptar, B atrás, Y ajustes.
+Teclado: flechas, Enter, Esc y F11 para pantalla completa.
+
+Estado del proyecto
+-------------------
+La emulación de Switch 2 está empezando. Algunos juegos arrancan y otros
+todavía no; el rendimiento depende mucho del procesador. NovaS se actualiza
+solo: al abrirlo te avisa si hay una versión nueva.
+
+Licencia y código fuente
+------------------------
+El motor de NovaS se distribuye bajo la Licencia Pública General de GNU,
+versión 3 (GPL-3.0); ver LICENSE.txt. El menú (NovaS.exe) es el lanzador
+de Nova5, bajo GPL-2.0 o posterior. Los componentes de terceros conservan
+sus propias licencias (carpeta licenses).
+
+Código fuente: https://github.com/nova5emu/novas
+Web oficial: https://nova5emu.github.io/nova5/novas.html
+
+NovaS no está afiliado, respaldado ni patrocinado por Nintendo.
+"Nintendo Switch 2" es una marca de su respectivo dueño.

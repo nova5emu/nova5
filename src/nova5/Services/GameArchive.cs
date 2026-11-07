@@ -11,6 +11,30 @@ public static class GameArchive
 
 	public static string Meta(string archive) => archive + ".meta";
 
+	// A .zar without its "<file>.zar.meta" (packed by hand with zarchive.exe, or the folder lost): its sce_sys is taken out
+	// of the archive again (a few MB, a second or two), so the library shows the game. False when that fails.
+	public static bool RestoreMeta(string archive)
+	{
+		if (File.Exists(Path.Combine(Meta(archive), "sce_sys", "param.json"))) return true;
+		if (!File.Exists(Tool)) return false;
+		try
+		{
+			var info = new ProcessStartInfo(Tool) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+			info.ArgumentList.Add(archive);
+			info.ArgumentList.Add(Meta(archive));
+			info.ArgumentList.Add("/sce_sys");
+			using var process = Process.Start(info);
+			if (process is null) return false;
+			process.StandardOutput.ReadToEnd();
+			if (!process.WaitForExit(120_000)) process.Kill(entireProcessTree: true);
+		}
+		catch (Exception e) when (e is IOException or System.ComponentModel.Win32Exception or InvalidOperationException)
+		{
+			return false;
+		}
+		return File.Exists(Path.Combine(Meta(archive), "sce_sys", "param.json"));
+	}
+
 	public static string OutputFor(Game game) =>
 	    Path.Combine(Path.GetDirectoryName(Path.GetFullPath(game.Dir).TrimEnd(Path.DirectorySeparatorChar))!, $"{game.TitleId}-{game.Version}.zar");
 

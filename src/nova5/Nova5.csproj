@@ -34,6 +34,8 @@
     <PackageReference Include="Avalonia.Desktop" Version="12.1.4" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.4" />
     <PackageReference Include="ppy.SDL3-CS" Version="2026.1002.1" />
+    <!-- Unpacks .rar, .zip and .7z games (Services/Archives.cs). MIT. -->
+    <PackageReference Include="SharpCompress" Version="0.50.8" />
   </ItemGroup>
 
   <!-- SkiaSharp and HarfBuzz ship 100 MB of native symbols that the launcher does not need. -->
