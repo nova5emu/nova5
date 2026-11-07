@@ -322,6 +322,7 @@ public:
 		std::lock_guard lock(m_mutex);
 		HoldTimer       hold {LiveCounters::BackingHoldZeroUs};
 		BackingWriteFence fence(*this);
+		Common::MemoryWriteWatch::Notify("ZeroRange", reinterpret_cast<uint64_t>(m_backing_base + backing_offset), size);
 		std::memset(m_backing_base + backing_offset, 0, size);
 		return true;
 	}
@@ -334,6 +335,7 @@ public:
 		const auto* source = static_cast<const uint8_t*>(data);
 		return TryTransferBacking<true>(vaddr, size,
 		                          [source](uint8_t* backing, uint64_t data_offset, size_t bytes) {
+			                          Common::MemoryWriteWatch::Notify("TryWriteBacking", reinterpret_cast<uint64_t>(backing), bytes);
 			                          std::memcpy(backing, source + data_offset, bytes);
 			                          FreshMemory::MarkBacking(reinterpret_cast<uint64_t>(backing), bytes);
 		                          });
@@ -360,6 +362,7 @@ public:
 			return false;
 		}
 		DataWriteFence fence(*this, begin, begin + size, m_cpu_write_pages);
+		Common::MemoryWriteWatch::Notify("TryWriteCpuBacking", reinterpret_cast<uint64_t>(m_backing_base + begin), size);
 		std::memcpy(m_backing_base + begin, data, size);
 		FreshMemory::MarkBacking(reinterpret_cast<uint64_t>(m_backing_base + begin), size);
 		return true;
@@ -404,7 +407,7 @@ public:
 		return ok;
 	}
 
-	bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+	bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size, bool probe_only = false) {
 		if (kyty_local_backing_read_mode.load(std::memory_order_relaxed) != 0 && IsAvailable() &&
 		    data && size && size <= 0x10000 && UINT64_MAX - vaddr >= size) {
 			BackingReadTransaction read(*this);
@@ -428,7 +431,7 @@ public:
 			// The transaction is released here, before a spanning transfer or a
 			// writer-held mutex can wait.
 		}
-		return TryReadBacking(vaddr, data, size);
+		return !probe_only && TryReadBacking(vaddr, data, size);
 	}
 
 	// The backing bytes of [vaddr, vaddr + size) when one mapping covers the range, else null.
@@ -1432,6 +1435,8 @@ private:
 
 	void* ReplacePlaceholderView(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                             VirtualMemory::Mode mode, FailureReason* failure_reason) {
+		Common::MemoryWriteWatch::Notify("ReplacePlaceholderView", vaddr, size, true, backing_offset);
+		Common::MemoryWriteWatch::Notify("MapBackingAlias", GetBackingBase() + backing_offset, size);
 		const DWORD map_protect =
 		    mode == VirtualMemory::Mode::NoAccess ? PAGE_READWRITE : GetProtect(mode);
 		void* ptr = nullptr;
@@ -1717,8 +1722,8 @@ public:
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
-	bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
-		return m_backing->TryReadBackingToHost(vaddr, data, size);
+	bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size, bool probe_only = false) {
+		return m_backing->TryReadBackingToHost(vaddr, data, size, probe_only);
 	}
 
 	const uint8_t* BackingPointer(uint64_t vaddr, uint64_t size) { return m_backing->BackingPointer(vaddr, size); }
@@ -2030,6 +2035,7 @@ public:
 	}
 
 	bool UnmapBacking(uint64_t vaddr, uint64_t size) {
+		Common::MemoryWriteWatch::Notify("UnmapBacking", vaddr, size, true);
 		bool unmapped = false;
 		{
 			LiveTrace::SlowOsCallScope slow(LiveTrace::OsUnmapBacking, vaddr, size);
@@ -2380,6 +2386,7 @@ private:
 	// A guest mapping's protection; on Windows with KYTY_READ_GUARD, a view's no access as a read guard
 	// (kyty_local_read_guard: private memory is no section's), but for the pages read back lately (NoteRead).
 	bool ProtectView(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode, MappingType type, bool trackers) {
+		Common::MemoryWriteWatch::ProtectionScope diagnostic_watch(vaddr, size);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (mode == VirtualMemory::Mode::NoAccess && type == MappingType::Backing &&
 		    kyty_local_read_guard.load(std::memory_order_relaxed) != 0) {
@@ -2843,7 +2850,15 @@ private:
 		}
 		for (; it != m_free.end() && it->first < search_end; ++it) {
 			const auto& [base, range_size] = *it;
-			const auto candidate           = AlignUp(std::max(base, search_start), alignment);
+			auto candidate                 = AlignUp(std::max(base, search_start), alignment);
+			// Ordinary hinted/hintless allocations cannot borrow AMM's aperture,
+			// even after an AMM unmap returns a hole to m_free. Fixed mappings keep
+			// their existing semantics and are how AMM commits into this aperture.
+			if (g_amm_address_layout.isolated &&
+			    VirtualRangesOverlap(candidate, size, g_amm_address_layout.begin,
+			                         g_amm_address_layout.end - g_amm_address_layout.begin)) {
+				candidate = AlignUp(g_amm_address_layout.end, alignment);
+			}
 			if (candidate < search_end && size <= search_end - candidate &&
 			    GuestFreeRangeContains(base, range_size, candidate, size)) {
 				return candidate;

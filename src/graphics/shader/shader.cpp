@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -100,6 +101,10 @@ bool ShaderLookupMappedData(uint64_t addr, ShaderMappedData* out) {
 }
 
 static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
+	if (DrawPrep::Speculative() && g_shader_map == nullptr) {
+		DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+		return {};
+	}
 	EXIT_IF(g_shader_map == nullptr);
 
 	// The thread's earlier lookups by address, two per set, the latest first: a frame's draws and
@@ -125,6 +130,10 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 		return iter->second;
 	}
 
+	if (DrawPrep::Speculative()) {
+		DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+		return {};
+	}
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
 }
 
@@ -132,6 +141,10 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 // covers whole pages, so bytes that only share a page with GPU-written data come from the backing (a
 // load would fault on the page and wait for its download). GPU-written bytes are loaded.
 static void ReadShaderMemory(uint64_t address, void* out, size_t bytes) {
+	if (DrawPrep::Speculative()) {
+		(void)DrawPrep::ReadMemory(address, out, bytes);
+		return;
+	}
 	if (!LibKernel::Memory::TryReadGpuCleanBackingOnWatchedPage(address, out, bytes))
 		std::memcpy(out, reinterpret_cast<const void*>(address), bytes);
 }
@@ -168,6 +181,15 @@ static uint64_t HashShaderCode(std::span<const uint32_t> code) {
 // (any registration moves the generation) and again at every 64th use, which also catches code rewritten in
 // place: hashing ~2 KiB of code at every draw and dispatch was ~1.4% of the render thread.
 static uint64_t ShaderCodeHash(uint64_t shader_addr, std::span<const uint32_t> code) {
+	if (DrawPrep::Speculative() || DrawPrep::t_fresh_shader_hash) {
+		const auto hash = GetDeclaredShaderHash(shader_addr);
+		if (hash != 0) return hash;
+		if (DrawPrep::Speculative()) {
+			DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+			return 0; // Never dereference/hash guest code outside the certificate.
+		}
+		return HashShaderCode(code);
+	}
 	struct Entry {
 		uint64_t addr = 0, generation = UINT64_MAX, hash = 0;
 		uint32_t uses = 0;
@@ -225,6 +247,7 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	KYTY_PROFILER_FUNCTION();
 
 	info.buffers_num = 0;
+	if (DrawPrep::SpeculativeFailed()) return;
 
 	for (int ri = 0; ri < info.resources_num; ri++) {
 		const auto& r = info.resources[ri];
@@ -243,6 +266,11 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 				uint64_t offset2 = b.addr - base;
 
 				if (offset1 < stride && offset2 < stride) {
+					if (DrawPrep::Speculative() && (b.num_records != r.NumRecords() ||
+					    b.attr_num >= ShaderVertexInputBuffer::ATTR_MAX)) {
+						DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+						return;
+					}
 					EXIT_NOT_IMPLEMENTED(b.num_records != r.NumRecords());
 					b.addr = base;
 					EXIT_NOT_IMPLEMENTED(b.attr_num >= ShaderVertexInputBuffer::ATTR_MAX);
@@ -297,13 +325,26 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	for (uint32_t i = 0; i < num_input_semantics; i++) {
 		const auto& in = input_semantics[i];
 
+		if (DrawPrep::Speculative() && (in.static_vb_index == 1 || in.static_attribute == 1)) {
+			DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+			return;
+		}
 		EXIT_NOT_IMPLEMENTED(in.static_vb_index == 1 || in.static_attribute == 1);
 
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 		bool backing = false;
-		const auto attribute = ShaderReadMetadataWords<1>(attrib + in.semantic, clean_backing,
-		    LibKernel::Memory::TryReadGpuCleanBackingToHost, backing)[0];
+		uint32_t attribute = 0;
+		if (DrawPrep::Speculative()) {
+			if (!DrawPrep::ReadMemory(reinterpret_cast<uint64_t>(attrib + in.semantic), &attribute, 4)) {
+				DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+				return;
+			}
+			backing = true;
+		} else {
+			attribute = ShaderReadMetadataWords<1>(attrib + in.semantic, clean_backing,
+			    LibKernel::Memory::TryReadGpuCleanBackingToHost, backing)[0];
+		}
 		note("attribute", attrib + in.semantic, 4, backing);
 
 		if (Config::GraphicsDebugDumpEnabled()) {
@@ -327,12 +368,23 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			}
 		}
 
+		if (DrawPrep::Speculative() && (index >= ShaderVertexInputInfo::RES_MAX ||
+		    info.resources_num >= ShaderVertexInputInfo::RES_MAX)) {
+			DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+			return;
+		}
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
 
 		const auto* sharp = &buffer[index * 4];
 		EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
-		const auto words = ShaderReadMetadataWords<4>(sharp, clean_backing,
-		    LibKernel::Memory::TryReadGpuCleanBackingToHost, backing);
+		std::array<uint32_t, 4> words {};
+		if (DrawPrep::Speculative()) {
+			if (!DrawPrep::ReadMemory(reinterpret_cast<uint64_t>(sharp), words.data(), sizeof(words))) return;
+			backing = true;
+		} else {
+			words = ShaderReadMetadataWords<4>(sharp, clean_backing,
+			    LibKernel::Memory::TryReadGpuCleanBackingToHost, backing);
+		}
 		note("buffer", sharp, 16, backing);
 
 		auto& r           = info.resources[info.resources_num];
@@ -508,7 +560,13 @@ static void ShaderGetStaticInputInfoPS(
 		ps_info.ps_perspective_center_vgpr = (active_inputs & 0x00000001u) != 0 ? 2u : 0u;
 	}
 	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num && i < 32u; i++) {
-		const auto& semantic = data.input_semantics[i];
+		ShaderSemantic semantic {};
+		if (DrawPrep::Speculative()) {
+			if (!DrawPrep::ReadMemory(reinterpret_cast<uint64_t>(data.input_semantics + i),
+			                          &semantic, sizeof(semantic))) return;
+		} else {
+			semantic = data.input_semantics[i];
+		}
 		if (semantic.is_custom != 0 && semantic.is_f16 == 0) {
 			ps_info.custom_interpolation_mask |= 1u << i;
 		}
@@ -600,6 +658,8 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.scratch_size_dwords, mesh.input_primitive,
 		                       mesh.primitives_per_group, mesh.vertices_per_group,
 		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex});
+		// A distinct entry ABI; keep existing ordinary NGG cache keys unchanged.
+		if (mesh.fast_launch) key.push_back(0x464c0001u);
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {
@@ -683,21 +743,34 @@ void PrepareProgramInto(const HW::VertexShaderInfo& regs, const HW::Context& con
                         ShaderParams& params) {
 	const auto& sh   = context.GetShaderRegisters();
 	const auto  data = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
+	if (DrawPrep::SpeculativeFailed()) return;
 	const bool merged = (context.GetShaderStages() & 0x20u) != 0;
 	// GS_EN controls amplification. A native NGG program still needs a workgroup
 	// and the NGG entry ABI when GS_EN is clear (same classification as Jetsku).
 	const bool native_ngg = !merged && data.type == Prospero::ShaderBinaryType::kGs &&
 	                        regs.gs_regs.rsrc2.lds_size != 0;
+	// This first worker port handles the ordinary vertex ABI. Mesh/GS retains
+	// its existing preparation at commit (including host-limit diagnostics).
+	if (DrawPrep::Speculative() && (merged || native_ngg || data.code_size_bytes == 0 ||
+	    data.code_size_bytes % 4 != 0)) {
+		DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+		return;
+	}
 	FillShaderParams(regs.es_regs.data_addr, "ShaderRecompiler VS",
 	                 std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
 	                 params);
 	// The GS user SGPRs start at s8: one the shader receives may hold the draw's start instance.
+	if (DrawPrep::SpeculativeFailed()) return;
 	const auto start_instance      = regs.start_instance_user_sgpr;
 	const auto start_instance_sgpr =
 	    start_instance >= 0 && static_cast<uint32_t>(start_instance) < regs.gs_regs.rsrc2.user_sgpr
 	        ? 8 + start_instance : -1;
 	if (!merged && !native_ngg) {
 		if (!ShaderGetStaticInputInfoVS(regs, sh, data, info)) {
+			if (DrawPrep::Speculative()) {
+				DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+				return;
+			}
 			EXIT("failed to prepare vertex shader program\n");
 		}
 		info.start_instance_sgpr = start_instance_sgpr;
@@ -718,6 +791,8 @@ void PrepareProgramInto(const HW::VertexShaderInfo& regs, const HW::Context& con
 	mesh.provoking_vertex    = context.GetModeControl().provoking_vtx_last ? 2u : 0u;
 	mesh.lds_size_dwords     = static_cast<uint32_t>(regs.gs_regs.rsrc2.lds_size) * 128u;
 	mesh.scratch_size_dwords = data.scratch_size_dwords;
+	const auto fast_launch = (context.GetShaderStages() >> 19u) & 3u;
+	mesh.fast_launch = fast_launch == 1u;
 	if (data.type == Prospero::ShaderBinaryType::kGsFront) {
 		EXIT_IF(regs.gs_regs.data_addr == 0);
 		const auto back = ShaderGetMappedData(regs.gs_regs.data_addr, "ShaderGetInputInfoGS():");
@@ -730,11 +805,33 @@ void PrepareProgramInto(const HW::VertexShaderInfo& regs, const HW::Context& con
 		params.hash = XXH3_64bits(hashes, sizeof(hashes));
 		mesh.scratch_size_dwords = std::max(mesh.scratch_size_dwords, back.scratch_size_dwords);
 	}
-	if (merged) {
-		EXIT_NOT_IMPLEMENTED(regs.gs_regs.rsrc1.gs_vgpr_component_count != 3u ||
-		                     regs.gs_regs.rsrc2.es_vgpr_component_count != 3u);
-	}
 	const auto& group = user_config.GetGeControl();
+	const auto& user_vgpr = user_config.GetGeUserVgprEn();
+	// Frank 11001c97 / 8e9e5c6d: mode 1 is a mesh launch, not ordinary ES/GS assembly.
+	const bool valid_fast = merged && data.type == Prospero::ShaderBinaryType::kGs &&
+	    regs.gs_regs.rsrc1.gs_vgpr_component_count == 0u &&
+	    regs.gs_regs.rsrc2.es_vgpr_component_count == 1u &&
+	    user_config.GetPrimType() == Prospero::PrimitiveType::kPointList &&
+	    group.primitive_group_size == 1u && group.vertex_group_size == 1u &&
+	    !user_vgpr.vgpr1 && !user_vgpr.vgpr2 && !user_vgpr.vgpr3 &&
+	    mesh.max_vertices == sh.m_vgtGsMaxVertOut;
+	const bool valid_ordinary = !merged ||
+	    (regs.gs_regs.rsrc1.gs_vgpr_component_count == 3u && regs.gs_regs.rsrc2.es_vgpr_component_count == 3u);
+	const bool supported_launch = fast_launch == 0u ? valid_ordinary : fast_launch == 1u && valid_fast;
+	if (fast_launch != 0u || !supported_launch) {
+		static std::atomic<uint32_t> logged {0};
+		if (!supported_launch || logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::fprintf(stderr, "[NGG_LAUNCH] hash=0x%016llx stages=0x%x mode=%u GS=%u ES=%u type=%u "
+			             "input=%u GE=%u/%u max_vertices=%u gs_max=%u subgrp=0x%x supported=%u\n",
+			             (unsigned long long)params.hash, context.GetShaderStages(), fast_launch,
+			             regs.gs_regs.rsrc1.gs_vgpr_component_count, regs.gs_regs.rsrc2.es_vgpr_component_count,
+			             static_cast<uint32_t>(data.type), mesh.input_primitive, group.primitive_group_size,
+			             group.vertex_group_size, mesh.max_vertices, sh.m_vgtGsMaxVertOut, sh.m_geNggSubgrpCntl,
+			             supported_launch ? 1u : 0u);
+			std::fflush(stderr);
+		}
+	}
+	EXIT_NOT_IMPLEMENTED(!supported_launch);
 	if ((user_config.GetPrimType() != Prospero::PrimitiveType::kPointList &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kLineList &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriFan &&
@@ -755,7 +852,12 @@ void PrepareProgramInto(const HW::VertexShaderInfo& regs, const HW::Context& con
 	                                          mesh.max_vertices / sh.m_vgtGsMaxVertOut});
 	EXIT_IF(mesh.primitives_per_group == 0u);
 	mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
-	const auto threads = native_ngg ? mesh.vertices_per_group : mesh.max_vertices;
+	uint32_t threads = native_ngg ? mesh.vertices_per_group : mesh.max_vertices;
+	if (mesh.fast_launch) {
+		// Wolverine's title meshlet emits 64 primitives from 32 vertices (Frank 8e9e5c6d).
+		mesh.max_primitives = std::max(mesh.max_vertices, sh.m_geNggSubgrpCntl & 0x1ffu);
+		threads = std::max({mesh.max_vertices, mesh.max_primitives, (sh.m_geNggSubgrpCntl >> 9u) & 0x1ffu});
+	}
 	mesh.threads_num[0] = ((threads + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
 	mesh.threads_num[1] = mesh.threads_num[2] = 1u;
 }
@@ -773,6 +875,11 @@ void PrepareProgramInto(const HW::PixelShaderInfo& regs, const HW::ShaderRegiste
                         std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
                         ShaderPixelInputInfo& ps_info, ShaderParams& params) {
 	const auto data = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
+	if (DrawPrep::SpeculativeFailed()) return;
+	if (DrawPrep::Speculative() && (data.code_size_bytes == 0 || data.code_size_bytes % 4 != 0)) {
+		DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified);
+		return;
+	}
 	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
 	FillShaderParams(regs.ps_regs.data_addr, "ShaderRecompiler PS",
 	                 std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data,

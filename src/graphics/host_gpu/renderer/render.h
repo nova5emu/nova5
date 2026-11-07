@@ -37,6 +37,7 @@ struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
 namespace PassTiming { struct Pass; }
+namespace DrawPrep { class Engine; }
 struct RenderExecutorTestAccess;
 
 enum class CommandBufferDebugOp : uint32_t {
@@ -229,6 +230,8 @@ public:
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void PrepareBindingsInto(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	bool ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void PrepareBdaBindings(const PreparedBindings& first, const PreparedBindings* second = nullptr);
 	void                           RebindBuffers(PreparedBindings& bindings);
@@ -458,6 +461,7 @@ private:
 	std::unordered_set<uint64_t> m_depth_tiled_reports;
 
 	friend class CommandProcessor;
+	friend class DrawPrep::Engine; // Commits a window's prepared draws in order (DrawIndex, DrawAuto).
 	friend struct RenderExecutorTestAccess;
 };
 

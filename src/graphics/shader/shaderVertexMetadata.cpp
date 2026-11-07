@@ -1,9 +1,17 @@
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "graphics/host_gpu/renderer/drawPrep/readSet.h"
 
 #include <array>
 #include <cstring>
 
 namespace Libs::Graphics {
+
+static bool ReadMetadata(void* destination, const void* source, uint64_t size) {
+	if (DrawPrep::Speculative())
+		return DrawPrep::ReadMemory(reinterpret_cast<uint64_t>(source), destination, size);
+	std::memcpy(destination, source, size);
+	return true;
+}
 
 bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sgprs,
                               ShaderVertexMetadata& metadata, std::string* error) {
@@ -12,7 +20,7 @@ bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sg
 	}
 
 	ShaderUserData user_data {};
-	std::memcpy(&user_data, data.user_data, sizeof(user_data));
+	if (!ReadMetadata(&user_data, data.user_data, sizeof(user_data))) return false;
 
 	constexpr uint32_t DirectResourceCount =
 	    static_cast<uint32_t>(AgcDirectResourceType::Last) + 1u;
@@ -28,7 +36,7 @@ bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sg
 		if (user_data.direct_resource_offset == nullptr) {
 			return ShaderError::Fail(error, "missing AGC direct-resource offsets");
 		}
-		std::memcpy(direct_offsets.data(), user_data.direct_resource_offset, direct_size);
+		if (!ReadMetadata(direct_offsets.data(), user_data.direct_resource_offset, direct_size)) return false;
 	}
 
 	ShaderVertexMetadata next;
@@ -73,7 +81,7 @@ bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sg
 	if (data.input_semantics == nullptr) {
 		return ShaderError::Fail(error, "missing vertex input semantics");
 	}
-	std::memcpy(next.input_semantics.data(), data.input_semantics, semantic_size);
+	if (!ReadMetadata(next.input_semantics.data(), data.input_semantics, semantic_size)) return false;
 	next.input_semantics_count = data.num_input_semantics;
 	metadata                   = next;
 	return true;

@@ -658,6 +658,37 @@ uint32_t ImageAtomicOpcode(IR::ValueOpcode opcode) {
 
 } // namespace
 
+static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& image, IR::Value image_arg) {
+	auto& state = ctx.state;
+	const auto* handle = image_arg.Resolve().TryInstruction();
+	EXIT_IF(handle == nullptr || state.flattened_srt_variable == 0);
+	const auto key = ctx.Def(handle->Arg(0));
+	const auto load = [&](uint32_t variable, uint32_t index) {
+		const auto pointer = state.builder.AllocateId(), value = state.builder.AllocateId();
+		state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+		                           variable, ConstantU32(state, 0), index});
+		state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
+		return value;
+	};
+	const auto base = load(state.flattened_srt_variable, ConstantU32(state, image.indirect_mapping_offset));
+	const auto count = load(state.flattened_srt_variable, ConstantU32(state, image.indirect_mapping_offset + 1));
+	const auto in_range = Binary(state, OpULessThan, TypeBool(state), key, count);
+	const auto entry = Binary(state, OpIAdd, TypeU32(state), base, key);
+	const auto index = Select(state, TypeU32(state), in_range, entry, ConstantU32(state, 0));
+	const auto raw = load(state.bindless_translation_variable, index);
+	const auto pending = Binary(state, OpIEqual, TypeBool(state), raw, ConstantU32(state, IR::BindlessPending));
+	const auto flag = Select(state, TypeU32(state), pending, ConstantU32(state, 1), ConstantU32(state, 0));
+	const auto pointer = state.builder.AllocateId(), ignored = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                           state.bindless_feedback_variable, ConstantU32(state, 0), index});
+	// Multiple waves can request the same key. Atomic OR retains a pending request.
+	state.builder.AddFunction({OpAtomicOr, TypeU32(state), ignored, pointer, ConstantU32(state, 1),
+	                           ConstantU32(state, 0), flag});
+	const auto slot = Select(state, TypeU32(state), pending, ConstantU32(state, 2), raw);
+	state.builder.AddAnnotation({OpDecorate, slot, DecorationNonUniform});
+	return slot;
+}
+
 bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op         = inst.GetOpcode();
 	const auto image_info = IR::ImageOpcodeInfoOf(op);
@@ -669,6 +700,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  image_arg = inst.Arg(0);
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
 	const auto& image   = state.program.info.images.at(mem.resource);
+	state.bindless_slot = image.bindless ? BindlessSlot(ctx, image, image_arg) : 0u;
 	const auto* address = ctx.ImageAddress(inst.Arg(image_info.needs_sampler ? 2 : 1));
 	if (address == nullptr) return true;
 	if (op == IR::ValueOpcode::ImageQueryDimensions) {

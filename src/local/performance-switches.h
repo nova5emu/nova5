@@ -25,6 +25,7 @@ extern volatile std::atomic_uint32_t kyty_local_backing_read_mode;
 extern volatile std::atomic<uint32_t> kyty_local_move_compare;
 extern volatile std::atomic_uint32_t kyty_local_stream_upload_mode;
 extern volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
+extern volatile std::atomic_uint32_t kyty_local_draw_prep_bindings_mode;
 extern volatile std::atomic_uint32_t kyty_local_draw_run_ranges_mode;
 extern volatile std::atomic_uint32_t kyty_local_image_barrier_dedupe;
 extern volatile std::atomic_uint32_t kyty_local_pending_drain_mode;
@@ -74,6 +75,8 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_SPECIALIZATION_GUARD", &kyty_local_specialization_guard_mode},
 	    Switch {"KYTY_PIPELINE_INDEX", &kyty_local_pipeline_index_mode},
 	    Switch {"KYTY_BINDING_SCRATCH", &kyty_local_binding_scratch_mode},
+	    // Phase 1: pure inline binding plans. 0 off, 1 use, 2 compare/use serial, 3 compare/exit on mismatch.
+	    Switch {"KYTY_DRAW_PREP_BINDINGS", &kyty_local_draw_prep_bindings_mode, 0, 3},
 	    Switch {"KYTY_DRAW_RUN_RANGES", &kyty_local_draw_run_ranges_mode},
 	    // Buffers and guest memory.
 	    Switch {"KYTY_BUFFER_RESIDENCY", &kyty_local_buffer_residency_mode},

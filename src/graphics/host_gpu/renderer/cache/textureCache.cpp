@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "slow-log.h"
 
 #include "common/assert.h"
@@ -15,6 +16,8 @@
 #include "graphics/host_gpu/renderer/image/linearImageUpload.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/wolverine.h"
+#include "loader/systemContent.h"
 #include "kernel/memory.h"
 #include "fresh-memory.h"
 #include "texture-offload.h"
@@ -371,6 +374,14 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
       m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
+	std::string title;
+	Loader::SystemContentParamSfoGetString("TITLE_ID", &title);
+	m_demand_linear_readback = Wolverine::LinearReadbackEnabled(
+	    title, std::getenv("NOVA5_WOLVERINE_LINEAR_READBACK"));
+	if (title == "PPSA03671") {
+		std::fprintf(stderr, "[WOLVERINE] demand linear image readback=%u (NOVA5_WOLVERINE_LINEAR_READBACK)\n",
+		             unsigned(m_demand_linear_readback));
+	}
 	m_image_granules.assign((ImageGranuleSpace >> ImageGranuleBits) / 64, 0);
 	g_report_cache               = this;
 	LiveCounters::g_image_report = [](const char* path) {
@@ -697,6 +708,7 @@ void TextureCache::RegisterImage(ImageId id) {
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
+	if (m_bindless_table) m_bindless_table->OnImageUnregistered(id);
 	if (KeepImageAliases()) ForgetAlias(id);
 	auto& image = m_slot_images[id];
 	if (!image.registered) {
@@ -969,6 +981,7 @@ void TextureCache::TrackImageTail(ImageId id) {
 
 void TextureCache::UntrackImage(ImageId id, const char* why) {
 	auto& image = m_slot_images[id];
+	UntrackImageReads(image);
 	if (SlowLog::Threshold() > 0.0 && image.IsTracked() && image.info.data.size >= PartialDirtyMinSize) {
 		std::printf("[tsc %llu] UNTRACK %s addr=0x%llx size=0x%llx holes=%zu partial=%d\n",
 		            static_cast<unsigned long long>(__rdtsc()), why,
@@ -1118,6 +1131,9 @@ bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t
 	const auto page_begin = granule_begin & ~(TRACKER_PAGE_SIZE - 1);
 	const auto page_end   = (granule_end + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 	// The released pages are dirty wherever they hold image bytes.
+	// A partial remap/unmap can reach here without a CPU fault. Mixed ownership
+	// is no longer eligible for a whole-image demand download.
+	UntrackImageReads(image);
 	image.InvalidateCpuWritePartial(std::max(page_begin, base), std::min(page_end, info.data.End()));
 	UntrackImagePages(image, page_begin, page_end);
 	LiveCounters::Add(LiveCounters::PartialDirtyFaults);
@@ -1403,6 +1419,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	PrepareImageCopy(destination);
 	if (source.IsBufferModified()) {
 		if (source.info.data == destination.info.data) {
+			UntrackImageReads(destination);
 			destination.MarkBufferModified();
 		}
 		return;
@@ -1439,6 +1456,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	}
 	destination.ClearBufferModified();
 	if (destination.kept_alias && !m_alias_copy_active) CommitGpuWrite(destination);
+	TrackImageReads(destination);
 }
 
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
@@ -1456,6 +1474,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
 	}
+	TrackImageReads(destination);
 }
 
 static bool GrowImageToLayers(ImageInfo& info, uint32_t layers) {
@@ -1671,6 +1690,7 @@ void TextureCache::ClaimAliasWrite(Image& image) {
 			group.owner = id;
 			other.alias_stale = false;
 		} else {
+			UntrackImageReads(other);
 			other.ClearGpuModified();
 			other.alias_stale = true;
 		}
@@ -1689,7 +1709,10 @@ void TextureCache::ForgetAlias(ImageId id) {
 		for (const auto member: found->second.members) {
 			auto& other = m_slot_images[member];
 			other.kept_alias = other.alias_stale = false;
-			if (member != id) other.MarkBufferModified();
+			if (member != id) {
+				UntrackImageReads(other);
+				other.MarkBufferModified();
+			}
 			++other.validity;
 		}
 		m_kept_aliases.erase(found);
@@ -3388,6 +3411,7 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
+	UntrackImageReads(record);
 	if (record.depth_id != depth_id) ++record.validity;
 	record.depth_id = depth_id;
 	if (std::find(m_stencil_associations.begin(), m_stencil_associations.end(), association) ==
@@ -4100,6 +4124,7 @@ void TextureCache::CommitGpuWrite(Image& image, bool keep_partial) {
 	}
 	image.MarkGpuModified();
 	ClaimAliasWrite(image);
+	TrackImageReads(image);
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -4411,6 +4436,79 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
+void TextureCache::TrackImageReads(Image& image) {
+	if (!m_demand_linear_readback || image.cpu_read_tracked || !image.registered || image.depth_id ||
+	    image.info.IsTiled() || !SafeToDownload(image) || !BuildDownload(image).valid ||
+	    image.info.data.size > m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size() / 2) {
+		return;
+	}
+	image.cpu_read_tracked = true;
+	m_cpu_readback_holds.fetch_add(1, std::memory_order_release);
+	// Use the existing counted holds, independent of the buffer tracker's single
+	// read-ownership bit. They also compose with texture offload holds.
+	m_page_manager.UpdateReadWatchers<true>(image.info.data.address, image.info.data.size);
+}
+
+void TextureCache::UntrackImageReads(Image& image) {
+	if (!image.cpu_read_tracked) return;
+	m_page_manager.UpdateReadWatchers<false>(image.info.data.address, image.info.data.size);
+	image.cpu_read_tracked = false;
+	m_cpu_readback_holds.fetch_sub(1, std::memory_order_release);
+}
+
+bool TextureCache::HasPendingCpuReadback(uint64_t address, uint64_t size) {
+	if (m_cpu_readback_holds.load(std::memory_order_acquire) == 0 ||
+	    !GuestRange {address, size}.Valid()) return false;
+	const auto begin = address & ~(TRACKER_PAGE_SIZE - 1);
+	const auto end = (address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(begin, end - begin, true)) {
+		if (m_slot_images[id].cpu_read_tracked) return true;
+	}
+	std::lock_guard downloads_lock(m_download_mutex);
+	for (const auto& pending: m_pending_downloads) {
+		if (pending.read_tracked && begin < pending.address + pending.size && pending.address < end)
+			return true;
+	}
+	return false;
+}
+
+void TextureCache::ReadMemory(uint64_t address, uint64_t size) {
+	if (!HasPendingCpuReadback(address, size)) return;
+	if (CommandScheduler::InDeferredOperation()) {
+		EXIT("TextureCache: image readback from an asynchronous GPU completion\n");
+	}
+	const auto begin = address & ~(TRACKER_PAGE_SIZE - 1);
+	const auto end = (address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	m_scheduler.Context().GetGpu().SendCommandSync([this, begin, end] {
+		std::vector<std::pair<ImageId, uint64_t>> images;
+		{
+			std::scoped_lock lock {m_lock};
+			for (const auto id: FindImagesInRegion(begin, end - begin, true)) {
+				auto& image = m_slot_images[id];
+				if (!image.cpu_read_tracked) continue;
+				if (!TryDownloadImage(id)) {
+					EXIT("TextureCache: cannot publish guarded linear image at 0x%016" PRIx64 "\n",
+					     image.info.data.address);
+				}
+				images.emplace_back(id, image.serial);
+			}
+		}
+		// A retired image may only have a pending download left. A Vulkan fence
+		// alone is insufficient: the priority callback must finish WriteBacking.
+		const auto tick = PendingDownloadTick(begin, end - begin);
+		if (tick != 0) {
+			m_scheduler.Wait(tick);
+			m_scheduler.WaitPriorityOperations(tick);
+		}
+		std::scoped_lock lock {m_lock};
+		for (const auto& [id, serial]: images) {
+			auto* image = m_slot_images.try_get(id);
+			if (image != nullptr && image->serial == serial) UntrackImageReads(*image);
+		}
+	});
+}
+
 bool TextureCache::TryDownloadImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
@@ -4458,10 +4556,16 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	const auto first_page = range.address & ~(TRACKER_PAGE_SIZE - 1);
 	const auto end_page   = (range.address + range.size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 	m_page_manager.UpdatePageWatchers<true>(first_page, end_page - first_page);
+	const bool read_tracked = image.cpu_read_tracked;
+	if (read_tracked) {
+		m_cpu_readback_holds.fetch_add(1, std::memory_order_release);
+		m_page_manager.UpdateReadWatchers<true>(first_page, end_page - first_page);
+	}
 	{
 		std::lock_guard lock(m_download_mutex);
 		m_pending_downloads.push_back(
-		    {range.address, range.size, tick, first_page, std::vector<bool>((end_page - first_page) / TRACKER_PAGE_SIZE, true)});
+		    {range.address, range.size, tick, first_page,
+		     std::vector<bool>((end_page - first_page) / TRACKER_PAGE_SIZE, true), read_tracked});
 	}
 	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, tick] {
 		download.Invalidate(offset, range.size);
@@ -4485,8 +4589,10 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 			const auto end       = std::min(run_end, range.address + range.size);
 			LibKernel::Memory::WriteBacking(begin, mapped + (begin - range.address), end - begin, "image");
 			m_page_manager.UpdatePageWatchers<false>(run_begin, run_end - run_begin);
+			if (done->read_tracked) m_page_manager.UpdateReadWatchers<false>(run_begin, run_end - run_begin);
 			first = last;
 		}
+		if (done->read_tracked) m_cpu_readback_holds.fetch_sub(1, std::memory_order_release);
 		m_pending_downloads.erase(done);
 	});
 	return true;
@@ -4991,6 +5097,7 @@ void TextureCache::ReleaseDownloadPages(uint64_t address, uint64_t size) {
 			if (index >= pending.held.size() || !pending.held[index]) continue;
 			pending.held[index] = false;
 			m_page_manager.UpdatePageWatchers<false>(page, TRACKER_PAGE_SIZE);
+			if (pending.read_tracked) m_page_manager.UpdateReadWatchers<false>(page, TRACKER_PAGE_SIZE);
 			LiveCounters::Add(LiveCounters::DownloadPagesReleased);
 		}
 	}
@@ -5039,6 +5146,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, cons
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();
 		}
+		UntrackImageReads(image);
 		// (The written bytes of it: InitializeImage uploads only the subresources over them.)
 		const auto begin = std::max(address, image.info.data.address), end = std::min(address + size, image.info.data.End());
 		if (fill != nullptr) {
@@ -5384,6 +5492,13 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::EraseSlot(ImageId id) {
+	if (m_bindless_table) {
+		if (const auto* image = m_slot_images.try_get(id)) {
+			std::vector<vk::ImageView> views;
+			for (const auto& cached: image->views) if (cached.view) views.push_back(cached.view);
+			(void)m_bindless_table->ReleaseViews(views);
+		}
+	}
 	m_slot_images.erase(id);
 	m_erase_epoch.fetch_add(1, std::memory_order_release);
 }

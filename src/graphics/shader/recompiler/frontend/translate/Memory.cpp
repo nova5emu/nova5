@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include <algorithm>
 #include <array>
@@ -127,6 +128,10 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.image_r128    = decoded.image_r128;
 	memory.image_cube    = decoded.image_cube;
 	memory.glc           = decoded.glc;
+	// The IR flag describes cache bypass, not the atomic return flag (which is
+	// taken from decoded.glc below). Keep the persisted MemoryInfo layout stable.
+	if (GetCodegenOptions().coherent_buffers && memory.kind == ResourceKind::Buffer)
+		memory.glc |= decoded.dlc;
 	memory.slc           = decoded.slc;
 	memory.idxen         = decoded.idxen;
 	memory.offen         = decoded.offen;

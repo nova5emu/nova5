@@ -28,6 +28,8 @@
 
 namespace Libs::Graphics {
 
+namespace DrawPrep { struct StageBindingPlan; }
+
 struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;
@@ -225,6 +227,16 @@ public:
 		ShaderProgram vertex;
 		ShaderProgram pixel;
 	};
+	// Probe-only lookup of already live normal permutations: no compilation,
+	// reload, resource-reuse mutation, scheduler access or Vulkan calls.
+	bool PrepareGraphicsProgramsSpeculative(
+	    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+	    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+	    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
+	    ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info,
+	    GraphicsPrograms& programs, uint64_t& publication,
+	    DrawPrep::StageBindingPlan* vertex_bindings, DrawPrep::StageBindingPlan* pixel_bindings);
+	bool SpeculativePublicationCurrent(uint64_t publication);
 
 	// `table_mode`: both programs in table mode (ShaderRecompiler::IR::EnterTableMode), each empty when it does not
 	// allow that.

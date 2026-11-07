@@ -271,6 +271,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/drawPrep/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/drawPrep/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.cpp"
@@ -620,6 +622,15 @@ add_executable(archive_file_tests EXCLUDE_FROM_ALL
 target_link_libraries(archive_file_tests common ZArchive::zarchive)
 target_include_directories(archive_file_tests PRIVATE ${inc_headers})
 
+add_executable(elf_segment_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ElfSegmentTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/elf.cpp")
+target_link_libraries(elf_segment_tests common)
+target_include_directories(elf_segment_tests PRIVATE ${inc_headers})
+if(BUILD_TESTING)
+	add_test(NAME elf_segment COMMAND elf_segment_tests)
+endif()
+
 add_executable(demons_souls_copy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DemonsSoulsCopyTests.cpp")
 target_link_libraries(demons_souls_copy_tests xbyak::xbyak)
@@ -671,6 +682,14 @@ target_include_directories(jetsku_draw_ports_tests PRIVATE ${inc_headers})
 add_executable(texture_binding_memo_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/TextureBindingMemoTests.cpp")
 target_include_directories(texture_binding_memo_tests PRIVATE ${inc_headers})
 
+add_executable(draw_prep_binding_plan_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/DrawPrepBindingPlanTests.cpp")
+target_include_directories(draw_prep_binding_plan_tests PRIVATE ${inc_headers})
+target_link_libraries(draw_prep_binding_plan_tests PRIVATE fmt::fmt Threads::Threads)
+
+add_executable(draw_prep_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/DrawPrepTests.cpp")
+target_include_directories(draw_prep_tests PRIVATE ${inc_headers})
+target_link_libraries(draw_prep_tests PRIVATE fmt::fmt Threads::Threads)
+
 add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceMaterializationTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/BdaReadPlan.cpp"
@@ -685,6 +704,7 @@ target_include_directories(resource_materialization_tests PRIVATE ${inc_headers}
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/CodegenOptions.cpp"
 	"${KYTY_SOURCE_DIR}/local/resource-plan-serial.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ExportOps.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ImageOps.cpp"
@@ -842,7 +862,7 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
-			virtual_memory_allocation_tests)
+			virtual_memory_allocation_tests elf_segment_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
 endif()
@@ -865,6 +885,8 @@ if(BUILD_TESTING)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME shader_ngg_assembly COMMAND $<TARGET_FILE:shader_cfg_tests> --ngg-assembly)
+	add_test(NAME shader_mesh_fast_launch COMMAND $<TARGET_FILE:shader_cfg_tests> --wolverine-fast-launch-only)
+	add_test(NAME shader_wolverine_gpu_stability COMMAND $<TARGET_FILE:shader_cfg_tests> --wolverine-gpu-stability-only)
 	add_test(NAME shader_ngg_vertex_launch COMMAND $<TARGET_FILE:shader_cfg_tests> --ngg-vertex-launch)
 	set_tests_properties(shader_ngg_vertex_launch PROPERTIES ENVIRONMENT "KYTY_NGG_VERTEX_LAUNCH=1")
 	add_test(NAME shader_ngg_vertex_launch_legacy COMMAND $<TARGET_FILE:shader_cfg_tests> --ngg-vertex-launch)
@@ -882,8 +904,14 @@ if(BUILD_TESTING)
 	add_test(NAME clean_read_cache COMMAND $<TARGET_FILE:clean_read_cache_tests>)
 	add_test(NAME jetsku_draw_ports COMMAND $<TARGET_FILE:jetsku_draw_ports_tests>)
 	add_test(NAME texture_binding_memo COMMAND $<TARGET_FILE:texture_binding_memo_tests>)
+	add_test(NAME draw_prep_binding_plan COMMAND $<TARGET_FILE:draw_prep_binding_plan_tests>)
+	add_test(NAME draw_prep_protocol COMMAND $<TARGET_FILE:draw_prep_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+	add_test(NAME wolverine_bindless_tracking COMMAND $<TARGET_FILE:resource_tracking_tests> --wolverine-bindless-only)
+	add_test(NAME wolverine_bindless_spirv COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wolverine-bindless-ir-only)
+	add_test(NAME wolverine_descriptor_counts COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wolverine-descriptors-only)
+	add_test(NAME invariant_indirect_images COMMAND $<TARGET_FILE:resource_tracking_tests> --invariant-indirect-only)
 	add_test(NAME pixel_capture COMMAND $<TARGET_FILE:pixel_capture_tests>)
 	add_test(NAME raster_depth_clamp COMMAND $<TARGET_FILE:raster_depth_clamp_tests>)
 	add_test(NAME nova5_cli COMMAND $<TARGET_FILE:nova5_cli_tests>)
@@ -925,6 +953,22 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --guest-stack-exit-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	add_test(NAME main_entry_stack
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --main-entry-stack-only)
+	add_test(NAME wolverine_shader_recovery
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --wolverine-shader-recovery-only)
+	if(WIN32)
+		add_test(NAME wolverine_amm_isolation
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --wolverine-amm-only)
+		add_test(NAME wolverine_amm_optout
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --wolverine-amm-optout-only)
+		add_test(NAME wolverine_apr_map_before_read
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --wolverine-apr-only)
+		add_test(NAME wolverine_apr_maps_optout
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --wolverine-apr-optout-only)
+		add_test(NAME wolverine_apr_async_optout
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --wolverine-apr-sync-only)
+	endif()
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME shader_lod_feedback
@@ -985,6 +1029,8 @@ if(BUILD_TESTING)
 		atrac9_initialization_tests
 		bit_array_tests
 		shader_vertex_metadata_tests
+		draw_prep_binding_plan_tests
+		draw_prep_tests
 		resource_materialization_tests
 		resource_tracking_tests
 		pixel_capture_tests
@@ -1206,6 +1252,14 @@ if((LINUX OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 		add_test(NAME vulkan_recording COMMAND vulkan_recording_tests)
 		add_test(NAME specialization_guard
 			COMMAND shader_recompiler_compute_tests --specialization-guard-only)
+		add_test(NAME draw_prep_bindings_gpu
+			COMMAND shader_recompiler_compute_tests --draw-prep-bindings-only)
+		set_tests_properties(draw_prep_bindings_gpu PROPERTIES
+			ENVIRONMENT "KYTY_DRAW_PREP=off;KYTY_DRAW_PREP_BINDINGS=0")
+		add_test(NAME draw_prep_programs_gpu
+			COMMAND shader_recompiler_compute_tests --draw-prep-programs-only)
+		set_tests_properties(draw_prep_programs_gpu PROPERTIES
+			ENVIRONMENT "KYTY_DRAW_PREP=off;KYTY_DRAW_PREP_VERIFY=exit;KYTY_DRAW_PREP_BINDINGS=0")
 		add_test(NAME native_pipeline_index
 			COMMAND shader_recompiler_compute_tests --native-pipeline-index-only)
 		add_test(NAME draw_run_ranges COMMAND shader_recompiler_compute_tests --draw-run-ranges-only)

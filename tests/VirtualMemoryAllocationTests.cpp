@@ -5,11 +5,15 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "kernel/memory.h"
+#include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "loader/redZonePatcher.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
+#include "loader/symbolDatabase.h"
+#include "graphics/shader/recompiler/ShaderCompileRecovery.h"
+#include "graphics/host_gpu/renderer/wolverine.h"
 
 #include <array>
 #include <atomic>
@@ -17,6 +21,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -34,6 +39,9 @@
 
 // (memory.cpp: how a partial unmap of a Windows view goes, 0 split, 1 parked, 2 parked no-access.)
 extern "C" volatile std::atomic_uint32_t kyty_local_park_unmaps;
+
+namespace Libs::LibAmpr { void InitAmpr_1(Loader::SymbolDatabase*); }
+namespace Libs::LibKernelApr { void InitLibKernel_1_Apr(Loader::SymbolDatabase*); }
 
 namespace {
 
@@ -95,7 +103,7 @@ void CheckFailed(const char* test, int result, const char* action) {
 	}
 }
 
-void InitSubsystems() {
+void InitSubsystems(bool wolverine = false) {
 	static bool initialized = false;
 	if (initialized) {
 		return;
@@ -115,13 +123,15 @@ void InitSubsystems() {
 	const auto param_json = std::filesystem::temp_directory_path() /
 	                        ("kyty_virtual_memory_" +
 	                         std::to_string(reinterpret_cast<uintptr_t>(&initialized)) + ".json");
-	constexpr char json[] = R"({"kernel":{"flexibleMemorySize":3221225472}})";
+	const std::string json = wolverine
+	    ? R"({"titleId":"PPSA03671","kernel":{"flexibleMemorySize":3221225472}})"
+	    : R"({"kernel":{"flexibleMemorySize":3221225472}})";
 	Common::File   param_file;
 	Check("InitSubsystems", param_file.Create(param_json), "failed to create temporary param.json");
 	uint32_t bytes_written = 0;
-	param_file.Write(json, sizeof(json) - 1, &bytes_written);
+	param_file.Write(json.data(), static_cast<uint32_t>(json.size()), &bytes_written);
 	param_file.Close();
-	Check("InitSubsystems", bytes_written == sizeof(json) - 1,
+	Check("InitSubsystems", bytes_written == json.size(),
 	      "failed to write temporary param.json");
 
 	Loader::SystemContentLoadParamSfo(param_json);
@@ -964,8 +974,49 @@ void TestGuestStackExitLifecycle() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-void TestMainEntryUsesGuestStackAndDisablesHostChecks() {
-	const char* test = "MainEntryUsesGuestStackAndDisablesHostChecks";
+void TestWolverineShaderRecovery() {
+	using namespace Libs::Graphics::ShaderRecompiler;
+	const char* test = "WolverineShaderRecovery";
+	using Libs::Graphics::Wolverine::ShaderRecoveryEnabled;
+	Check(test, ShaderRecoveryEnabled("PPSA03671", nullptr) &&
+	            !ShaderRecoveryEnabled("PPSA03671", "0") &&
+	            !ShaderRecoveryEnabled("PPSA01325", "1") &&
+	            !ShaderRecoveryEnabled("", "1"), "shader recovery title gate changed");
+	int calls = 0;
+	Check(test, RecoverShaderCompile(true, [&] { ++calls; return 17; }) == 17 && calls == 1,
+	      "successful compiler result was changed");
+	bool unwound = false, rejected = false;
+	try {
+		RecoverShaderCompile(true, [&]() -> int {
+			struct Cleanup { bool& flag; ~Cleanup() { flag = true; } } cleanup {unwound};
+			EXIT("synthetic shader resource tracking rejection");
+			return 0;
+		});
+	} catch (const ShaderCompileRejected& failure) {
+		rejected = failure.message.find("synthetic shader resource tracking rejection") != std::string::npos;
+	}
+	Check(test, rejected && unwound, "compiler rejection did not preserve reason or unwind resources");
+	// The outer scope observes the original failure when the title policy is off.
+	bool strict = false;
+	try {
+		Common::RecoverableExitScope outer;
+		RecoverShaderCompile(false, []() -> int { EXIT("strict compiler failure"); return 0; });
+	} catch (const Common::RecoverableExit&) {
+		strict = true;
+	}
+	Check(test, strict, "opt-out converted the original failure");
+	bool unrelated = false;
+	try {
+		RecoverShaderCompile(true, []() -> int { throw TestFailure {}; });
+	} catch (const TestFailure&) {
+		unrelated = true;
+	}
+	Check(test, unrelated, "recovery swallowed an unrelated exception");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestMainEntryUsesGuestStackAndRestoresHostBounds() {
+	const char* test = "MainEntryUsesGuestStackAndRestoresHostBounds";
 
 	Check(test, Loader::TestMainEntryUsesGuestStack(),
 	      "main-entry stack switch did not preserve the guest/host stack invariants");
@@ -2816,10 +2867,378 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+std::array<uint64_t, 4> QueryAmmExport(const char* test) {
+	Loader::SymbolDatabase symbols;
+	Libs::LibAmpr::InitAmpr_1(&symbols);
+	const auto* symbol = symbols.FindByNid("wkQR9+xTFKY", Loader::SymbolType::Func);
+	Check(test, symbol != nullptr, "AMM address-range export missing");
+	using GetRanges = void (KYTY_SYSV_ABI*)(uint64_t*, uint64_t*, uint64_t*, uint64_t*);
+	std::array<uint64_t, 4> range {};
+	reinterpret_cast<GetRanges>(symbol->vaddr)(&range[0], &range[1], &range[2], &range[3]);
+	return range;
+}
+
+void TestAmmLegacyLayout() {
+	const char* test = "AmmLegacyLayout";
+	const auto range = QueryAmmExport(test);
+	Check(test, !Libs::LibKernel::Memory::GetAmmAddressLayout().isolated &&
+	            range == std::array<uint64_t, 4> {0x1000000000ull, 0x2000000000ull, 0x1800000000ull, 0x2000000000ull},
+	      "AMM layout changed outside the enabled Wolverine policy");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestWolverineAmmIsolation() {
+	using namespace Libs::LibKernel::Memory;
+	const char* test = "WolverineAmmIsolation";
+	const auto range = QueryAmmExport(test);
+	Check(test, GetAmmAddressLayout().isolated && range[0] == WolverineAmmLayout.begin &&
+	            range[1] == WolverineAmmLayout.end && range[2] == (range[0] + range[1]) / 2 && range[3] == range[1],
+	      "guest AMM export does not match the allocator's isolated aperture");
+	Check(test, range[1] <= (uint64_t {1} << 40) && range[1] <= 0x8000000000ull,
+	      "AMM exceeds unified trackers or the default framegen reserve ceiling");
+
+	// Same layout as the captured failure: flexible heap + table, then an 8 MiB
+	// AMM direct map at aperture+0x2810000. The old advertised aperture destroyed
+	// this heap with MAP_FIXED despite no CPU/GPU write to its backing.
+	constexpr uint64_t HeapBase = 0x1002a00000ull, HeapSize = 0x400000;
+	constexpr uint64_t TableAddress = 0x1002bdbf70ull, MapSize = 0x800000;
+	void* heap = reinterpret_cast<void*>(HeapBase);
+	CheckOk(test, KernelMapNamedFlexibleMemory(&heap, HeapSize, SceKernelProtCpuRw,
+	                                         SceKernelMapFixed | SceKernelMapNoOverwrite, "sound-heap"), "map heap");
+	auto* table = reinterpret_cast<uint64_t*>(TableAddress);
+	const std::array<uint64_t, 3> expected {0x909b8ae20ull, 0x90beda190ull, 0x909b8b230ull};
+	std::memcpy(table, expected.data(), sizeof(expected));
+	const auto* heap_backing = TryGetBackingPointer(TableAddress, sizeof(expected));
+	Check(test, heap_backing != nullptr, "heap has no backing");
+	const auto check_heap = [&] {
+		std::array<uint64_t, 3> from_backing {};
+		Check(test, TryGetBackingPointer(TableAddress, sizeof(expected)) == heap_backing &&
+		            std::memcmp(table, expected.data(), sizeof(expected)) == 0 &&
+		            TryReadBacking(TableAddress, from_backing.data(), sizeof(from_backing)) && from_backing == expected,
+		      "AMM changed the sound heap's bytes or physical backing");
+	};
+	int64_t physical = 0;
+	CheckOk(test, KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), MapSize * 2,
+	                                       SceKernelPageSize, SceKernelMtypeC, &physical), "allocate direct backing");
+	const auto amm_address = range[0] + 0x2810000;
+	for (unsigned pass = 0; pass < 2; ++pass) {
+		void* mapped = reinterpret_cast<void*>(amm_address);
+		CheckOk(test, KernelMapDirectMemory2(&mapped, MapSize, SceKernelMtypeC, SceKernelProtCpuRw,
+		                                   SceKernelMapFixed, physical + pass * MapSize, SceKernelPageSize),
+		        "AMM map/replace direct");
+		Check(test, reinterpret_cast<uint64_t>(mapped) == amm_address, "fixed AMM map moved");
+		*static_cast<uint64_t*>(mapped) = 0xfeed0000 + pass;
+		check_heap();
+	}
+	CheckOk(test, KernelMunmap(amm_address, MapSize), "AMM unmap");
+	check_heap();
+
+	// Released AMM holes remain excluded from ordinary searches, including a
+	// request starting before the aperture but whose length straddles its edge.
+	void* ordinary = reinterpret_cast<void*>(amm_address);
+	CheckOk(test, KernelMapNamedFlexibleMemory(&ordinary, SceKernelPageSize, SceKernelProtCpuRw,
+	                                         0, "ordinary-flex"), "hinted flexible map");
+	Check(test, reinterpret_cast<uint64_t>(ordinary) >= range[1], "flexible heap borrowed an AMM hole");
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(ordinary), SceKernelPageSize), "unmap flexible hint");
+	ordinary = reinterpret_cast<void*>(range[0] - SceKernelPageSize);
+	CheckOk(test, KernelReserveVirtualRange(&ordinary, SceKernelPageSize * 2, 0, SceKernelPageSize),
+	        "reserve straddling AMM start");
+	Check(test, reinterpret_cast<uint64_t>(ordinary) >= range[1], "reservation straddled AMM aperture");
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(ordinary), SceKernelPageSize * 2), "unmap reserve hint");
+	ordinary = reinterpret_cast<void*>(amm_address);
+	CheckOk(test, KernelMapDirectMemory(&ordinary, SceKernelPageSize, SceKernelProtCpuRw, 0,
+	                                  physical, SceKernelPageSize), "hinted direct map");
+	Check(test, reinterpret_cast<uint64_t>(ordinary) >= range[1], "direct allocator borrowed an AMM hole");
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(ordinary), SceKernelPageSize), "unmap direct hint");
+	ordinary = reinterpret_cast<void*>(range[1] - SceKernelPageSize);
+	CheckOk(test, KernelMapDirectMemory(&ordinary, SceKernelPageSize, SceKernelProtCpuRw,
+	                                  SceKernelMapFixed | SceKernelMapNoOverwrite, physical, SceKernelPageSize),
+	        "fixed map of last AMM page");
+	*static_cast<uint64_t*>(ordinary) = 0xcafe;
+	check_heap();
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(ordinary), SceKernelPageSize), "unmap last AMM page");
+	CheckOk(test, KernelReleaseDirectMemory(physical, MapSize * 2), "release direct backing");
+	CheckOk(test, KernelMunmap(HeapBase, HeapSize), "unmap heap");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void CheckAprMapSequence(bool enabled, bool asynchronous = false) {
+	using namespace Libs::LibKernel::Memory;
+	const char* test = enabled ? "WolverineAprMapBeforeRead" : "AprMapLegacyMarkers";
+	Loader::SymbolDatabase symbols;
+	Libs::LibAmpr::InitAmpr_1(&symbols);
+	Libs::LibKernelApr::InitLibKernel_1_Apr(&symbols);
+	const auto find = [&]<typename F>(const char* nid) {
+		const auto* symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+		Check(test, symbol != nullptr, nid);
+		return reinterpret_cast<F>(symbol->vaddr);
+	};
+	using Unary = int (KYTY_SYSV_ABI*)(void*);
+	using SetBuffer = int (KYTY_SYSV_ABI*)(void*, void*, uint32_t);
+	using Map = int (KYTY_SYSV_ABI*)(void*, uint64_t, uint64_t, int32_t, int32_t);
+	using MapDirect = int (KYTY_SYSV_ABI*)(void*, uint64_t, uint64_t, uint64_t, int32_t, int32_t);
+	using Read = int (KYTY_SYSV_ABI*)(void*, uint64_t, uint64_t, uint32_t, void*, uint64_t, uint64_t);
+	using Submit = int (KYTY_SYSV_ABI*)(void*, uint64_t, void*, uint32_t*);
+	using Resolve = int (KYTY_SYSV_ABI*)(const char* const*, uint32_t, uint32_t*, uint64_t*, uint32_t*);
+	const auto construct = find.operator()<Unary>("8aI7R7WaOlc");
+	const auto destroy = find.operator()<Unary>("GuchCTefuZw");
+	const auto reset = find.operator()<Unary>("baQO9ez2gL4");
+	const auto set_buffer = find.operator()<SetBuffer>("N-FSPA4S3nI");
+	const auto map = find.operator()<Map>("Eul7AGEpjLo");
+	const auto map_direct = find.operator()<MapDirect>("bFEs0Gs6D2A");
+	const auto map_end = find.operator()<Unary>("X169CE6G3Y4");
+	const auto read = find.operator()<Read>("mQ16-QdKv7k");
+	const auto submit = find.operator()<Submit>("ASoW5WE-UPo");
+	const auto wait = find.operator()<int (KYTY_SYSV_ABI*)(uint32_t)>("rqwFKI4PAiM");
+	const auto resolve = find.operator()<Resolve>("gEpBkcwxUjw");
+	using CounterWait = int (KYTY_SYSV_ABI*)(void*, uint8_t, uint8_t, uint64_t, uint8_t, uint8_t, uint64_t, uint8_t);
+	using CounterWrite = int (KYTY_SYSV_ABI*)(void*, uint8_t, uint8_t, uint64_t, uint8_t);
+	using CounterRead = int (KYTY_SYSV_ABI*)(void*, volatile uint64_t*, uint8_t);
+	using AddressWait = int (KYTY_SYSV_ABI*)(void*, volatile uint64_t*, uint64_t, uint8_t, uint8_t);
+	using AddressWrite = int (KYTY_SYSV_ABI*)(void*, volatile uint64_t*, uint64_t);
+	using AmmSubmit = int (KYTY_SYSV_ABI*)(void*, uint32_t, uint32_t, void*, uint32_t*);
+	const auto counter_wait = find.operator()<CounterWait>("cQb8Zr8Q0Y0");
+	const auto counter_write = find.operator()<CounterWrite>("3wn42MWTzTs");
+	const auto counter_read = find.operator()<CounterRead>("gSF5OsXdfIg");
+	const auto counter_pair_read = find.operator()<CounterRead>("ZLWtNUP6R5E");
+	const auto address_wait = find.operator()<AddressWait>("DLfoNxTFNVk");
+	const auto address_write = find.operator()<AddressWrite>("sJXyWHjP-F8");
+	const auto amm_map_direct = find.operator()<MapDirect>("8TBE+9XCZbI");
+	const auto amm_submit = find.operator()<AmmSubmit>("OJf3vCckPAM");
+	const auto amm_wait = find.operator()<int (KYTY_SYSV_ABI*)(uint32_t)>("HXymib4T8gc");
+	alignas(16) std::array<uint8_t, 0x40> cb {};
+	alignas(16) std::array<uint8_t, 0x400> records {};
+	CheckOk(test, construct(cb.data()), "APR constructor");
+	CheckOk(test, set_buffer(cb.data(), records.data(), uint32_t(records.size())), "APR set buffer");
+	struct Destroy { Unary fn; void* cb; ~Destroy() { fn(cb); } } cleanup {destroy, cb.data()};
+	constexpr uint64_t Size = 0x8000;
+	const uint64_t va = GetAmmAddressLayout().begin + 0xd038000;
+	Check(test, !IsFullyMapped(va, Size), "test destination was already committed");
+	int64_t physical = 0;
+	CheckOk(test, KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), Size,
+	                                       SceKernelPageSize, SceKernelMtypeC, &physical), "APR direct backing");
+	struct Release {
+		int64_t physical;
+		uint64_t size;
+		~Release() { KernelReleaseDirectMemory(physical, size); }
+	} release {physical, Size};
+	struct Result { int32_t result; uint32_t offset; } result {};
+	const auto execute = [&] {
+		uint32_t id = 0;
+		result = {123, 456};
+		CheckOk(test, submit(cb.data(), 0, &result, &id), "APR submit");
+		CheckOk(test, wait(id), "APR wait");
+	};
+	if (!enabled) {
+		alignas(8) uint64_t observed = 123;
+		CheckOk(test, counter_wait(cb.data(), 40, 1, 99, 0, 0, 0, 0), "legacy counter wait marker");
+		CheckOk(test, counter_write(cb.data(), 40, 1, 99, 0), "legacy counter write marker");
+		CheckOk(test, counter_read(cb.data(), &observed, 40), "legacy counter read zero");
+		CheckOk(test, map(cb.data(), va, Size, SceKernelMtypeC, 0x80), "legacy mapBegin");
+		CheckOk(test, map_end(cb.data()), "legacy mapEnd");
+		CheckOk(test, map_direct(cb.data(), va, physical, Size, SceKernelMtypeC, 0x80), "legacy mapDirectBegin");
+		CheckOk(test, map_end(cb.data()), "legacy mapEnd");
+		execute();
+		Check(test, result.result == 0 && observed == 0 && !IsFullyMapped(va, Size),
+		      "APR map or synchronization gate leaked into legacy mode");
+		std::printf("[host]    %-48s ok\n", test);
+		return;
+	}
+	Libs::LibKernel::FileSystem::Initialize();
+	struct FilesystemCleanup { ~FilesystemCleanup() { Libs::LibKernel::FileSystem::Shutdown(); } } filesystem_cleanup;
+	const auto directory = std::filesystem::temp_directory_path();
+	const auto filename = "nova5_apr_map_" + std::to_string(reinterpret_cast<uintptr_t>(cb.data())) + ".bin";
+	const auto path = directory / filename;
+	struct DeleteFile { std::filesystem::path path; ~DeleteFile() { Common::File::DeleteFile(path); } } file_cleanup {path};
+	std::vector<uint8_t> expected(Size);
+	for (size_t i = 0; i < expected.size(); ++i) expected[i] = uint8_t(i * 37u + (i >> 8u));
+	Common::File file;
+	Check(test, file.Create(path), "create APR input");
+	uint32_t written = 0;
+	file.Write(expected.data(), uint32_t(expected.size()), &written);
+	file.Close();
+	Check(test, written == Size, "write APR input");
+	Libs::LibKernel::FileSystem::Mount(directory, "/apr-test");
+	Libs::LibKernel::FileSystem::Mount(directory, "/app0");
+	const auto guest_path = "/apr-test/" + filename;
+	const char* paths[] {guest_path.c_str()};
+	uint32_t file_id = 0, error_index = 0;
+	uint64_t file_size = 0;
+	CheckOk(test, resolve(paths, 1, &file_id, &file_size, &error_index), "APR resolve file");
+	Check(test, file_size == Size, "APR file size mismatch");
+	const auto append_read = [&] {
+		CheckOk(test, read(cb.data(), 0, 0, file_id, reinterpret_cast<void*>(va), Size, 0), "APR readFile");
+	};
+	if (asynchronous) {
+		alignas(16) std::array<uint8_t, 0x40> writer {};
+		alignas(16) std::array<uint8_t, 0x400> writer_records {};
+		CheckOk(test, construct(writer.data()), "writer constructor");
+		CheckOk(test, set_buffer(writer.data(), writer_records.data(), uint32_t(writer_records.size())), "writer buffer");
+		Destroy destroy_writer {destroy, writer.data()};
+		Result writer_result {};
+		uint32_t reader_id = 0, writer_id = 0;
+		// Reproduce the log: APR is submitted first, AMM supplies its map later on the same guest thread.
+		CheckOk(test, counter_wait(cb.data(), 40, 1, 1, 0, 0, 0, 0), "wait for future AMM map");
+		append_read();
+		CheckOk(test, submit(cb.data(), 0, &result, &reader_id), "enqueue blocked APR reader");
+		// Reset the source before the dependency resolves: the pending batch must own its records.
+		CheckOk(test, reset(cb.data()), "reset submitted reader");
+		CheckOk(test, amm_map_direct(writer.data(), va, physical, Size, SceKernelMtypeC, 0x90), "append AMM map");
+		CheckOk(test, counter_write(writer.data(), 40, 1, 1, 0), "signal after AMM map");
+		CheckOk(test, amm_submit(writer.data(), 0, 0, &writer_result, &writer_id), "enqueue AMM writer");
+		CheckOk(test, amm_wait(writer_id), "AMM completion");
+		CheckOk(test, wait(reader_id), "APR dependency completion");
+		CheckOk(test, writer_result.result, "AMM map execution");
+		CheckOk(test, result.result, "APR deferred read execution");
+		Check(test, std::memcmp(reinterpret_cast<void*>(va), expected.data(), Size) == 0,
+		      "APR ran before the AMM signal or lost its submitted snapshot");
+		CheckOk(test, KernelMunmap(va, Size), "unmap asynchronous read");
+		// Both units use independent priority rings. AMM priority is ABI argument three.
+		alignas(8) uint64_t observed = 0;
+		for (const bool amm: {false, true}) {
+			alignas(8) uint64_t signal = 0;
+			observed = 0;
+			CheckOk(test, reset(cb.data()), "reset priority reader");
+			CheckOk(test, address_wait(cb.data(), &signal, 1, 0, 0), "cross-priority address wait");
+			CheckOk(test, address_write(cb.data(), &observed, 0xabc), "write after address wait");
+			CheckOk(test, amm ? amm_submit(cb.data(), 0, 0, &result, &reader_id)
+			                  : submit(cb.data(), 0, &result, &reader_id), "enqueue priority zero reader");
+			CheckOk(test, reset(writer.data()), "reset signal writer");
+			CheckOk(test, address_write(writer.data(), &signal, 1), "append address signal");
+			CheckOk(test, amm ? amm_submit(writer.data(), 0, 1, &writer_result, &writer_id)
+			                  : submit(writer.data(), 1, &writer_result, &writer_id), "enqueue priority one writer");
+			CheckOk(test, amm ? amm_wait(writer_id) : wait(writer_id), "priority one completion");
+			CheckOk(test, amm ? amm_wait(reader_id) : wait(reader_id), "priority zero completion");
+			CheckOk(test, result.result, "address wait execution");
+			Check(test, observed == 0xabc, "different priorities deadlocked or reordered their commands");
+		}
+		// The anonymous and ID-only ABI entry points must use the same queues as GetResult.
+		const auto apr_submit_id = find.operator()<int (KYTY_SYSV_ABI*)(void*, uint64_t, uint32_t*)>("qvMUCyyaCSI");
+		const auto apr_submit_plain = find.operator()<int (KYTY_SYSV_ABI*)(void*, uint64_t)>("eE4Szl8sil8");
+		const auto amm_submit_id = find.operator()<int (KYTY_SYSV_ABI*)(void*, uint32_t, uint32_t, uint32_t*)>("NnKhlMJtIsI");
+		const auto amm_submit_plain = find.operator()<int (KYTY_SYSV_ABI*)(void*, uint32_t, uint32_t)>("lwS-7y3jcBI");
+		for (const bool amm: {false, true}) {
+			const uint64_t value = amm ? 3 : 2;
+			observed = 0;
+			CheckOk(test, reset(cb.data()), "reset ID-only reader");
+			CheckOk(test, counter_wait(cb.data(), 40, 1, value, 0, 0, 0, 0), "append ID-only wait");
+			CheckOk(test, address_write(cb.data(), &observed, value), "append ID-only completion signal");
+			CheckOk(test, amm ? amm_submit_id(cb.data(), 0, 0, &reader_id)
+			                  : apr_submit_id(cb.data(), 0, &reader_id), "submit ID-only reader");
+			CheckOk(test, reset(writer.data()), "reset anonymous writer");
+			CheckOk(test, counter_write(writer.data(), 40, 1, value, 0), "append anonymous counter signal");
+			CheckOk(test, amm ? amm_submit_plain(writer.data(), 0, 1)
+			                  : apr_submit_plain(writer.data(), 1), "submit anonymous writer");
+			CheckOk(test, amm ? amm_wait(reader_id) : wait(reader_id), "ID-only completion");
+			Check(test, observed == value, "anonymous or ID-only submit bypassed synchronization");
+		}
+		// Counter slices alias the same bank; masked and wrapped comparisons use the selected width.
+		CheckOk(test, reset(cb.data()), "reset counter commands");
+		CheckOk(test, counter_write(cb.data(), 42, 0, 0x1122334455667788ull, 0), "write counter pair");
+		CheckOk(test, counter_write(cb.data(), 42, 4, 0xff, 0), "write low byte");
+		CheckOk(test, counter_write(cb.data(), 42, 4, 1, 4), "add byte with wrap");
+		CheckOk(test, counter_write(cb.data(), 42, 5, 0x80, 1), "OR second byte");
+		CheckOk(test, counter_write(cb.data(), 42, 5, 0x07, 2), "AND complement second byte");
+		CheckOk(test, counter_write(cb.data(), 42, 5, 0x0f, 3), "XOR second byte");
+		CheckOk(test, counter_wait(cb.data(), 42, 1, 0x55000000, 0, 1, 0xff000000, 0), "masked counter wait");
+		CheckOk(test, counter_wait(cb.data(), 42, 4, 0xff, 4, 0, 0, 0), "wrapped byte comparison");
+		CheckOk(test, counter_pair_read(cb.data(), &observed, 42), "read counter pair at execution");
+		execute();
+		CheckOk(test, result.result, "counter execution");
+		Check(test, observed == 0x112233445566ff00ull, "counter aliases, operations or deferred read are incorrect");
+		CheckOk(test, reset(cb.data()), "reset after asynchronous cases");
+		std::printf("[host]    %-48s ok\n", "WolverineAprCrossEngineSynchronization");
+	} else {
+		// The opt-out and other titles must retain the original marker/zero behavior.
+		alignas(8) uint64_t observed = 123;
+		CheckOk(test, counter_wait(cb.data(), 40, 1, 99, 0, 0, 0, 0), "legacy counter wait marker");
+		CheckOk(test, counter_write(cb.data(), 40, 1, 99, 0), "legacy counter write marker");
+		CheckOk(test, counter_read(cb.data(), &observed, 40), "legacy counter read zero");
+		execute();
+		Check(test, result.result == 0 && observed == 0, "async opt-out changed legacy counter behavior");
+		CheckOk(test, reset(cb.data()), "reset legacy synchronization commands");
+	}
+	for (const bool direct: {false, true}) {
+		CheckOk(test, reset(cb.data()), "reset APR commands");
+		CheckOk(test, direct ? map_direct(cb.data(), va, physical, Size, SceKernelMtypeC, 0x80)
+		                     : map(cb.data(), va, Size, SceKernelMtypeC, 0x80), "APR mapBegin");
+		append_read();
+		CheckOk(test, map_end(cb.data()), "APR mapEnd");
+		Check(test, !IsFullyMapped(va, Size), "map was executed during recording instead of submission");
+		execute();
+		CheckOk(test, result.result, "APR map/read execution");
+		const auto mapping = Query(test, va);
+		Check(test, mapping.is_direct && mapping.is_committed &&
+		            (mapping.protection & SceKernelProtCpuRw) != 0 &&
+		            std::memcmp(reinterpret_cast<void*>(va), expected.data(), expected.size()) == 0,
+		      "APR read did not reach the mapped backing with AMPR_WRITE protection");
+		const auto offset = mapping.offset + va - mapping.start;
+		if (direct) Check(test, offset == uint64_t(physical), "APR direct map used wrong physical offset");
+		CheckOk(test, KernelMunmap(va, Size), "APR unmap");
+		if (!direct) CheckOk(test, KernelReleaseDirectMemory(offset, Size), "APR release auto backing");
+	}
+	// Invalid ordering must fail at the read; do not map all pages eagerly before execution.
+	CheckOk(test, reset(cb.data()), "reset reverse-order commands");
+	append_read();
+	CheckOk(test, map_direct(cb.data(), va, physical, Size, SceKernelMtypeC, 0x80), "append late map");
+	CheckOk(test, map_end(cb.data()), "close late map");
+	execute();
+	Check(test, result.result == Libs::LibKernel::KERNEL_ERROR_EFAULT && result.offset == 0 &&
+	            !IsFullyMapped(va, Size), "read before map did not stop safely at its own offset");
+	CheckOk(test, reset(cb.data()), "reset invalid-map commands");
+	CheckOk(test, map_direct(cb.data(), va, KernelGetDirectMemorySize() + SceKernelPageSize,
+	                        Size, SceKernelMtypeC, 0x80), "record invalid physical map");
+	append_read();
+	CheckOk(test, map_end(cb.data()), "close invalid map");
+	execute();
+	Check(test, result.result != 0 && result.offset == 0 && !IsFullyMapped(va, Size),
+	      "failed map allowed its following APR read");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestWolverineAprMapBeforeRead() { CheckAprMapSequence(true, true); }
+void TestWolverineAprSynchronousOptout() { CheckAprMapSequence(true, false); }
+void TestAprMapLegacyMarkers() { CheckAprMapSequence(false); }
+
 } // namespace
 
 int main(int argc, char** argv) {
-	InitSubsystems();
+	const bool wolverine_amm = argc == 2 && std::strcmp(argv[1], "--wolverine-amm-only") == 0;
+	const bool wolverine_amm_optout = argc == 2 && std::strcmp(argv[1], "--wolverine-amm-optout-only") == 0;
+	const bool wolverine_apr = argc == 2 && std::strcmp(argv[1], "--wolverine-apr-only") == 0;
+	const bool wolverine_apr_optout = argc == 2 && std::strcmp(argv[1], "--wolverine-apr-optout-only") == 0;
+	const bool wolverine_apr_sync = argc == 2 && std::strcmp(argv[1], "--wolverine-apr-sync-only") == 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (wolverine_amm || wolverine_amm_optout)
+		_putenv_s("NOVA5_WOLVERINE_AMM_ISOLATION", wolverine_amm ? "1" : "0");
+	if (wolverine_apr || wolverine_apr_optout || wolverine_apr_sync) {
+		_putenv_s("NOVA5_WOLVERINE_AMM_ISOLATION", "1");
+		_putenv_s("NOVA5_WOLVERINE_APR_MAPS", wolverine_apr_optout ? "0" : "1");
+		_putenv_s("NOVA5_WOLVERINE_APR_ASYNC", wolverine_apr_sync ? "0" : "1");
+	}
+#endif
+	InitSubsystems(wolverine_amm || wolverine_amm_optout || wolverine_apr || wolverine_apr_optout || wolverine_apr_sync);
+	if (wolverine_apr || wolverine_apr_optout || wolverine_apr_sync) {
+		RunTest(wolverine_apr_sync ? TestWolverineAprSynchronousOptout :
+		        wolverine_apr ? TestWolverineAprMapBeforeRead : TestAprMapLegacyMarkers);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+	if (argc == 2 && std::strcmp(argv[1], "--wolverine-shader-recovery-only") == 0) {
+		RunTest(TestWolverineShaderRecovery);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+	if (argc == 2 && std::strcmp(argv[1], "--main-entry-stack-only") == 0) {
+		RunTest(TestMainEntryUsesGuestStackAndRestoresHostBounds);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+	if (wolverine_amm || wolverine_amm_optout) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		RunTest(wolverine_amm ? TestWolverineAmmIsolation : TestAmmLegacyLayout);
+#else
+		RunTest(TestAmmLegacyLayout); // The title default currently applies on Windows only.
+#endif
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--prt-direct-concurrent-only") == 0) {
 		RunTest(TestPrtBackingConcurrentDirectResidency);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -2845,6 +3264,8 @@ int main(int argc, char** argv) {
 	}
 
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
+	RunTest(TestAmmLegacyLayout);
+	RunTest(TestWolverineShaderRecovery);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestPrtBackingReadPreservesSparseResidency);
@@ -2865,7 +3286,7 @@ int main(int argc, char** argv) {
 	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 	RunTest(TestGuestStackExitLifecycle);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
-	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
+	RunTest(TestMainEntryUsesGuestStackAndRestoresHostBounds);
 	RunTest(TestFragmentedBackingUnmapRollback);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
@@ -2901,6 +3322,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
+	RunTest(TestAprMapLegacyMarkers);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

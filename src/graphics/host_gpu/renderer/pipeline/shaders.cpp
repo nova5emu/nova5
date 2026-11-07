@@ -569,6 +569,7 @@ static void SharedLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	pipeline.native_bindings       = native_bindings;
 	pipeline.uses_push_descriptors = !native_bindings && descriptor_count <= graphics.max_push_descriptors;
 	std::vector<uint32_t> words {pipeline.uses_push_descriptors ? 1u : 0u, static_cast<uint32_t>(push_stages)};
+	if (graphics.bindless_enabled) words.insert(words.end(), {0x424c4931u, graphics.bindless_max_sampled_images});
 	words.reserve(words.size() + bindings.size() * 4u);
 	for (const auto& binding: bindings) {
 		words.insert(words.end(), {binding.binding, static_cast<uint32_t>(binding.descriptorType), binding.descriptorCount,
@@ -592,8 +593,9 @@ static void SharedLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	EXIT_IF(graphics.device.createDescriptorSetLayout(&create, nullptr, &shared->set) != vk::Result::eSuccess);
 	const vk::PushConstantRange  push_constants {push_stages, 0, ShaderRecompiler::IR::NativePushConstantSize};
 	vk::PipelineLayoutCreateInfo layout_info {};
-	layout_info.setLayoutCount         = 1;
-	layout_info.pSetLayouts            = &shared->set;
+	const std::array layouts {shared->set, graphics.bindless_layout};
+	layout_info.setLayoutCount         = graphics.bindless_enabled ? 2u : 1u;
+	layout_info.pSetLayouts            = layouts.data();
 	layout_info.pushConstantRangeCount = 1;
 	layout_info.pPushConstantRanges    = &push_constants;
 	EXIT_NOT_IMPLEMENTED(graphics.device.createPipelineLayout(&layout_info, nullptr, &shared->layout) != vk::Result::eSuccess);

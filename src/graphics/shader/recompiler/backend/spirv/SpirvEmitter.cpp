@@ -41,6 +41,18 @@ void ValidateNativeProgram(const IR::Program& program) {
 		Expect(Kind::Buffers, Dense(program.info.buffers.size()));
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		const auto& image = program.info.images[i];
+		if (image.bindless) {
+			// Resident sampled images live in set 1, not the native image groups
+			// allocated in set 0. Keep validating their contract before excluding them.
+			if (program.table_mode || image.resource_class != IR::ImageResourceClass::Sampled ||
+			    image.written || image.atomic || image.mip_count != 1u ||
+			    image.indirect_root != IR::ImageResource::NoIndirectImage ||
+			    image.indirect_search_iterations != 0u || !image.indirect_resources.empty()) {
+				Fail(program, "native shader plan has invalid bindless image metadata");
+			}
+			continue;
+		}
 		const auto kind = IR::DescriptorBindingForImage(program.info.images[i]);
 		if (!kind.has_value()) {
 			Fail(program, "native shader plan has an invalid image class");
@@ -90,7 +102,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
 	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
-		     return image.indirect_search_iterations != 0u;
+		     return image.bindless || image.indirect_search_iterations != 0u;
 	     });
 	if (uses_flattened_runtime && !program.table_mode) {
 		Expect(Kind::FlattenedSrt);

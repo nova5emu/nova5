@@ -68,6 +68,9 @@ bool SoftwareRtEnabled() {
 uint64_t RtCodegenFingerprint() {
 	const auto& options = Storage();
 	return (uint64_t {options.rt_node_budget} << 16u) | (uint64_t {options.rt_function} << 8u) |
+	       (uint64_t {options.bindless_images} << 5u) |
+	       (uint64_t {options.coherent_buffers} << 6u) |
+	       (uint64_t {options.wolverine_loop_guard} << 7u) |
 	       (uint64_t {options.rt_node_stats} << 4u) | (uint64_t {options.rt_type6} << 3u) |
 	       (uint64_t {options.rt_stub} << 2u) | (uint64_t {options.rt_software_auto} << 1u) |
 	       uint64_t {options.rt_software};

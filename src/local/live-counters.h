@@ -196,6 +196,19 @@ enum Id : uint32_t {
 	OptionalFlushRequests,
 	SmallFlushDeferrals,   // optional requests deferred by KYTY_FLUSH_MIN_WORK
 	BacklogFlushDeferrals, // optional requests deferred by the existing GPU-backlog policy
+	BindingPlans,         // pure stage plans attempted (KYTY_DRAW_PREP_BINDINGS)
+	BindingPlanFallbacks, // plan refused; preserve the serial preparation
+	BindingPlanUses,      // accepted stage plans consumed in mode 1
+	BindingPlanChecks,    // individual pure outputs compared in verification modes
+	BindingPlanMismatches,
+	DrawPrepSubmitted, DrawPrepWorker, DrawPrepSelf, DrawPrepAccepted, DrawPrepUnused,
+	DrawPrepIneligible, DrawPrepReadFailed, DrawPrepNotPublished, DrawPrepStale,
+	DrawPrepCertUnclean, DrawPrepCertChanged, DrawPrepVerifyChecks, DrawPrepMismatches,
+	DrawPrepDrains, DrawPrepWaitUs, DrawPrepPrepareUs, DrawPrepCertBytes,
+	DrawPrepUsed,         // draws using prepared programs, excluding serial oracle passes
+	DrawPrepBindingPlans, // prepared stage plans handed to consumers (includes comparison modes)
+	DrawPrepReadBacking, DrawPrepReadUncertified, DrawPrepReadOverflow, DrawPrepReadInconsistent,
+	DrawPrepCacheWaitUs,
 	Count
 };
 
@@ -203,7 +216,13 @@ inline constexpr const char* Names[Count] = {
     "window_faults", "window_pages",     "write_faults",     "read_faults",   "reprotects",
     "reprotect_pages", "unprotects",     "unprotect_pages",  "protect_calls", "protect_calls_render",
     "upload_copies", "upload_bytes",     "sync_downloads",   "async_readbacks", "readback_detaches", "readback_evictions", "dispatch_after_dispatch", "dispatch_same_shader", "pm4_suspends", "submission_requeues", "guest_commands", "render_read_faults", "srt_watched_reads", "submission_slices", "buffer_registrations", "bda_rebuilds", "region_syncs", "region_skips", "bda_full_syncs", "bda_range_calls", "bda_ranges", "bda_range_mib", "protect_calls_gfx", "sync_reads_guest", "sync_reads_render", "rb_reject_size", "rb_reject_backing", "rb_reject_image", "rb_reject_capacity", "rb_queue_done", "indirect_tables", "direct_draws", "mesh_draws", "backing_read_bytes", "backing_read_us", "xpr_tries", "xpr_hits", "xpr_miss_key", "xpr_miss_state", "xpr_miss_target", "xpr_miss_validate", "xpr_stores", "vblanks", "async_image_bytes", "backing_lock_waits", "backing_lock_wait_us", "backing_hold_zero_us", "backing_hold_write_us", "backing_hold_map_us", "unmap_finishes", "unmap_finish_us", "partial_dirty_faults", "partial_uploads", "partial_upload_bytes", "partial_fallbacks", "partial_unmaps", "stale_protect_repairs", "readback_parts", "gpu_range_entries", "texture_unmaps", "texture_unmap_us", "texture_unmap_deletes", "full_uploads", "full_upload_bytes", "async_pipelines", "xpr_store_pending", "dispatch_key_new", "dispatch_key_same", "dispatch_key_changed", "draw_key_new", "draw_key_same", "xpr_direct_tries", "xpr_direct_hits", "xpr_stored", "xpr_refuse_program", "xpr_refuse_reads", "xpr_refuse_bind", "xpr_refuse_draw", "xpr_relocated", "xpr_relocated_stored", "depth_overlaps", "depth_overlap_bytes", "xpr_miss_blocked", "xpr_miss_refused", "xpr_miss_unseen", "xpr_miss_budget", "readback_regions", "table_draws", "table_evals", "table_stores", "table_continued", "table_store_variant", "table_store_targets", "table_refused_sets", "table_dispatches", "table_registered", "render_passes", "writeback_skips", "backing_write_waits", "backing_write_wait_us", "gc_image_deletes", "gc_buffer_deletes", "image_refills", "image_refill_bytes", "inorder_uploads", "inorder_upload_bytes", "level_refreshes", "level_skipped_bytes", "table_no_set", "table_draw_native", "table_store_deferred", "upload_wait_us", "upload_busy_us", "record_wait_us", "upload_call_us", "upload_shared_runs", "upload_guard_stops", "table_proof_mismatches", "table_ring_copies", "table_ring_bytes", "table_ring_shared", "table_ring_shared_bytes", "rb_narrowed", "rb_window_narrowed", "unmap_buffer_deletes", "bda_fault_pages", "backing_span_writes", "discarded_gpu_bytes", "guest_move_bytes", "guest_move_same_bytes", "guest_move_gpu_bytes", "unmap_buffer_splits", "unmap_split_freed_bytes", "shortcut_mismatches", "remapped_views", "write_back_retries", "remap_window_writes", "download_pages_released", "address_space_holds", "address_space_hold_kt", "address_space_waits", "address_space_wait_kt", "address_space_wait_kt_render", "address_space_unmap_hold_kt", "address_space_busy_waits", "gpu_unmap_kt", "gpu_map_kt", "placeholder_calls", "placeholder_kt", "parked_unmaps", "parked_releases", "parked_splits", "timeline_queries", "timeline_queries_render", "upload_sleeps", "record_sleeps", "spin_gate_shuts", "read_guard_faults", "read_guard_settles", "read_hot_locks", "read_hot_cools", "read_hot_full", "unmapped_upload_bytes", "presents", "presents_replaced", "presents_not_due", "read_guard_races", "rb_spans", "gb_cs", "gb_gfx", "gb_cache", "gb_release", "upload_help_us",
-    "scheduler_submits", "optional_flush_requests", "small_flush_deferrals", "backlog_flush_deferrals"};
+    "scheduler_submits", "optional_flush_requests", "small_flush_deferrals", "backlog_flush_deferrals",
+    "binding_plans", "binding_plan_fallbacks", "binding_plan_uses", "binding_plan_checks", "binding_plan_mismatches",
+    "dp_submitted", "dp_worker", "dp_self", "dp_accepted", "dp_unused", "dp_ineligible",
+    "dp_read_failed", "dp_not_published", "dp_stale", "dp_cert_unclean", "dp_cert_changed",
+    "dp_verify_checks", "dp_mismatches", "dp_drains", "dp_wait_us", "dp_prepare_us", "dp_cert_bytes",
+    "dp_used", "dp_binding_plans", "dp_read_backing", "dp_read_uncertified", "dp_read_overflow",
+    "dp_read_inconsistent", "dp_cache_wait_us"};
 
 inline std::atomic<uint64_t> g_values[Count];
 // The render thread's counts: it is their only writer, so an increment needs no locked

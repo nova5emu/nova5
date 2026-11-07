@@ -13,6 +13,8 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/WaterfallDescriptor.h"
 #include "resource-plan-serial.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/host_gpu/renderer/wolverine.h"
 
 #include <array>
 #include <atomic>
@@ -53,7 +55,37 @@ bool SameResourceSnapshot(const ResourceSnapshot &lhs,
   return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
          lhs.samplers == rhs.samplers &&
          lhs.flattened_srt == rhs.flattened_srt &&
-         lhs.user_data == rhs.user_data && lhs.uniform_fill == rhs.uniform_fill;
+         lhs.user_data == rhs.user_data && lhs.uniform_fill == rhs.uniform_fill &&
+         lhs.bindless_heaps == rhs.bindless_heaps;
+}
+
+// These fixtures have one indirect root. Its portable ABI is a header word
+// pointing at [key count, sorted key/candidate pairs], not a count at the header.
+uint32_t CheckIndirectMapping(const ResourceSnapshot& snapshot,
+                              const ResourceSpecialization& specialization,
+                              uint32_t expected_keys) {
+  Check(!specialization.images.empty() &&
+            specialization.images.size() == snapshot.images.size(),
+        "indirect image snapshot and specialization differ in size");
+  const auto& root = specialization.images[0];
+  const auto& flat = snapshot.flattened_srt;
+  Check(root.indirect_root == 0 && !root.bindless &&
+            root.indirect_search_iterations == ImageResource::RuntimeIndirectSearch &&
+            root.indirect_mapping_offset < flat.size(),
+        "indirect image mapping lost its portable header");
+  const auto mapping = flat.at(root.indirect_mapping_offset);
+  Check(mapping == root.indirect_mapping_offset + 1u && mapping < flat.size(),
+        "single indirect image table has an invalid header offset");
+  Check(flat.at(mapping) == expected_keys &&
+            size_t{mapping} + 1u + size_t{expected_keys} * 2u == flat.size(),
+        "indirect image mapping has the wrong key count or trailing padding");
+  for (uint32_t i = 0; i < expected_keys; ++i) {
+    const auto at = mapping + 1u + i * 2u;
+    Check((i == 0 || flat.at(at - 2u) < flat.at(at)) &&
+              flat.at(at + 1u) < snapshot.images.size(),
+          "indirect image mapping has unsorted keys or an invalid candidate");
+  }
+  return mapping;
 }
 
 template <typename F>
@@ -291,6 +323,134 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
   return fixture;
 }
 
+void TestWolverineBindlessImages() {
+  namespace SR = Libs::Graphics::ShaderRecompiler;
+  using Libs::Graphics::Wolverine::BindlessImagesEnabled;
+  Check(BindlessImagesEnabled("PPSA03671", nullptr) &&
+        !BindlessImagesEnabled("PPSA03671", "0") &&
+        !BindlessImagesEnabled("PPSA01340", "1") &&
+        !BindlessImagesEnabled("PPSA01923", "1"), "bindless title gate leaked");
+  struct Restore {
+    SR::CodegenOptions saved = SR::GetCodegenOptions();
+    ~Restore() { SR::SetCodegenOptions(saved); }
+  } restore;
+  auto options = restore.saved;
+  options.bindless_images = true;
+  SR::SetCodegenOptions(options);
+  const auto make = [](bool malformed, bool cube = false) {
+    auto f = std::make_unique<Fixture>();
+    const auto masked = f->Emit(ValueOpcode::BitwiseAnd32, {f->UserData(8), Value(0xfffffu)});
+    const auto selected = f->Emit(ValueOpcode::SelectU32, {Value(true), masked, f->UserData(9)});
+    const auto key = f->Emit(ValueOpcode::ReadFirstLane, {selected, Value(true)});
+    const auto offset = f->Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    const auto heap = f->Buffer({f->UserData(4), f->UserData(5), f->UserData(6), f->UserData(7)});
+    std::array<Value, 8> words;
+    for (uint32_t i = 0; i < 8; ++i) {
+      MemoryInfo read;
+      read.kind = ResourceKind::ScalarBuffer;
+      read.offset = i * 4 + (malformed && i == 7 ? 4 : 0);
+      words[i] = f->Emit(ValueOpcode::ReadConstBuffer, {heap, offset}, f->AddMemory(read, 0x113c));
+    }
+    const auto sampler = f->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    for (uint32_t i = 0; i < 2; ++i) {
+      const auto image = f->Image(words, 0x114c + i * 8);
+      MemoryInfo sample;
+      sample.kind = ResourceKind::Image;
+      sample.image_dimension = cube ? Decoder::ImageDimension::Dim2DArray : Decoder::ImageDimension::Dim2D;
+      sample.image_cube = cube;
+      sample.image_sample_flags = Decoder::ImageSampleFlagLod;
+      sample.image_address_components = cube ? 4u : 3u;
+      const auto value = f->Emit(ValueOpcode::ImageSampleRaw, {image, sampler, f->ImageAddress()},
+                                 f->AddMemory(sample, 0x114c + i * 8));
+      const auto x = f->Emit(ValueOpcode::CompositeExtractU32x4, {value, Value(0u)});
+      f->Emit(ValueOpcode::ReferenceU32, {x});
+    }
+    return f;
+  };
+  auto f = make(false);
+  f->PlanAndTrack();
+  auto plan = ExtractResourcePlan(f->program);
+  EliminateDeadCode(f->program.blocks);
+  ValidateProgram(f->program, true);
+  Check(f->program.dynamic_reads.empty(), "descriptor loads survived bindless planning");
+  Check(f->program.info.images.size() == 1, "shared image descriptors did not deduplicate");
+  uint32_t handles = 0;
+  for (const auto& inst: *f->block) if (inst.GetOpcode() == ValueOpcode::GetImageResource) {
+    ++handles;
+    Check(inst.Arg(0).ResolveInstruction()->GetOpcode() == ValueOpcode::ReadFirstLane,
+          "GPU waterfall key was replaced with a CPU candidate");
+  }
+  Check(handles != 0, "no live bindless image handle");
+  std::array<uint32_t, 10> user_data {0, 0, 0, 0, 0x2000, 0, 32u * 65536u, 0, 0xabcde, 7};
+  TestMemory memory;
+  memory.fail_after = 0; // no CPU read of keys or heap contents is legal during materialization
+  SrtRuntime runtime;
+  runtime.user_data = user_data;
+  runtime.read_memory = ReadTestMemory;
+  runtime.read_specialization_memory = ReadTestMemory;
+  runtime.userdata = &memory;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  MaterializeReport report;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization, &report), report.reason.c_str());
+  Check(snapshot.bindless_heaps.size() == 1 && snapshot.bindless_heaps[0].base == 0x2000 &&
+        snapshot.bindless_heaps[0].size == 32u * 65536u && memory.reads == 0,
+        "heap materialization enumerated GPU keys or lost its extent");
+	std::vector<uint8_t> serialized;
+	ResourcePlan restored;
+	Check(ResourcePlanSerial::Save(plan, serialized) && ResourcePlanSerial::Load(serialized, restored),
+	      "bindless resource plan did not serialize");
+	ResourceSnapshot restored_snapshot;
+	ResourceSpecialization restored_specialization;
+	Check(MaterializeResources(restored, runtime, restored_snapshot, restored_specialization) &&
+	      SameResourceSnapshot(snapshot, restored_snapshot) && restored_specialization == specialization,
+	      "serialized bindless plan changed heap or specialization");
+  Check(specialization.images[0].bindless && !TableIndirectForm(specialization, nullptr),
+        "bindless specialization incorrectly entered table mode");
+  ApplyResourceSpecialization(f->program, specialization);
+  ShaderComputeInputInfo compute {};
+  compute.threads_num[0] = compute.threads_num[1] = compute.threads_num[2] = 1;
+  ShaderInfoOptions info;
+  info.compute = &compute;
+  CollectShaderInfo(f->program, info);
+  AllocateBindings(f->program);
+  Check(FindBinding(f->program.bindings, DescriptorBindingKind::FlattenedSrt) != nullptr,
+        "bindless region/count has no SRT binding");
+  for (const auto& binding: f->program.bindings.descriptors)
+    Check(ImageBindingResourceClass(binding.kind) == ImageResourceClass::None,
+          "resident images leaked into descriptor set 0");
+  // Wolverine's 0xf090071a at ade1bef389644fa5+0x114c is SAMPLE_L, DIM=CUBE,
+  // R128=0. It uses the existing face-coordinate conversion and a 2D-array view.
+  auto cube = make(false, true);
+  cube->PlanAndTrack();
+  auto cube_plan = ExtractResourcePlan(cube->program);
+  Check(MaterializeResources(cube_plan, runtime, snapshot, specialization, &report), report.reason.c_str());
+  Check(specialization.images.size() == 1 && specialization.images[0].bindless &&
+        specialization.images[0].cube &&
+        specialization.images[0].dimension == Decoder::ImageDimension::Dim2DArray &&
+        specialization.images[0].mip_count == 1 && memory.reads == 0,
+        "bindless cube lost its face-array shape or enumerated GPU keys");
+  ApplyResourceSpecialization(cube->program, specialization);
+  CollectShaderInfo(cube->program, info);
+  AllocateBindings(cube->program);
+  for (const auto& binding: cube->program.bindings.descriptors)
+    Check(ImageBindingResourceClass(binding.kind) == ImageResourceClass::None,
+          "bindless cube leaked into descriptor set 0");
+  const auto valid_snapshot = snapshot;
+  const auto valid_specialization = specialization;
+  cube_plan.info.images[0].depth_compare = true;
+  Check(!MaterializeResources(cube_plan, runtime, snapshot, specialization, &report) &&
+        report.reason.find("depth_compare=true") != std::string::npos &&
+        SameResourceSnapshot(snapshot, valid_snapshot) && specialization == valid_specialization,
+        "unsupported bindless depth comparison was accepted or mutated the snapshot");
+  auto bad = make(true);
+  CheckFatal([&] { bad->PlanAndTrack(); }, "not a valid runtime value", "noncontiguous descriptor accepted");
+  options.bindless_images = false;
+  SR::SetCodegenOptions(options);
+  auto disabled = make(false);
+  CheckFatal([&] { disabled->PlanAndTrack(); }, "not a valid runtime value", "disabled bindless path accepted GPU key");
+}
+
 void TestInvariantIndirectImageMaterialization() {
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
@@ -401,11 +561,21 @@ void TestInvariantIndirectImageMaterialization() {
             dynamic_snapshot.images.size() == 2,
         "dynamic indirect image table was not specialized transactionally");
   const auto &mapping = dynamic_specialization.images[0];
-  const auto key_count = dynamic_snapshot.flattened_srt[mapping.indirect_mapping_offset];
-  Check(mapping.indirect_search_iterations == std::bit_width(key_count) &&
-            mapping.indirect_mapping_offset + 1u + key_count * 2u ==
-                dynamic_snapshot.flattened_srt.size(),
+  // Portable modules load the mapping's offset from a header, then its key count.
+  // The search length is runtime data, not a specialization of bit_width(count).
+  const auto &flat = dynamic_snapshot.flattened_srt;
+  Check(mapping.indirect_search_iterations == ImageResource::RuntimeIndirectSearch &&
+            mapping.indirect_mapping_offset < flat.size(),
+        "indirect image mapping lost its runtime header");
+  const auto table_offset = flat.at(mapping.indirect_mapping_offset);
+  Check(table_offset == mapping.indirect_mapping_offset + 1u && table_offset < flat.size(),
+        "single indirect image table has an invalid header offset");
+  const auto key_count = flat.at(table_offset);
+  Check(key_count == 2u && table_offset + 1u + key_count * 2u == flat.size(),
         "indirect image mapping retained worst-case padding");
+  Check(flat.at(table_offset + 1u) == 0u && flat.at(table_offset + 2u) == 0u &&
+            flat.at(table_offset + 3u) == 1u && flat.at(table_offset + 4u) == 1u,
+        "indirect image mapping changed its sorted key/candidate pairs");
 
   for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
     memory.words[(0x2000u - memory.base) / 4u + dword] =
@@ -1418,8 +1588,13 @@ void TestDynamicSrtReadRemainsExplicit() {
   Check(fixture.program.bindings.memory_offset_dword ==
                 fixture.program.bindings.user_data_registers.size() &&
             fixture.program.bindings.memory_offset_count == 1u &&
+            fixture.program.bindings.buffer_word_count == 1u &&
+            fixture.program.bindings.BufferWordDword() ==
+                fixture.program.bindings.memory_offset_dword + 1u &&
+            fixture.program.bindings.lod_stats_count == 0u &&
+            fixture.program.bindings.table_block_dwords == 0u &&
             fixture.program.bindings.ShaderDataDwords() ==
-                fixture.program.bindings.memory_offset_dword + 1u,
+                fixture.program.bindings.memory_offset_dword + 2u,
         "unified memory-offset layout is inconsistent");
 }
 
@@ -1586,7 +1761,7 @@ void TestPhiValidation() {
         "control-dependent descriptor phi was not rejected transactionally");
 }
 
-Fixture MakeNullPathSamplerFixture(uint32_t null_dword) {
+Fixture MakeNullPathSamplerFixture(uint32_t null_dword, bool reverse_edges = false) {
   Fixture fixture;
   auto *loaded = fixture.block;
   auto *nulled = fixture.AddBlock();
@@ -1600,8 +1775,13 @@ Fixture MakeNullPathSamplerFixture(uint32_t null_dword) {
     const bool flipped = index == null_dword;
     auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {},
                                      static_cast<uint64_t>(Type::U32));
-    phi.AddPhiOperand(loaded, flipped ? Value(0u) : word);
-    phi.AddPhiOperand(nulled, flipped ? word : Value(0u));
+    if (reverse_edges && (index & 1u)) {
+      phi.AddPhiOperand(nulled, flipped ? word : Value(0u));
+      phi.AddPhiOperand(loaded, flipped ? Value(0u) : word);
+    } else {
+      phi.AddPhiOperand(loaded, flipped ? Value(0u) : word);
+      phi.AddPhiOperand(nulled, flipped ? word : Value(0u));
+    }
     sampler_words[index] = Value(&phi);
   }
   std::array<Value, 8> image_words{};
@@ -1644,15 +1824,87 @@ void TestNullDescriptorPathCollapse() {
         "sampler nulled on one branch did not collapse to the loaded value");
 }
 
-void TestMixedNullDescriptorPathsRejected() {
-  auto fixture = MakeNullPathSamplerFixture(1u);
-  BuildSrtPlan(fixture.program);
-  CheckFatal([&] { TrackResources(fixture.program); },
-             "not a valid runtime value",
-             "descriptor nulled on mismatched branches was accepted");
-  Check(!fixture.program.resource_tracking_complete &&
-            fixture.program.info.samplers.empty(),
-        "descriptor nulled on mismatched branches was partially accepted");
+void TestMixedNullDescriptorPathsPreserveBranches() {
+  namespace SR = Libs::Graphics::ShaderRecompiler;
+  struct Restore {
+    SR::CodegenOptions saved = SR::GetCodegenOptions();
+    ~Restore() { SR::SetCodegenOptions(saved); }
+  } restore;
+  // 384fe544 added exact GPU selection of two sampler alternatives. This must
+  // not regress to combining the nonzero words from different incoming edges.
+  for (const bool bindless : {false, true}) for (const bool reverse_edges : {false, true}) {
+    auto options = restore.saved;
+    options.bindless_images = bindless;
+    SR::SetCodegenOptions(options);
+    auto fixture = MakeNullPathSamplerFixture(1u, reverse_edges);
+    auto* loaded = fixture.program.blocks[0];
+    auto* nulled = fixture.program.blocks[1];
+    auto* merge = fixture.program.blocks[2];
+    auto sample = std::ranges::find_if(*merge, [](const Inst& inst) {
+      return inst.GetOpcode() == ValueOpcode::ImageSampleRaw;
+    });
+    Check(sample != merge->end(), "mixed-null fixture has no image sample");
+    const auto use = fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+        {Value(&*sample), Value(0u)}, 0, merge);
+    fixture.PlanAndTrack();
+    Check(fixture.program.info.samplers.size() == 2 &&
+              fixture.program.info.sampled_pairs.size() == 2 &&
+              fixture.program.info.images.size() == 1 &&
+              !fixture.program.info.images[0].bindless &&
+              !fixture.program.descriptor_sources[fixture.program.info.images[0].source].indirect_image,
+          "mixed-null sampler did not retain two ordinary alternatives");
+    const auto* result = use.Instruction()->Arg(0).Resolve().TryInstruction();
+    Check(result && result->GetOpcode() == ValueOpcode::CompositeConstructU32x4,
+          "mixed-null sampler result was not selected in GPU code");
+    const Inst* selector = nullptr;
+    std::array<uint32_t, 2> sampler_indices {};
+    for (uint32_t component = 0; component < 4; ++component) {
+      const auto* selected = result->Arg(component).Resolve().TryInstruction();
+      Check(selected && selected->GetOpcode() == ValueOpcode::SelectU32,
+            "mixed-null sampler lost result component selection");
+      const auto* condition = selected->Arg(0).Resolve().TryInstruction();
+      Check(condition && condition->GetOpcode() == ValueOpcode::IEqual32 &&
+                condition->Arg(1).IsImmediate() && condition->Arg(1).U32() == 0u,
+            "mixed-null sampler does not select the first edge on selector zero");
+      const auto* phi = condition->Arg(0).Resolve().TryInstruction();
+      Check(phi && phi->GetOpcode() == ValueOpcode::Phi && phi->Parent() == merge &&
+                phi->NumArgs() == 2 && phi->NumPhiBlocks() == 2 &&
+                phi->PhiBlock(0) == loaded && phi->PhiBlock(1) == nulled &&
+                phi->Arg(0).IsImmediate() && phi->Arg(0).U32() == 0u &&
+                phi->Arg(1).IsImmediate() && phi->Arg(1).U32() == 1u &&
+                (selector == nullptr || selector == phi),
+            "mixed-null sampler selection lost its incoming-edge identity");
+      selector = phi;
+      for (uint32_t arm = 0; arm < 2; ++arm) {
+        const auto* extract = selected->Arg(arm + 1u).Resolve().TryInstruction();
+        Check(extract && extract->GetOpcode() == ValueOpcode::CompositeExtractU32x4 &&
+                  extract->Arg(1).IsImmediate() && extract->Arg(1).U32() == component,
+              "mixed-null sampler selected the wrong result component");
+        const auto* sampled = extract->Arg(0).Resolve().TryInstruction();
+        Check(sampled && sampled->GetOpcode() == ValueOpcode::ImageSampleRaw && sampled->Parent() == merge,
+              "mixed-null sampler alternative is not sampled at the merge");
+        const auto index = fixture.program.memory_info.at(sampled->Flags<MemoryFlags>().index).sampler;
+        Check(index < 2 && (component == 0 || sampler_indices[arm] == index),
+              "mixed-null sampler components selected different alternatives");
+        sampler_indices[arm] = index;
+      }
+    }
+    Check(sampler_indices[0] != sampler_indices[1], "mixed-null samplers collapsed to one descriptor");
+    for (uint32_t draw = 0; draw < 2; ++draw) {
+      const std::array<uint32_t, 16> user_data {
+          0x11u + draw * 0x100u, 0x22u + draw, 0x33u + draw, 0x44u + draw};
+      const std::array<std::array<uint32_t, 4>, 2> expected {{
+          {user_data[0], 0u, user_data[2], user_data[3]}, {0u, user_data[1], 0u, 0u}}};
+      for (uint32_t arm = 0; arm < 2; ++arm) {
+        DescriptorValue descriptor;
+        Check(EvaluateDescriptorSource(fixture.program,
+                  fixture.program.info.samplers[sampler_indices[arm]].source,
+                  {.user_data = user_data}, descriptor) && descriptor.dword_count == 4 &&
+                  std::equal(expected[arm].begin(), expected[arm].end(), descriptor.dwords.begin()),
+              "mixed-null sampler invented a descriptor by combining different edges");
+      }
+    }
+  }
 }
 
 struct WaterfallFixture {
@@ -1783,15 +2035,9 @@ void TestDenseIndirectImageMaterialization() {
   ResourceSpecialization specialization;
   Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
         "dense indirect image table did not materialize");
-  const auto mapping = specialization.images.empty()
-                           ? UINT32_MAX
-                           : specialization.images[0].indirect_mapping_offset;
+  const auto mapping = CheckIndirectMapping(snapshot, specialization, kEntries);
   Check(specialization.images.size() == kEntries &&
-            snapshot.images.size() == kEntries &&
-            specialization.images[0].indirect_root == 0 &&
-            mapping != UINT32_MAX &&
-            mapping + 1u + kEntries * 2u <= snapshot.flattened_srt.size() &&
-            snapshot.flattened_srt[mapping] == kEntries,
+            snapshot.images.size() == kEntries,
         "dense indirect image table did not enumerate its bound");
   const auto candidate_of = [&](const ResourceSnapshot &view, uint32_t key) {
     const auto offset = mapping + 1u + key * 2u;
@@ -1968,17 +2214,14 @@ void TestLoopBoundedDenseIndirectImage() {
   ResourceSpecialization specialization;
   Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
         "loop-bounded dense table did not materialize");
-  const auto mapping = specialization.images.empty()
-                           ? UINT32_MAX
-                           : specialization.images[0].indirect_mapping_offset;
-  Check(specialization.images.size() == 3u && snapshot.images.size() == 3u &&
-            mapping != UINT32_MAX &&
-            mapping + 1u + 3u * 2u <= snapshot.flattened_srt.size() &&
-            snapshot.flattened_srt[mapping] == 3u,
-        "loop-bounded dense table did not enumerate the runtime count");
+  const auto mapping = CheckIndirectMapping(snapshot, specialization, 3u);
+  Check(specialization.images.size() == 4u && snapshot.images.size() == 4u &&
+            std::ranges::all_of(snapshot.images[3].dwords, [](uint32_t word) { return word == 0; }),
+        "three loop-bounded candidates must occupy four slots with null padding");
   for (uint32_t entry_index = 0; entry_index < 3u; entry_index++) {
     const auto offset = mapping + 1u + entry_index * 2u;
     Check(snapshot.flattened_srt[offset] == entry_index &&
+              snapshot.flattened_srt[offset + 1u] < 3u &&
               snapshot.images[snapshot.flattened_srt[offset + 1u]].dwords[0] ==
                   0x40u + entry_index,
           "loop-bounded dense table read the wrong entry");
@@ -2118,12 +2361,8 @@ void TestFindLsbDenseIndirectImage() {
   ResourceSpecialization specialization;
   Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
         "lsb-keyed dense table did not materialize");
-  const auto mapping = specialization.images.empty()
-                           ? UINT32_MAX
-                           : specialization.images[0].indirect_mapping_offset;
+  const auto mapping = CheckIndirectMapping(snapshot, specialization, 32u);
   Check(specialization.images.size() == 32u && snapshot.images.size() == 32u &&
-            mapping != UINT32_MAX &&
-            mapping + 1u + 32u * 2u <= snapshot.flattened_srt.size() &&
             snapshot.flattened_srt[mapping] == 32u,
         "lsb-keyed dense table did not enumerate all 32 bit positions");
   for (uint32_t entry_index = 0; entry_index < 32u; entry_index++) {
@@ -2312,17 +2551,14 @@ void TestReadLaneProbeIndirectImage(bool first_lane = false, bool loop_mask = fa
           "address probe span reads skipped an unreadable record key");
     return;
   }
-  const auto mapping = specialization.images.empty()
-                           ? UINT32_MAX
-                           : specialization.images[0].indirect_mapping_offset;
-  Check(specialization.images.size() == 3u && snapshot.images.size() == 3u &&
-            mapping != UINT32_MAX &&
-            mapping + 1u + 3u * 2u <= snapshot.flattened_srt.size() &&
-            snapshot.flattened_srt[mapping] == 3u,
-        "address probe did not collect the records' distinct keys");
+  const auto mapping = CheckIndirectMapping(snapshot, specialization, 3u);
+  Check(specialization.images.size() == 4u && snapshot.images.size() == 4u &&
+            std::ranges::all_of(snapshot.images[3].dwords, [](uint32_t word) { return word == 0; }),
+        "three address-probe candidates must occupy four slots with null padding");
   for (uint32_t key_value = 0; key_value < 3u; key_value++) {
     const auto offset = mapping + 1u + key_value * 2u;
     Check(snapshot.flattened_srt[offset] == key_value &&
+              snapshot.flattened_srt[offset + 1u] < 3u &&
               snapshot.images[snapshot.flattened_srt[offset + 1u]].dwords[0] ==
                   0x40u + key_value,
           "address probe read the wrong table entry for a key");
@@ -4121,20 +4357,39 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  const bool keep_going = argc == 2 && std::strcmp(argv[1], "--keep-going") == 0;
+  size_t test_count = 0, failed_count = 0;
   try {
     // KYTY_TEST_FILTER: only the tests whose name contains it.
     const char *filter = std::getenv("KYTY_TEST_FILTER");
-    const auto Run = [filter](const char *name, auto test) {
+    const auto Run = [&](const char *name, auto test) {
       if (filter != nullptr && std::strstr(name, filter) == nullptr) return;
+      ++test_count;
       try {
         test();
+        if (keep_going) std::cout << "[PASS] " << name << std::endl;
       } catch (const std::exception &exception) {
-        throw std::runtime_error(std::string(name) + ": " + exception.what());
+        if (!keep_going)
+          throw std::runtime_error(std::string(name) + ": " + exception.what());
+        ++failed_count;
+        std::cerr << "[FAIL] " << name << ": " << exception.what() << std::endl;
       }
     };
+    if (argc == 2 && std::strcmp(argv[1], "--wolverine-bindless-only") == 0) {
+      Run("Wolverine bindless images", TestWolverineBindlessImages);
+      std::cout << "Wolverine bindless images passed\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--invariant-indirect-only") == 0) {
+      Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
+      std::cout << "invariant indirect image tests passed\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--sampler-phi-only") == 0) {
       Run("sampler Phi selection", TestSamplerPhiSelection);
       Run("sampler Phi near misses", TestSamplerPhiNearMisses);
+      Run("null descriptor path", TestNullDescriptorPathCollapse);
+      Run("mixed null descriptor paths", TestMixedNullDescriptorPathsPreserveBranches);
       Run("phi validation", TestPhiValidation);
       Run("images and samplers", TestImagesSamplersAndAliases);
       Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
@@ -4188,6 +4443,7 @@ int main(int argc, char** argv) {
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
+    Run("Wolverine bindless images", TestWolverineBindlessImages);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("sampler Phi selection", TestSamplerPhiSelection);
@@ -4209,7 +4465,7 @@ int main(int argc, char** argv) {
     Run("waterfall near misses", TestWaterfallNearMissesRejected);
     Run("waterfall rewrite", TestWaterfallRewriteDescalarizes);
     Run("null descriptor path", TestNullDescriptorPathCollapse);
-    Run("mixed null descriptor paths", TestMixedNullDescriptorPathsRejected);
+    Run("mixed null descriptor paths", TestMixedNullDescriptorPathsPreserveBranches);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("large runtime evaluation", TestLargeRuntimeEvaluation);
     Run("extracted runtime evaluation", TestExtractedRuntimeEvaluation);
@@ -4229,6 +4485,11 @@ int main(int argc, char** argv) {
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;
+  }
+  if (keep_going) {
+    std::cout << "resource tracking tests: " << test_count << " executed, "
+              << failed_count << " failed\n";
+    if (test_count == 0 || failed_count != 0) return 1;
   }
   std::cout << "resource tracking tests passed\n";
   return 0;

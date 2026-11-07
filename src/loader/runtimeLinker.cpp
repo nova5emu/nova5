@@ -8,6 +8,7 @@
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
+#include "common/memoryWriteWatch.h"
 #include "common/platform/sysDbg.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
@@ -31,10 +32,13 @@
 #include "loader/demonsSoulsEnginePools.h"
 #include "loader/demonsSoulsTouchGuard.h"
 #include "loader/elf.h"
+#include "loader/loadTrace.h"
 #include "loader/gamePatch.h"
 #include "loader/jit.h"
 #include "loader/redZonePatcher.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
+#include "loader/wolverine.h"
 #include "loader/x64InstructionEmulator.h"
 #include "live-trace.h"
 
@@ -82,8 +86,9 @@ public:
 	}
 private:
 	void Print(const char* phase, long long ms) const {
-		std::printf("[LOADER] %s stage=%s module=%s address=0x%llx elapsed_ms=%lld\n",
-		            phase, stage_, module_.c_str(), static_cast<unsigned long long>(address_), ms);
+		std::printf("[LOADER] %s stage=%s module=%s address=0x%llx elapsed_ms=%lld clock_ms=%lld\n",
+		            phase, stage_, module_.c_str(), static_cast<unsigned long long>(address_), ms,
+		            LoadTrace::ClockMs());
 		std::fflush(stdout);
 	}
 	const char* stage_;
@@ -581,11 +586,13 @@ bool TestMainEntryUsesGuestStack() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t original_teb_stack_base  = 0;
 	uintptr_t original_teb_stack_limit = 0;
+	uintptr_t host_deallocation_stack = 0;
 	asm volatile("movq %%gs:0x08, %0\n\t"
 	             "movq %%gs:0x10, %1\n\t"
 	             : "=r"(original_teb_stack_base), "=r"(original_teb_stack_limit)
 	             :
 	             : "memory");
+	asm volatile("movq %%gs:0x1478, %0" : "=r"(host_deallocation_stack) : : "memory");
 #endif
 
 	RunEntry(reinterpret_cast<uint64_t>(TestMainEntryStackCallback), &params, nullptr,
@@ -599,7 +606,11 @@ bool TestMainEntryUsesGuestStack() {
 	             : "=r"(restored_teb_stack_base), "=r"(restored_teb_stack_limit)
 	             :
 	             : "memory");
-	const bool teb_ok = state.teb_stack_base == 0 && state.teb_stack_limit == 0 &&
+	// e7109edc: CFG continuation checks require the guest stack region when the
+	// host allocation is above it. RunEntry only uses zeros on low host stacks.
+	const bool guest_range = host_deallocation_stack >= Common::HostException::GuestStacksHigh;
+	const bool teb_ok = state.teb_stack_base == (guest_range ? Common::HostException::GuestStacksHigh : 0) &&
+	                    state.teb_stack_limit == (guest_range ? Common::HostException::GuestStacksLow : 0) &&
 	                    restored_teb_stack_base == original_teb_stack_base &&
 	                    restored_teb_stack_limit == original_teb_stack_limit;
 #else
@@ -609,6 +620,10 @@ bool TestMainEntryUsesGuestStack() {
 	const bool rsp_ok  = state.rsp >= stack_base && state.rsp < stack_base + stack_size;
 	const bool root_ok = root_frame[0] == 0 && root_frame[1] == 0;
 	const bool freed   = Libs::LibKernel::Memory::FreeGuestMemory(stack_base, stack_size);
+	if (!(state.called && rsp_ok && root_ok && teb_ok && freed)) {
+		std::fprintf(stderr, "MainEntryStack: called=%d rsp=%d root=%d teb=%d freed=%d\n",
+		             state.called, rsp_ok, root_ok, teb_ok, freed);
+	}
 	return state.called && rsp_ok && root_ok && teb_ok && freed;
 }
 
@@ -849,9 +864,95 @@ static std::string DescribeGuestCode(uint64_t vaddr) {
 	}
 	return bytes;
 }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Opt-in observation of PPSA03671 01.001.005's sound processor registry. The
+// successful registration path stores RSI into table[RCX], increments the count,
+// then executes MOV AL,1; RET. Trap only that MOV, preserving its exact semantics.
+// No object is manufactured and the failing virtual call is never skipped.
+static uint64_t g_wolverine_sound_trace_base = 0;
+static std::atomic<uint64_t> g_wolverine_sound_registered_table {0};
+static std::atomic<unsigned> g_wolverine_sound_registrations {0};
+
+static void PrintWolverineSoundWords(const char* label, uint64_t address, unsigned count) {
+	std::printf("[WOLVERINE_SOUND] %s address=0x%016" PRIx64, label, address);
+	if (!IsReadableRange(address, count * sizeof(uint64_t))) {
+		std::printf(" unreadable\n");
+		return;
+	}
+	const auto* words = reinterpret_cast<const uint64_t*>(address);
+	for (unsigned i = 0; i < count; ++i) std::printf(" %016" PRIx64, words[i]);
+	std::printf("\n");
+}
+
+static bool TraceWolverineSoundRegistration(const Common::HostException::ExceptionInfo& info) {
+	const auto base = g_wolverine_sound_trace_base;
+	if (base == 0 || info.type != Common::HostException::ExceptionType::IllegalInstruction ||
+	    info.exception_address != base + 0x4041288 || info.native_context == nullptr) return false;
+	const auto hit = g_wolverine_sound_registrations.fetch_add(1, std::memory_order_relaxed);
+	g_wolverine_sound_registered_table.store(info.rax, std::memory_order_relaxed);
+	if (hit < 16) {
+		std::printf("[WOLVERINE_SOUND] register=%u clock_ms=%lld owner=0x%016" PRIx64
+		            " table=0x%016" PRIx64 " index=%" PRIu64 " object=0x%016" PRIx64 "\n",
+		            hit, LoadTrace::ClockMs(), info.rdi, info.rax, info.rcx, info.rsi);
+		PrintWolverineSoundWords("return", info.rsp, 1);
+		PrintWolverineSoundWords("registry(+380)", info.rdi + 0x380, 4);
+		PrintWolverineSoundWords("slots[0..2]", info.rax, 3);
+		PrintWolverineSoundWords("object/vtable", info.rsi, 2);
+		std::fflush(stdout);
+	}
+	if (hit == 2 && info.rdi == base + 0xbeddec0 && info.rcx == 2) {
+		const auto* watch = std::getenv("NOVA5_WOLVERINE_SOUND_WATCH");
+		if (watch != nullptr && std::strcmp(watch, "1") == 0) {
+			const auto* backing = Libs::LibKernel::Memory::TryGetBackingPointer(info.rax, 64);
+			uint64_t backing_base = 0, backing_size = 0;
+			if (backing != nullptr && Libs::LibKernel::Memory::BackingView(&backing_base, &backing_size))
+				std::printf("[WOLVERINE_SOUND] table backing offset=0x%llx mapping_end=0x%llx\n",
+				            static_cast<unsigned long long>(reinterpret_cast<uint64_t>(backing) - backing_base),
+				            static_cast<unsigned long long>(Libs::LibKernel::Memory::BackingMappingEnd(info.rax)));
+			if (!Common::MemoryWriteWatch::Arm(info.rax, reinterpret_cast<uint64_t>(backing)))
+				std::printf("[WOLVERINE_SOUND] write watch refused: missing/mismatched backing or unsuitable protection\n");
+			std::fflush(stdout);
+		}
+	}
+	auto* context = static_cast<CONTEXT*>(info.native_context);
+	context->Rax = (context->Rax & ~uint64_t {0xff}) | 1;
+	context->Rip += 2; // MOV AL,1 does not modify flags or any other register.
+	return true;
+}
+
+static void DumpWolverineSoundRegistry() {
+	const auto base = g_wolverine_sound_trace_base;
+	if (base == 0) return;
+	Common::MemoryWriteWatch::Report();
+	const auto owner = base + 0xbeddec0;
+	std::printf("[WOLVERINE_SOUND] fault snapshot clock_ms=%lld registrations=%u\n",
+	            LoadTrace::ClockMs(), g_wolverine_sound_registrations.load(std::memory_order_relaxed));
+	PrintWolverineSoundWords("registry(+380)", owner + 0x380, 4);
+	uint64_t current_table = 0;
+	if (IsReadableRange(owner + 0x388, sizeof(uint64_t)))
+		current_table = *reinterpret_cast<const uint64_t*>(owner + 0x388);
+	const auto registered_table = g_wolverine_sound_registered_table.load(std::memory_order_relaxed);
+	for (const auto table: {registered_table, current_table}) {
+		PrintWolverineSoundWords("table at register / at fault", table, 8);
+		if (table != 0) {
+			std::printf("[WOLVERINE_SOUND] GPU write-backs over table page:\n");
+			if (!Libs::LibKernel::Memory::PrintWriteBacksOverlapping(table & ~uint64_t {0xfff}, 0x1000))
+				std::printf("  none in retained history\n");
+		}
+	}
+	for (const uint64_t offset: {0x9b8ae20ull, 0xbeda190ull, 0x9b8b230ull})
+		PrintWolverineSoundWords("expected static object", base + offset, 4);
+	std::fflush(stdout);
+}
+#endif
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (TraceWolverineSoundRegistration(*info)) return true;
+#endif
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
 		return true;
@@ -934,6 +1035,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 		Common::Termination::Report("unhandled-cpu-exception", info->native_code, info->exception_address, true);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		DumpWolverineSoundRegistry();
+#endif
 		std::printf("--- Guest fault context ---\n");
 		std::printf("thread: %s\n", thread_name);
 		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
@@ -2262,7 +2366,15 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	const bool precise_rsqrt = cpu_mode == Config::GuestCpuMode::Full;
 	const bool emulate_amd = precise_rsqrt || (cpu_mode == Config::GuestCpuMode::Auto &&
 	    (!host_features.sse4a || !host_features.rdpid || !host_features.clwb));
-	const bool protect_memory = Config::RedZoneProtectionEnabled();
+	std::string title_id;
+	SystemContentParamSfoGetString("TITLE_ID", &title_id);
+	const bool protect_memory = Wolverine::RedZoneProtectionEnabled(
+	    Config::RedZoneProtectionEnabled(), title_id, std::getenv("NOVA5_WOLVERINE_REDZONE"));
+	if (title_id == "PPSA03671") {
+		std::printf("[WOLVERINE] module=%s redzone_memory=%u explicit=%u (NOVA5_WOLVERINE_REDZONE)\n",
+		            module_name.c_str(), unsigned(protect_memory), unsigned(Config::RedZoneProtectionEnabled()));
+		std::fflush(stdout);
+	}
 	const bool use_red_zone_protection = protect_memory || emulate_amd;
 	constexpr uint64_t RED_ZONE_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (use_red_zone_protection) {
@@ -2332,6 +2444,29 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     "[%d] mode        = %s\n",
 			     i, segment_addr, i, segment_file_size, i, segment_memory_size, i,
 			     Common::EnumName(mode).c_str());
+
+			if (LoadTrace::Enabled()) {
+				std::printf("[LOADER_SEGMENT] module=%s index=%u type=0x%x flags=0x%x address=0x%llx "
+				            "file_offset=0x%llx filesz=0x%llx memsz=0x%llx protect_size=0x%llx align=0x%llx\n",
+				            module_name.c_str(), static_cast<unsigned>(i), phdr[i].p_type, phdr[i].p_flags,
+				            static_cast<unsigned long long>(segment_addr), static_cast<unsigned long long>(phdr[i].p_offset),
+				            static_cast<unsigned long long>(segment_file_size), static_cast<unsigned long long>(phdr[i].p_memsz),
+				            static_cast<unsigned long long>(segment_memory_size), static_cast<unsigned long long>(phdr[i].p_align));
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				// Inspect actual host permissions, including pages shared with the previous segment.
+				for (uint64_t cursor = segment_addr; cursor - segment_addr < segment_file_size;) {
+					MEMORY_BASIC_INFORMATION info {};
+					if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) break;
+					const auto region = reinterpret_cast<uint64_t>(info.BaseAddress);
+					std::printf("[LOADER_MEMORY] module=%s address=0x%llx region=0x%llx size=0x%llx state=0x%lx protect=0x%lx\n",
+					            module_name.c_str(), static_cast<unsigned long long>(cursor), static_cast<unsigned long long>(region),
+					            static_cast<unsigned long long>(info.RegionSize), info.State, info.Protect);
+					if (info.RegionSize > UINT64_MAX - region || region + info.RegionSize <= cursor) break;
+					cursor = region + info.RegionSize;
+				}
+#endif
+				std::fflush(stdout);
+			}
 
 			{ LoadStage stage("read-segment", module_name, segment_addr);
 			  program->elf->LoadSegment(segment_addr, phdr[i].p_offset, segment_file_size); }
@@ -2441,6 +2576,35 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		Common::VirtualMemory::FlushInstructionCache(program->red_zone_trampoline_vaddr,
 		                                             program->red_zone_trampoline_size);
 	}
+	const auto* sound_trace = std::getenv("NOVA5_WOLVERINE_SOUND_TRACE");
+	if (!is_shared && title_id == "PPSA03671" && module_name == "eboot.bin" &&
+	    sound_trace != nullptr && std::strcmp(sound_trace, "1") == 0) {
+		// Check both the producer and consumer in the loaded code, AFTER ISA/red-zone
+		// patching. A different executable or a rewritten site must refuse the probe.
+		constexpr uint8_t producer[] {0x48, 0x89, 0x34, 0xc8, 0xff, 0x87, 0x94, 0x03,
+		                              0x00, 0x00, 0xb0, 0x01, 0xc3};
+		constexpr uint8_t consumer[] {0x48, 0x8b, 0x3c, 0xc2, 0x41, 0x8b, 0x14, 0x88,
+		                              0x4c, 0x8b, 0x85, 0x78, 0xff, 0xff, 0xff, 0x4c,
+		                              0x89, 0xf1, 0x48, 0x8b, 0x07, 0xff, 0x50, 0x10};
+		const auto base = program->base_vaddr;
+		if (program->base_size >= 0xbeddec0 + 0x3a0 &&
+		    IsReadableRange(base + 0x404127e, sizeof(producer)) &&
+		    IsReadableRange(base + 0x403fb04, sizeof(consumer)) &&
+		    std::memcmp(reinterpret_cast<const void*>(base + 0x404127e), producer, sizeof(producer)) == 0 &&
+		    std::memcmp(reinterpret_cast<const void*>(base + 0x403fb04), consumer, sizeof(consumer)) == 0) {
+			g_wolverine_sound_trace_base = base;
+			g_wolverine_sound_registered_table.store(0, std::memory_order_relaxed);
+			g_wolverine_sound_registrations.store(0, std::memory_order_relaxed);
+			auto* site = reinterpret_cast<uint8_t*>(base + 0x4041288);
+			site[0] = 0x0f;
+			site[1] = 0x0b; // UD2, handled only at this exact address.
+			Common::VirtualMemory::FlushInstructionCache(base + 0x4041288, 2);
+			std::printf("[WOLVERINE_SOUND] enabled: registration at eboot+4041288\n");
+		} else {
+			std::printf("[WOLVERINE_SOUND] refused: executable/site signature mismatch\n");
+		}
+		std::fflush(stdout);
+	}
 #endif
 
 	if (!is_shared) {
@@ -2452,6 +2616,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 void RuntimeLinker::DeleteProgram(Program* p) {
 	auto program = std::unique_ptr<Program>(p);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (g_wolverine_sound_trace_base == program->base_vaddr) {
+		Common::MemoryWriteWatch::Disarm();
+		g_wolverine_sound_trace_base = 0;
+	}
+#endif
 	if (g_tls_main_program == program.get()) {
 		g_tls_main_program = nullptr;
 	}

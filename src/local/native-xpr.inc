@@ -1814,7 +1814,7 @@ void RenderExecutor::NativeXprStore(CommandBuffer& buffer, const DrawRenderState
 		for (const auto& resource: program.info.buffers)
 			if (resource.written || resource.atomic) return refuse_program();
 		for (const auto& image: program.info.images)
-			if (image.written || image.atomic) return refuse_program();
+			if (image.bindless || image.written || image.atomic) return refuse_program();
 		for (const auto& image: prepared->images)
 			if (image.desc.type == TextureCache::BindingType::Storage) return refuse_program();
 	}

@@ -91,7 +91,7 @@ public:
 
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
-	// The texture offload's hold on whole pages (texture-offload.h): no access while it lasts, a
+	// Counted holds on whole pages (texture offload and demand image readback): no access while any lasts, a
 	// count of its own beside the watchers (the memory tracker's read watcher of a page GPU work
 	// wrote stays its own); reads of them fault (HasReadWatchers). `reapply` (a release): the
 	// offload changed the pages' host protection (a touch made them readable), so every page gets

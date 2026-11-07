@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -876,6 +877,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		auto layout = feedback ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 		                       : depth_attachment_layout(depth);
+		if (image.binding.bindless_general) layout = vk::ImageLayout::eGeneral;
 		auto writable = depth.AttachmentWriteAspects() & vk::ImageAspectFlagBits::eStencil;
 		if (depth.depth_write_enable) {
 			writable |= vk::ImageAspectFlagBits::eDepth;
@@ -1352,6 +1354,30 @@ static bool RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 		LogDrawPhase(draw.name, "GetGraphicsPrograms");
 	}
 	(void)PipelineCache::TakeMaterializationFailure();
+	if (auto* prepared = DrawPrep::TakePrepared(); prepared &&
+	    DrawPrep::Validate(pipeline_cache, *prepared, state.ps_active, target_export_mapping)) {
+		if (DrawPrep::GetMode() == DrawPrep::Mode::Probe || DrawPrep::VerifyMode() != 0) {
+			// The oracle always renders its serial result, even after a match.
+			state.programs = pipeline_cache.GetGraphicsPrograms(
+			    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
+			    target_export_mapping, state.ps_active, state.vs_input_info, state.ps_input_info);
+			const bool failed = PipelineCache::TakeMaterializationFailure();
+			const bool same = DrawPrep::Verify(*prepared, state.programs, state.vs_input_info, state.ps_input_info);
+			// In binding verification modes, compare the worker's actual plans
+			// against the serial consumers too, still rendering serial values.
+			if (!failed && same && prepared->binding_mode >= 2)
+				DrawPrep::OfferBindingPlans(*prepared, state.vs_input_info.stage,
+				                            state.ps_active ? &state.ps_input_info.stage : nullptr);
+			return !failed;
+		}
+		state.programs = prepared->programs;
+		LiveCounters::Add(LiveCounters::DrawPrepUsed);
+		std::swap(state.vs_input_info, prepared->vertex);
+		if (state.ps_active) std::swap(state.ps_input_info, prepared->pixel);
+		DrawPrep::OfferBindingPlans(*prepared, state.vs_input_info.stage,
+		                            state.ps_active ? &state.ps_input_info.stage : nullptr);
+		return true;
+	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vs_input_info, state.ps_input_info);
@@ -1620,6 +1646,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vs_input_info.mesh;
+		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (emit.indexed || primitive_restart_enable));
 		// Primitive restart in a mesh-path draw (Astro Bot's Sky Garden: an indexed fan) is drawn without it, as
 		// Jetsku's fork does by default; it ended the emulator.
 		static std::atomic_bool restart_warned = false;

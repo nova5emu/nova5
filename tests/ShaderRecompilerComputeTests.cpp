@@ -2,6 +2,7 @@
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
 #include "native-resource-state.h"
 #include "native-preparation-scratch.h"
+#include "live-counters.h"
 extern "C" volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 extern "C" volatile std::atomic_uint32_t kyty_local_backing_read_mode;
 #include <barrier>
@@ -20,6 +21,7 @@ extern "C" volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode;
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
+#include "loader/systemContent.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -35,6 +37,7 @@ extern "C" volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode;
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/wolverine.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
@@ -44,6 +47,7 @@ extern "C" volatile std::atomic<uint32_t> kyty_local_vulkan_recording_mode;
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -119,6 +123,7 @@ namespace Libs { void InitAgcDriver_1(Loader::SymbolDatabase*); }
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -423,6 +428,22 @@ struct TextureCacheTestAccess {
 
   static void SetLinearReadback(TextureCache &cache, bool enabled) {
     cache.m_readback_linear_images = enabled;
+  }
+
+  static void SetDemandLinearReadback(TextureCache &cache, bool enabled) {
+    cache.m_demand_linear_readback = enabled;
+  }
+
+  static void CopyImage(TextureCache &cache, ImageId destination, ImageId source) {
+    auto lock = Lock(cache);
+    cache.CopyImage(destination, source);
+  }
+
+  static void DownloadAndRetire(TextureCache &cache, ImageId id) {
+    auto lock = Lock(cache);
+    if (!cache.TryDownloadImage(id)) std::abort();
+    cache.m_slot_images[id].ClearGpuModified();
+    cache.DeleteImage(id);
   }
 
   static std::pair<uint8_t *, uint64_t>
@@ -2382,6 +2403,253 @@ public:
   }
 
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  void CheckDrawPrepPrograms() {
+    constexpr const char* name = "DrawPrepPrograms";
+    constexpr uint64_t base = 0x207e00000ull, bytes = 0x40000;
+    constexpr uint64_t vs_address = base + 0x1000, ps_address = base + 0x2000;
+    constexpr uint64_t metadata_address = base + 0x3000, table_address = base + 0x4000;
+    EnsureRuntimeContext();
+    // Isolated-selector diagnostics. A preparation must never rely on the
+    // emulator's guest fault route: do not let installing it hide that bug.
+    static thread_local const char* phase = "setup";
+    static thread_local bool preparing = false;
+    static const bool serve_faults = [] {
+      const auto* value = std::getenv("KYTY_DRAW_PREP_TEST_FAULT_HANDLER");
+      return !value || std::strcmp(value, "0") != 0;
+    }();
+    const auto checkpoint = [](const char* next) {
+      phase = next;
+      std::printf("DrawPrepPrograms: %s\n", next);
+      std::fflush(stdout);
+    };
+    namespace Exception = Common::HostException;
+    Require(name, "fault diagnostics", Exception::InstallHandler([](const Exception::ExceptionInfo& info) {
+      const bool forbidden = preparing || DrawPrep::Speculative();
+      std::fprintf(stderr, "DrawPrepPrograms fault: phase=%s code=0x%08x access=%u address=0x%llx ip=0x%llx preparing=%u gpu_thread=%u handler=%u\n",
+          phase, info.native_code, static_cast<unsigned>(info.access_violation_type),
+          static_cast<unsigned long long>(info.access_violation_vaddr),
+          static_cast<unsigned long long>(info.exception_address), unsigned(forbidden),
+          unsigned(GuestGpu::IsGpuThread()), unsigned(serve_faults));
+      std::fflush(stderr);
+      if (forbidden || !serve_faults || info.type != Exception::ExceptionType::AccessViolation ||
+          (info.access_violation_type != Exception::AccessViolationType::Read &&
+           info.access_violation_type != Exception::AccessViolationType::Write)) return false;
+      const auto access = info.access_violation_type == Exception::AccessViolationType::Write
+          ? PageFaultAccess::Write : PageFaultAccess::Read;
+      const bool handled = LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+      std::fprintf(stderr, "DrawPrepPrograms fault: handled=%u\n", unsigned(handled));
+      std::fflush(stderr);
+      return handled;
+    }), "could not install isolated fault diagnostics");
+    uint32_t worker_count = 8;
+    if (const auto* value = std::getenv("KYTY_DRAW_PREP_TEST_WORKERS")) {
+      char* end = nullptr;
+      const auto parsed = std::strtoul(value, &end, 10);
+      Require(name, "worker count", *value && end && !*end && parsed <= 8,
+              "KYTY_DRAW_PREP_TEST_WORKERS must be 0..8 (0 runs on CP)");
+      worker_count = static_cast<uint32_t>(parsed);
+    }
+    const auto prepare = [&](const DrawPrep::RegisterSnapshot& registers, DrawPrep::PreparedDraw& draw,
+                             PipelineCache& cache) {
+      preparing = true;
+      DrawPrep::Prepare(cache, registers, true, draw);
+      preparing = false;
+    };
+    std::printf("DrawPrepPrograms: workers=%u fault_handler=%u\n", worker_count, unsigned(serve_faults));
+    std::fflush(stdout);
+    // This selector is intentionally isolated, including its shader registry.
+    ShaderInit();
+    int64_t physical = -1;
+    Require(name, "allocate", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+        0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), bytes, 0x10000, 0, &physical) == 0,
+        "allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", Libs::LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, bytes, 0x3, 0x10, physical, 0x10000) == 0 && mapped == reinterpret_cast<void*>(base),
+        "mapping failed");
+    std::memset(mapped, 0, bytes);
+    const auto install = [](uint64_t address, std::vector<u32> code, uint64_t hash) {
+      // The real declared-hash prologue; the decoder sees S_MOV_B32 vcc_hi,
+      // literal. Hash metadata lies after END so it is never executed.
+      code.insert(code.begin(), {0xbeeb03ffu, 31u}); // header at byte 256
+      std::memcpy(reinterpret_cast<void*>(address), code.data(), code.size() * 4);
+      const std::array<u32, 2> words {static_cast<u32>(hash), static_cast<u32>(hash >> 32u)};
+      std::memcpy(reinterpret_cast<void*>(address + 256 + 16), words.data(), sizeof(words));
+      return static_cast<u32>(code.size() * 4);
+    };
+    std::vector<u32> vs;
+    AppendVMovU32(&vs, 0, 0);
+    AppendVMovLiteral(&vs, 1, 0x3f800000u);
+    vs.push_back(EncodeExp0(0x0c, 0xf));
+    vs.push_back(EncodeExp1(0, 0, 0, 1));
+    AppendEnd(&vs);
+    std::vector<u32> ps {EncodeSMovB32(0, InlineU32(0)), EncodeSmem0(0x02, 20, 4), EncodeSmem1(0)};
+    AppendVMovU32(&ps, 0, 0);
+    ps.push_back(EncodeMubuf0(0x0c));
+    ps.push_back(EncodeMubuf1(1, 5, 0)); // descriptor s[20:23] from table at s[8:9]
+    ps.push_back(EncodeExp0(0, 0xf));
+    ps.push_back(EncodeExp1(1, 1, 1, 1));
+    AppendEnd(&ps);
+    const auto vs_size = install(vs_address, vs, 0x4450524550565301ull);
+    const auto ps_size = install(ps_address, ps, 0x4450524550505301ull);
+    auto* metadata = reinterpret_cast<ShaderUserData*>(metadata_address);
+    ShaderMapUserData(vs_address, {.user_data = metadata, .code_size_bytes = vs_size});
+    ShaderMapUserData(ps_address, {.code_size_bytes = ps_size});
+    auto* descriptor = reinterpret_cast<u32*>(table_address);
+    descriptor[0] = static_cast<u32>(base + 0x7000);
+    descriptor[1] = static_cast<u32>((base + 0x7000) >> 32u) | (4u << 16u);
+    descriptor[2] = 4;
+    descriptor[3] = DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+    const auto old_backing = kyty_local_backing_read_mode.exchange(1);
+    const auto old_bindings = kyty_local_draw_prep_bindings_mode.exchange(0);
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      auto& gpu = context.GetGpu();
+      auto& resources = context.GetGpuResources();
+      auto& cache = context.GetPipelineCache();
+      Libs::LibKernel::Memory::InstallGpuResources(&resources);
+      gpu.SendCommandSync([&] {
+        checkpoint("map resources");
+        resources.MapMemory(base, bytes);
+        DrawPrep::RegisterSnapshot registers;
+        registers.context.SetRenderTargetMask(0xf);
+        registers.context.SetShaderMask(0xf);
+        registers.context.SetTargetOutputMode(0, 4);
+        registers.user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+        registers.shaders.SetEsShaderBase(vs_address);
+        registers.shaders.SetPsShaderBase(ps_address);
+        HW::PsShaderResource2 ps_resource {};
+        ps_resource.user_sgpr = 10;
+        registers.shaders.SetPsShaderResource2(ps_resource);
+        registers.shaders.SetPsUserSgpr(8, static_cast<u32>(table_address), HW::UserSgprType::Unknown);
+        registers.shaders.SetPsUserSgpr(9, static_cast<u32>(table_address >> 32u), HW::UserSgprType::Unknown);
+        context.GetCommandScheduler().Begin(registers.context, registers.user_config, registers.shaders);
+        std::array<Prospero::ColorComponentMapping, 8> mapping {};
+        ShaderVertexInputInfo vertex;
+        ShaderPixelInputInfo pixel;
+        DrawPrep::PreparedDraw missing;
+        checkpoint("unpublished probe");
+        prepare(registers, missing, cache);
+        Require(name, "unpublished fallback", !missing.ok, "speculation compiled an unpublished program");
+        checkpoint("serial publish");
+        const auto serial = cache.GetGraphicsPrograms(registers.shaders.GetVs(), registers.shaders.GetPs(),
+            registers.context.GetShaderRegisters(), registers.context, registers.user_config, mapping, true, vertex, pixel);
+        Require(name, "serial publish", bool(serial.vertex) && bool(serial.pixel) &&
+            !PipelineCache::TakeMaterializationFailure(), "fixture programs did not publish");
+        std::array<DrawPrep::PreparedDraw, 8> prepared;
+        std::array<std::thread, 8> workers;
+        for (const auto binding_mode : {0u, 1u}) {
+          kyty_local_draw_prep_bindings_mode.store(binding_mode);
+          std::printf("DrawPrepPrograms: bindings=%u\n", binding_mode);
+          checkpoint("prepare batch");
+          if (worker_count == 0) {
+            for (auto& value : prepared) prepare(registers, value, cache);
+          } else {
+            for (uint32_t i = 0; i < worker_count; ++i) workers[i] = std::thread([&, i] {
+              phase = "worker preparation";
+              for (size_t slot = i; slot < prepared.size(); slot += worker_count)
+                prepare(registers, prepared[slot], cache);
+              phase = "worker exit";
+            });
+            for (uint32_t i = 0; i < worker_count; ++i) workers[i].join();
+          }
+          checkpoint("validate batch");
+          for (auto& value : prepared) {
+            Require(name, "worker certificate", value.ok && DrawPrep::Validate(cache, value, true, mapping),
+                    "worker did not produce a usable certificate");
+            Require(name, "serial equivalence", DrawPrep::Verify(value, serial, vertex, pixel),
+                    "worker differs from serial lookup");
+            Require(name, "descriptor bytes", !value.pixel.stage.resources.buffers.empty() &&
+                value.pixel.stage.resources.buffers[0].dwords[0] == descriptor[0], "SRT read was not materialized");
+            Require(name, "binding mode", value.pixel_bindings.valid == (binding_mode != 0), "stale binding plan");
+            if (binding_mode != 0) {
+              Require(name, "worker binding range", value.pixel_bindings.ranges.size() == 1 &&
+                  value.pixel_bindings.ranges[0].address == base + 0x7000 &&
+                  value.pixel_bindings.ranges[0].requested_size == 16, "wrong buffer range from worker");
+            }
+          }
+        }
+        checkpoint("change SRT");
+        descriptor[0] += 0x100;
+        Require(name, "changed SRT", !DrawPrep::Validate(cache, prepared[0], true, mapping), "changed descriptor accepted");
+        descriptor[0] -= 0x100;
+        checkpoint("change AGC metadata");
+        metadata->eud_size_dw = 1;
+        Require(name, "changed AGC metadata", !DrawPrep::Validate(cache, prepared[1], true, mapping), "AGC read not certified");
+        metadata->eud_size_dw = 0;
+        checkpoint("shader registration");
+        ShaderMapUserData(vs_address, {.user_data = metadata, .code_size_bytes = vs_size});
+        Require(name, "shader registration", !DrawPrep::Validate(cache, prepared[2], true, mapping), "stale shader map accepted");
+        prepare(registers, prepared[3], cache);
+        Require(name, "fresh registration", prepared[3].ok, "fresh preparation failed");
+        checkpoint("mark GPU ownership");
+        (void)context.GetBufferCache().ObtainBuffer(table_address, 16, true, true);
+        checkpoint("reject GPU ownership");
+        Require(name, "GPU ownership", !DrawPrep::Validate(cache, prepared[3], true, mapping), "GPU-owned SRT accepted");
+        checkpoint("finish scheduler");
+        context.GetCommandScheduler().Finish();
+        checkpoint("unmap resources");
+        resources.UnmapMemory(base, bytes);
+        checkpoint("GPU command complete");
+      });
+      checkpoint("shutdown GPU");
+      Libs::LibKernel::Memory::InstallGpuResources(nullptr);
+      context.ShutdownGpu();
+    }
+    kyty_local_backing_read_mode.store(old_backing);
+    kyty_local_draw_prep_bindings_mode.store(old_bindings);
+    checkpoint("release guest memory");
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, bytes) == 0, "unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(physical, bytes) == 0, "release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckDrawPrepBindingOracle() {
+    constexpr const char *name = "DrawPrepBindingOracle";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &executor = context.GetRenderExecutor();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    ShaderRecompiler::IR::CompiledShaderInfo program{};
+    program.stage = ShaderType::Pixel;
+    // Exercise the LOD payload independently of creating/acquiring image handles.
+    program.bindings.lod_stats_count = 1;
+    ShaderStageRuntime runtime{.program = &program};
+    runtime.resources.images.resize(1);
+    runtime.resources.images[0].dword_count = 8; // counter disabled: expected payload zero
+    PreparedBindings prepared;
+    kyty_local_draw_prep_bindings_mode.store(2);
+    executor.PrepareBindingsInto(runtime, prepared);
+    Require(name, "plan available", prepared.binding_plan.valid, "oracle fixture did not prepare a plan");
+    prepared.binding_plan.lod_stats[0] = 0xffffffff; // deliberate fault in the predicted result
+    const auto mismatches = LiveCounters::Value(LiveCounters::BindingPlanMismatches);
+    executor.FindBuffers(prepared);
+    executor.RebindBuffers(prepared);
+    Require(name, "detect and use reference",
+            LiveCounters::Value(LiveCounters::BindingPlanMismatches) == mismatches + 1 &&
+                prepared.shader_data == std::vector<uint32_t>{0},
+            "verification consumed the faulty prediction or failed to report it");
+    // An invalid plan must fall back, with no stale validity from the preceding stage.
+    // This layout's serial preparation truncates its unused user word to zero dwords.
+    program.bindings.lod_stats_count = 0;
+    program.bindings.user_data_registers = {0};
+    runtime.resources.user_data = {123};
+    kyty_local_draw_prep_bindings_mode.store(1);
+    const auto fallbacks = LiveCounters::Value(LiveCounters::BindingPlanFallbacks);
+    executor.PrepareBindingsInto(runtime, prepared);
+    Require(name, "refusal fallback", !prepared.binding_plan.valid && prepared.shader_data.empty() &&
+                LiveCounters::Value(LiveCounters::BindingPlanFallbacks) == fallbacks + 1,
+            "refused plan retained stale output instead of using serial preparation");
+    scheduler.Finish();
+    kyty_local_draw_prep_bindings_mode.store(0);
+    std::printf("[host]    %-32s ok (one intentional mismatch)\n", name);
+  }
+
   void CheckPreparedBindingScratch() {
     constexpr const char *name = "PreparedBindingScratch";
     EnsureRuntimeContext();
@@ -6203,6 +6471,7 @@ public:
 #endif
 
   #include "ImageAliasTests.inc"
+  #include "LinearImageReadbackTests.inc"
 
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
@@ -26879,7 +27148,8 @@ TestCase ImageD16StoreUnpacksHalfPairs() {
   return test;
 }
 
-void CheckIndirectImageKeySwitch(bool lod_stats = false) {
+void CheckIndirectImageKeySwitch(bool lod_stats = false, bool bindless = false, bool mixed = false,
+                                 bool cube = false, bool array_peer = false) {
   constexpr const char *name = "IndirectImageKeySwitch";
   constexpr uint32_t mapping_capacity = 1793u;
   using namespace ShaderRecompiler::IR;
@@ -26916,8 +27186,10 @@ void CheckIndirectImageKeySwitch(bool lod_stats = false) {
   memory.sampler = 0;
   memory.dmask = 0xf;
   memory.image_sample_flags = lod_stats ? 0u : ShaderRecompiler::Decoder::ImageSampleFlagLod;
-  memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  memory.image_address_components = 3;
+  memory.image_dimension = cube ? ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
+                                : ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  memory.image_cube = cube;
+  memory.image_address_components = cube ? 4u : 3u;
   program.memory_info.push_back(memory);
   const MemoryFlags memory_flags{0u, 0x10f0u};
   uint64_t memory_flag_bits = 0;
@@ -26940,7 +27212,8 @@ void CheckIndirectImageKeySwitch(bool lod_stats = false) {
   root.first_use_pc = 0x10f0u;
   root.resource_class = ImageResourceClass::Sampled;
   root.numeric_class = Prospero::TextureNumericClass::Float;
-  root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  root.dimension = memory.image_dimension;
+  root.cube = cube;
   root.read = true;
   root.indirect_root = 0;
   root.indirect_mapping_offset = 0;
@@ -26950,6 +27223,35 @@ void CheckIndirectImageKeySwitch(bool lod_stats = false) {
 	candidate.indirect_search_iterations = 0;
   candidate.indirect_resources.clear();
   program.info.images = {root, candidate};
+	if (bindless) {
+		root.bindless = true;
+		root.indirect_root = ImageResource::NoIndirectImage;
+		root.indirect_search_iterations = 0;
+		root.indirect_resources.clear();
+		program.info.images = {root};
+		if (mixed) {
+			candidate.indirect_root = ImageResource::NoIndirectImage;
+			candidate.bindless = array_peer;
+			if (array_peer) candidate.cube = false;
+			program.info.images.push_back(candidate);
+			auto& direct = block->AppendNewInst(ValueOpcode::GetImageResource,
+			    {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+			direct.SetFlags<uint32_t>(1u);
+			auto direct_memory = memory;
+			direct_memory.resource = 1;
+			if (array_peer) direct_memory.image_cube = false;
+			program.memory_info.push_back(direct_memory);
+			const MemoryFlags direct_flags {1u, 0x1100u};
+			uint64_t direct_flag_bits = 0;
+			std::memcpy(&direct_flag_bits, &direct_flags, sizeof(direct_flags));
+			auto& direct_sample = block->AppendNewInst(ValueOpcode::ImageSampleRaw,
+			    {Value(&direct), Value(&sampler), Value(&address)}, direct_flag_bits);
+			auto& direct_x = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
+			    {Value(&direct_sample), Value(0u)});
+			block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&direct_x)});
+			program.info.sampled_pairs.push_back({1u, 0u, 0x1100u});
+		}
+	}
   program.info.samplers.push_back({1u, 0x10f0u});
   program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
 
@@ -26964,6 +27266,50 @@ void CheckIndirectImageKeySwitch(bool lod_stats = false) {
   std::string text;
   Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
           "failed to disassemble indirect image shader");
+	if (bindless) {
+		Require(name, "resident image descriptors",
+		        text.find("OpTypeRuntimeArray") != std::string::npos &&
+		        text.find("SampledImageArrayNonUniformIndexing") != std::string::npos &&
+		        text.find("NonUniform") != std::string::npos &&
+		        text.find("OpAtomicOr") != std::string::npos &&
+		        text.find("OpSwitch") == std::string::npos &&
+		        CountText(text, lod_stats ? "OpImageSampleImplicitLod" : "OpImageSampleExplicitLod") == (mixed ? 2u : 1u),
+		        "GPU key did not select a nonuniform resident image with bounded feedback");
+		if (cube) {
+			Require(name, "cube face conversion",
+			        text.find("OpFSub") != std::string::npos &&
+			        text.find("OpConvertFToU") != std::string::npos &&
+			        text.find("OpShiftRightLogical") != std::string::npos,
+			        "cube face coordinates did not use CubeAxis/CubeLayer");
+		}
+		if (array_peer) {
+			// Cube and array images have the same OpTypeImage, but must access
+			// independent set-1 bindings. Validation alone cannot detect aliasing.
+			std::unordered_map<uint32_t, uint32_t> sets, bindings;
+			std::vector<uint32_t> accessed;
+			for (size_t offset = 5; offset < spirv.size();) {
+				const auto count = spirv[offset] >> 16u;
+				const auto opcode = spirv[offset] & 0xffffu;
+				if (opcode == spv::OpDecorate && count == 4u) {
+					if (spirv[offset + 2] == spv::DecorationDescriptorSet) sets[spirv[offset + 1]] = spirv[offset + 3];
+					if (spirv[offset + 2] == spv::DecorationBinding) bindings[spirv[offset + 1]] = spirv[offset + 3];
+				}
+				if (opcode == spv::OpAccessChain && count >= 5u) accessed.push_back(spirv[offset + 3]);
+				offset += count;
+			}
+			std::array<bool, 2> seen {};
+			for (const auto variable: accessed) {
+				if (!sets.contains(variable) || sets.at(variable) != 1u || !bindings.contains(variable)) continue;
+				if (bindings.at(variable) == 1u) seen[0] = true;
+				if (bindings.at(variable) == 2u) seen[1] = true;
+			}
+			Require(name, "cube and array heaps", seen[0] && seen[1],
+			        "cube and array samples aliased the same resident descriptor variable");
+		}
+		std::printf("[host] Wolverine bindless LOD=%d mixed=%d cube=%d array_peer=%d SPIR-V valid (CPU only)\n",
+		            lod_stats, mixed, cube, array_peer);
+		return;
+	}
   Require(name, "key switch",
           text.find("OpSwitch") != std::string::npos &&
               text.find("OpPhi") != std::string::npos &&
@@ -32573,6 +32919,7 @@ namespace {
 #include "ShaderBvhTests.inc"
 #include "GuestClockTraceTests.inc"
 #include "GuestClockGpuTests.inc"
+#include "WolverineDescriptorTests.inc"
 }
 }
 
@@ -32585,6 +32932,17 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--wolverine-descriptors-only") == 0) {
+    CheckWolverineDescriptorCounts();
+    return 0;
+  }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--linear-image-readback-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckLinearImageCpuReadback();
+    return 0;
+  }
+#endif
   if (argc == 2 && std::strcmp(argv[1], "--guest-clock-only") == 0) {
     CheckGuestClockPairTrace();
     CheckGuestClockScale();
@@ -32977,19 +33335,58 @@ int main(int argc, char **argv) {
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
-    CheckDepthAttachmentWrites();
-    CheckDynamicRenderingState();
+  if ((argc == 2 || argc == 3) && std::strcmp(argv[1], "--image-overlap-only") == 0) {
+    // Flushed boundaries locate a driver/scheduler stall, including construction
+    // and destruction. An optional case name avoids rerunning the whole suite.
+    const std::string_view selected = argc == 3 ? argv[2] : "";
+    constexpr std::array<std::string_view, 11> cases {
+        "DepthAttachmentWrites", "DynamicRenderingState", "Rasterization",
+        "ColorDiscovery", "ColorVolumeDiscovery", "DccFixedClearFloat", "SampledDccClear",
+        "ColorDepthTileDiscovery", "StencilBindingDiscovery", "UnifiedTextureCacheFlow", "Bgra16Readback"};
+    Require("ImageOverlap", "case", selected.empty() || std::ranges::find(cases, selected) != cases.end(),
+            "unknown case name");
+    std::string title;
+    Loader::SystemContentParamSfoGetString("TITLE_ID", &title);
+    const bool demand = Wolverine::LinearReadbackEnabled(title, std::getenv("NOVA5_WOLVERINE_LINEAR_READBACK"));
+    std::printf("[image-overlap] title=%s demand-linear-readback=%u\n",
+                title.empty() ? "<none>" : title.c_str(), unsigned(demand));
+    std::fflush(stdout);
+    Require("ImageOverlap", "title gate", !demand, "overlap suite requires the ordinary cache policy");
+    const auto mark = [](const char* phase, std::string_view name) {
+      std::printf("[image-overlap] %s %.*s\n", phase, static_cast<int>(name.size()), name.data());
+      std::fflush(stdout);
+    };
+    const auto run = [&](std::string_view name, auto&& action) {
+      if (!selected.empty() && selected != name) return;
+      mark("begin", name);
+      action();
+      mark("end", name);
+    };
+    run(cases[0], [] { CheckDepthAttachmentWrites(); });
+    run(cases[1], [] { CheckDynamicRenderingState(); });
+    if (selected == cases[0] || selected == cases[1]) return 0;
+    mark("begin", "VulkanHarness-init");
+    {
+      VulkanHarness vulkan;
+      mark("end", "VulkanHarness-init");
+      run(cases[2], [&] { vulkan.CheckRasterization(false); });
+      run(cases[3], [&] { vulkan.CheckRenderExecutorColorDiscovery(); });
+      run(cases[4], [&] { vulkan.CheckRenderExecutorColorVolumeDiscovery(); });
+      run(cases[5], [&] { vulkan.CheckRenderExecutorDccFixedClearFloat(); });
+      run(cases[6], [&] { vulkan.CheckSampledDccClear(); });
+      run(cases[7], [&] { vulkan.CheckRenderExecutorColorDepthTileDiscovery(); });
+      run(cases[8], [&] { vulkan.CheckRenderExecutorStencilBindingDiscovery(); });
+      run(cases[9], [&] { vulkan.CheckUnifiedTextureCacheFlow(); });
+      run(cases[10], [&] { vulkan.CheckBgra16Readback(); });
+      mark("begin", "VulkanHarness-destroy");
+    }
+    mark("end", "VulkanHarness-destroy");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--unified-texture-cache-only") == 0) {
     VulkanHarness vulkan;
-    vulkan.CheckRasterization(false);
-    vulkan.CheckRenderExecutorColorDiscovery();
-    vulkan.CheckRenderExecutorColorVolumeDiscovery();
-    vulkan.CheckRenderExecutorDccFixedClearFloat();
-    vulkan.CheckSampledDccClear();
-    vulkan.CheckRenderExecutorColorDepthTileDiscovery();
-    vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    kyty_local_draw_prep_bindings_mode.store(0);
     vulkan.CheckUnifiedTextureCacheFlow();
-    vulkan.CheckBgra16Readback();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave-branch-only") == 0) {
@@ -33045,6 +33442,38 @@ int main(int argc, char **argv) {
     return 0;
   }
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  if (argc == 2 && std::strcmp(argv[1], "--draw-prep-programs-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDrawPrepPrograms();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--draw-prep-bindings-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDrawPrepBindingOracle();
+    // Known-result fixtures through the actual consumers: nested/reused bindings,
+    // disabled pixel stage, dispatch arguments and raster output.
+    // The final off pass also checks that old plans cannot survive disabling it.
+    const auto initial_checks = LiveCounters::Value(LiveCounters::BindingPlanChecks);
+    const auto initial_uses = LiveCounters::Value(LiveCounters::BindingPlanUses);
+    const auto initial_mismatches = LiveCounters::Value(LiveCounters::BindingPlanMismatches);
+    for (const auto mode : {0u, 3u, 1u, 0u}) {
+      kyty_local_draw_prep_bindings_mode.store(mode);
+      std::printf("DrawPrepBindings: mode=%u\n", mode);
+      const auto before = LiveCounters::Value(LiveCounters::BindingPlans);
+      vulkan.CheckPreparedBindingScratch();
+      vulkan.CheckNativeDispatchIndirect();
+      vulkan.CheckRasterization(false);
+      Require("DrawPrepBindings", "enabled/off coverage",
+              (LiveCounters::Value(LiveCounters::BindingPlans) != before) == (mode != 0),
+              "fixtures did not exercise the selected binding-plan mode");
+    }
+    Require("DrawPrepBindings", "oracle coverage",
+            LiveCounters::Value(LiveCounters::BindingPlanChecks) > initial_checks &&
+                LiveCounters::Value(LiveCounters::BindingPlanUses) > initial_uses &&
+                LiveCounters::Value(LiveCounters::BindingPlanMismatches) == initial_mismatches,
+            "plans were unused, unverified or differed from serial bindings");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--draw-run-ranges-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckDrawRunReadRanges();
@@ -33211,6 +33640,18 @@ int main(int argc, char **argv) {
     CheckIndirectImageKeySwitch();
     return 0;
   }
+	if (argc == 2 && std::strcmp(argv[1], "--wolverine-bindless-ir-only") == 0) {
+		CheckWolverineDescriptorCounts();
+		CheckIndirectImageKeySwitch(false, true);
+		CheckIndirectImageKeySwitch(true, true);
+		CheckIndirectImageKeySwitch(false, true, true);
+		CheckIndirectImageKeySwitch(true, true, true);
+		CheckIndirectImageKeySwitch(false, true, false, true);
+		CheckIndirectImageKeySwitch(true, true, false, true);
+		CheckIndirectImageKeySwitch(false, true, true, true, true);
+		CheckIndirectImageKeySwitch(true, true, true, true, true);
+		return 0;
+	}
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
@@ -33300,6 +33741,7 @@ int main(int argc, char **argv) {
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
   CheckRectListShaders();
+  CheckWolverineDescriptorCounts();
   CheckIndirectImageKeySwitch();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
@@ -33317,6 +33759,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRenderExecutorColorStandardTileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
   vulkan.CheckRenderExecutorStencilBindingDiscovery();
+  vulkan.CheckLinearImageCpuReadback();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckDepthSliceGrowth();
   vulkan.CheckTextureLayerRanges();

@@ -110,8 +110,13 @@ template<class A> bool Visit(A& a, Record& r) {
             s.fetch_embedded, s.clip_space.enabled);
         Array(a, s.clip_space.scale); Array(a, s.clip_space.offset); Array(a, s.clip_space.half_extent);
         Workgroup(a, s.mesh);
+        // Provoking vertex is 0 or 2. Its reserved high bit carries the fast-launch ABI,
+        // without shifting the wire layout of existing recordings (whose bit is zero).
+        uint32_t mesh_flags = s.mesh.provoking_vertex | (s.mesh.fast_launch ? 0x80000000u : 0u);
         Fields(a, s.mesh.input_primitive, s.mesh.primitives_per_group, s.mesh.vertices_per_group,
-            s.mesh.max_vertices, s.mesh.max_primitives, s.mesh.provoking_vertex);
+            s.mesh.max_vertices, s.mesh.max_primitives, mesh_flags);
+        s.mesh.fast_launch = (mesh_flags & 0x80000000u) != 0;
+        s.mesh.provoking_vertex = mesh_flags & 0x7fffffffu;
         if (!a.Good() || s.resources_num < 0 || s.resources_num > s.RES_MAX ||
             s.start_instance_sgpr < -1 || s.start_instance_sgpr >= 8 + 32) return false;
         for (int i = 0; i < s.resources_num; ++i) {
@@ -140,7 +145,11 @@ template<class A> bool Visit(A& a, Record& r) {
     })) return false;
     if (!Vector(a, r.specialization.images, ShaderRecompiler::IR::ShaderInfo::MaxImages, [&](auto& i) {
         Fields(a, i.numeric_class, i.dimension, i.mip_count, i.conversion_format, i.shader_swizzle,
-            i.indirect_root, i.indirect_mapping_offset, i.indirect_search_iterations, i.cube, i.fmask);
+            i.indirect_root, i.indirect_mapping_offset, i.indirect_search_iterations, i.cube);
+        uint32_t flags = uint32_t(i.fmask) | (uint32_t(i.bindless) << 1u);
+        a(flags);
+        i.fmask = (flags & 1u) != 0;
+        i.bindless = (flags & 2u) != 0;
     })) return false;
     return a.Good();
 }

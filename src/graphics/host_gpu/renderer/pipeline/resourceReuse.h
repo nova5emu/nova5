@@ -55,6 +55,7 @@ public:
 		return sizeof(*this) + m_reads.CapacityBytes() + bytes(m_mapping_ends) +
 		       bytes(resources.buffers) + bytes(resources.images) + bytes(resources.samplers) +
 		       bytes(resources.flattened_srt) + bytes(resources.user_data) +
+		       bytes(resources.bindless_heaps) +
 		       bytes(specialization.buffers) + bytes(specialization.images);
 	}
 	Snapshot resources;
@@ -62,7 +63,8 @@ public:
 
 	static bool Equal(const Snapshot& a, const Snapshot& b) {
 		return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
-		       a.flattened_srt == b.flattened_srt && a.user_data == b.user_data && a.uniform_fill == b.uniform_fill;
+		       a.flattened_srt == b.flattened_srt && a.user_data == b.user_data && a.uniform_fill == b.uniform_fill &&
+		       a.bindless_heaps == b.bindless_heaps;
 	}
 
 private:

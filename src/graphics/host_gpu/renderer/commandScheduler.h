@@ -57,6 +57,15 @@ public:
 	[[nodiscard]] bool Active() const noexcept;
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
+	struct RegisterBinding { HW::Context* context; HW::UserConfig* user_config; HW::Shader* shaders; };
+	RegisterBinding BindRegisters(HW::Context& context, HW::UserConfig& user_config, HW::Shader& shaders) {
+		RegisterBinding previous {&m_command.GetRegisters(), &m_command.GetUserConfig(), &m_command.GetShaders()};
+		m_command.Bind(context, user_config, shaders);
+		return previous;
+	}
+	void RestoreRegisters(RegisterBinding binding) {
+		m_command.Bind(*binding.context, *binding.user_config, *binding.shaders);
+	}
 	// A buffer upload (BufferCache::UploadDirtyRanges) of pages whose regions were last made CPU-dirty at `last_dirty`
 	// (g_cpu_dirty_clock), no later than the open buffer began: those pages were dirty all the time since, so no
 	// command recorded into the open buffer read or wrote them (every use of a CPU-dirty range synchronizes it first),

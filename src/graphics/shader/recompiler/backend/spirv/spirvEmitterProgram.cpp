@@ -15,14 +15,19 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
-struct LoopBudget { uint32_t variable = 0, limit = 0, pc = UINT32_MAX; };
+struct LoopBudget {
+	uint32_t variable = 0, limit = 0, pc = UINT32_MAX;
+	bool exit_decisions = false;
+	std::unordered_set<uint32_t> merges;
+};
 
 uint32_t ConsumeLoopBudget(EmitterState& state, const LoopBudget& budget) {
 	const auto count = state.builder.AllocateId();
 	const auto allowed = state.builder.AllocateId();
 	const auto next = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, TypeU32(state), count, budget.variable});
-	state.builder.AddFunction({OpULessThan, TypeBool(state), allowed, count, ConstantU32(state, budget.limit)});
+	const auto limit = budget.exit_decisions ? budget.limit - 1u : budget.limit;
+	state.builder.AddFunction({OpULessThan, TypeBool(state), allowed, count, ConstantU32(state, limit)});
 	state.builder.AddFunction({OpIAdd, TypeU32(state), next, count, ConstantU32(state, 1)});
 	state.builder.AddFunction({OpStore, budget.variable, next});
 	if (ShaderLoopGuard::Settings().helper_exit && state.lod_helper_variable != 0) {
@@ -173,7 +178,8 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			const bool diagnostic = budget.variable != 0 && (budget.pc == UINT32_MAX || budget.pc == info.start_pc);
+			const bool diagnostic = budget.variable != 0 && !budget.exit_decisions &&
+			    (budget.pc == UINT32_MAX || budget.pc == info.start_pc);
 			const bool rt_guard = ctx.state.bvh_node_count_variable != 0 && GetCodegenOptions().rt_node_budget != 0;
 			if (term.loop_header && (diagnostic || rt_guard)) {
 				// The CFG isolates semantic loop headers into a branch-only control node.
@@ -207,7 +213,19 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = BranchCondition(ctx, info);
+			auto condition = BranchCondition(ctx, info);
+			if (budget.exit_decisions) {
+				// Frank's guard forces the existing exit edge, preserving its PHI
+				// predecessors and the shader's code after the loop.
+				const bool true_exits = budget.merges.contains(term.true_block);
+				const bool false_exits = budget.merges.contains(term.false_block);
+				if (true_exits != false_exits) {
+					const auto allowed = ConsumeLoopBudget(ctx.state, budget);
+					condition = true_exits
+					    ? EmitLogicalOrBool(ctx.state, condition, EmitLogicalNotBool(ctx.state, allowed))
+					    : EmitLogicalAndBool(ctx.state, condition, allowed);
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(
 			    {OpBranchConditional, condition, ctx.Label(true_block), ctx.Label(false_block)});
@@ -674,11 +692,21 @@ uint32_t ValueEmitContext::Label(const IR::Block* block) const {
 void EmitProgram(EmitterState& state) {
 	const auto&      program = state.program;
 	LoopBudget budget;
-	const auto& guard = ShaderLoopGuard::Settings();
+	auto guard = ShaderLoopGuard::Settings();
+	const bool wolverine_guard = GetCodegenOptions().wolverine_loop_guard &&
+	    state.stage == ShaderType::Compute && program.shader_hash == 0xdc76e1223a9bf673ULL;
+	if (wolverine_guard) {
+		// Frank's 6d6f10e0 defaults. Only this RT shader; never truncate the
+		// workgroup polling scan 383103dcf737184e or its barrier participation.
+		guard = {};
+		guard.limit = 2048;
+		guard.hash = program.shader_hash;
+	}
 	if (guard.Matches(program.shader_hash) && (state.stage == ShaderType::Vertex || state.stage == ShaderType::Pixel)) {
 		if (guard.scc_vote) std::printf("[SHADER_SCC_VOTE] hash=%016llx enabled=1\n", static_cast<unsigned long long>(program.shader_hash));
 	}
-	if (guard.limit != 0 && guard.Matches(program.shader_hash) && (state.stage == ShaderType::Vertex || state.stage == ShaderType::Pixel)) {
+	if (guard.limit != 0 && guard.Matches(program.shader_hash) &&
+	    (state.stage == ShaderType::Vertex || state.stage == ShaderType::Pixel || wolverine_guard)) {
 		uint32_t loops = program.dispatcher_fallback && guard.pc == UINT32_MAX ? 1u : 0u;
 		if (!program.dispatcher_fallback) for (const auto& info: program.block_info) {
 			if (!info.terminator.loop_header || (guard.pc != UINT32_MAX && guard.pc != info.start_pc)) continue;
@@ -692,6 +720,11 @@ void EmitProgram(EmitterState& state) {
 			budget.variable = state.builder.AllocateId();
 			budget.limit = guard.limit;
 			budget.pc = guard.pc;
+			budget.exit_decisions = wolverine_guard && !program.dispatcher_fallback;
+			if (budget.exit_decisions) {
+				for (const auto& info: program.block_info)
+					if (info.terminator.loop_header) budget.merges.insert(info.terminator.merge_block);
+			}
 			state.builder.AddName(budget.variable, "diagnostic_loop_budget");
 		}
 		std::printf("[SHADER_LOOP_GUARD] hash=%016llx limit=%u pc=0x%08x loops=%u dispatcher=%u (diagnostic; outputs may be incomplete)\n",

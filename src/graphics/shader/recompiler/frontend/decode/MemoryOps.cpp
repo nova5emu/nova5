@@ -263,6 +263,7 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	inst.idxen       = ((word0 >> 13u) & 1u) != 0;
 	inst.offen       = ((word0 >> 12u) & 1u) != 0;
 	inst.glc         = ((word0 >> 14u) & 1u) != 0;
+	inst.dlc         = ((word0 >> 15u) & 1u) != 0;
 	inst.slc         = ((word1 >> 22u) & 1u) != 0;
 	inst.family      = Family::MUBUF;
 	inst.opcode_id   = opcode;
@@ -298,6 +299,7 @@ void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	inst.idxen         = ((word0 >> 13u) & 1u) != 0;
 	inst.offen         = ((word0 >> 12u) & 1u) != 0;
 	inst.glc           = ((word0 >> 14u) & 1u) != 0;
+	inst.dlc           = ((word0 >> 15u) & 1u) != 0;
 	inst.slc           = ((word1 >> 22u) & 1u) != 0;
 	inst.family        = Family::MTBUF;
 	inst.opcode_id     = opcode;

@@ -463,7 +463,10 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
 	}
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
-	ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), value, pointer});
+	if (resource.memory_access != 0)
+		ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), value, pointer, resource.memory_access});
+	else
+		ctx.state.builder.AddFunction({OpLoad, TypeU32(ctx.state), value, pointer});
 	return value;
 }
 
@@ -930,7 +933,10 @@ void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resour
 		return;
 	}
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
-	ctx.state.builder.AddFunction({OpStore, pointer, data});
+	if (resource.memory_access != 0)
+		ctx.state.builder.AddFunction({OpStore, pointer, data, resource.memory_access});
+	else
+		ctx.state.builder.AddFunction({OpStore, pointer, data});
 }
 
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,

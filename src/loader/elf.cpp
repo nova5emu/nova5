@@ -3,7 +3,10 @@
 #include "common/assert.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "loader/loadTrace.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 
@@ -239,8 +242,53 @@ Elf64::~Elf64() {
 	Clear();
 }
 
+void Elf64::ReadSegmentBytes(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
+	const auto trace = [&](const char* phase, const char* operation, uint64_t done, uint64_t requested,
+	                       uint32_t received = 0) {
+		if (!LoadTrace::Enabled()) return;
+		std::printf("[LOADER_IO] %s operation=%s module=%s clock_ms=%lld address=0x%llx "
+		            "file_offset=0x%llx size=0x%llx done=0x%llx requested=%llu received=%u\n",
+		            phase, operation, m_file_name.c_str(), LoadTrace::ClockMs(),
+		            static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(file_offset),
+		            static_cast<unsigned long long>(size), static_cast<unsigned long long>(done),
+		            static_cast<unsigned long long>(requested), received);
+		std::fflush(stdout);
+	};
+	trace("begin", "file-size", 0, 0);
+	const auto file_size = m_f->Size();
+	trace("end", "file-size", 0, file_size);
+	if (file_offset > file_size || size > file_size - file_offset || size > UINT64_MAX - vaddr) {
+		EXIT("ELF segment out of bounds: module=%s address=0x%llx file_offset=0x%llx size=0x%llx file_size=0x%llx\n",
+		     m_file_name.c_str(), static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(file_offset),
+		     static_cast<unsigned long long>(size), static_cast<unsigned long long>(file_size));
+	}
+	trace("begin", "seek", 0, 0);
+	const bool sought = m_f->Seek(file_offset);
+	trace(sought ? "end" : "failed", "seek", 0, 0);
+	if (!sought) {
+		EXIT("ELF segment seek failed: module=%s file_offset=0x%llx\n",
+		     m_file_name.c_str(), static_cast<unsigned long long>(file_offset));
+	}
+	// File::Read takes uint32_t; never silently truncate the ELF's 64-bit size.
+	for (uint64_t done = 0; done < size;) {
+		const auto request = static_cast<uint32_t>(std::min<uint64_t>(size - done, UINT32_MAX));
+		uint32_t received = 0;
+		trace("begin", "read", done, request);
+		m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr + done)), request, &received);
+		trace("end", "read", done, request, received);
+		if (received != request) {
+			EXIT("ELF segment short read: module=%s address=0x%llx file_offset=0x%llx requested=%u received=%u\n",
+			     m_file_name.c_str(), static_cast<unsigned long long>(vaddr + done),
+			     static_cast<unsigned long long>(file_offset + done), request, received);
+		}
+		done += received;
+	}
+}
+
 void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
 	EXIT_IF(m_f == nullptr);
+	// A pure BSS segment has no corresponding file data (including in a SELF).
+	if (size == 0) return;
 
 	if (m_self != nullptr) {
 		EXIT_IF(m_self_segments == nullptr);
@@ -250,36 +298,36 @@ void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
 			const auto& seg = m_self_segments[i];
 			if ((seg.type & 0x800u) != 0) {
 				auto phdr_id = ((seg.type >> 20u) & 0xFFFu);
+				if (phdr_id >= m_ehdr->e_phnum) EXIT("SELF segment references an invalid program header\n");
 
 				const auto& phdr = m_phdr[phdr_id];
 
-				if (file_offset >= phdr.p_offset && file_offset < phdr.p_offset + phdr.p_filesz) {
+				if (file_offset >= phdr.p_offset && file_offset - phdr.p_offset < phdr.p_filesz) {
 					EXIT_NOT_IMPLEMENTED(seg.decompressed_size != phdr.p_filesz);
 					EXIT_NOT_IMPLEMENTED(seg.compressed_size != seg.decompressed_size);
 
 					auto offset = file_offset - phdr.p_offset;
 
-					EXIT_NOT_IMPLEMENTED(offset + size > seg.decompressed_size);
+					EXIT_NOT_IMPLEMENTED(size > seg.decompressed_size - offset);
+					if (offset > UINT64_MAX - seg.offset) EXIT("SELF segment file offset overflow\n");
 
-					m_f->Seek(offset + seg.offset);
-					m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
+					ReadSegmentBytes(vaddr, offset + seg.offset, size);
 
 					return;
 				}
 			}
 		}
 
-		if (m_f->Size() - m_self->file_size == size) {
-			m_f->Seek(m_self->file_size);
-			m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
+		const auto file_size = m_f->Size();
+		if (file_size >= m_self->file_size && file_size - m_self->file_size == size) {
+			ReadSegmentBytes(vaddr, m_self->file_size, size);
 
 			return;
 		}
 
 		EXIT("missing self segment\n");
 	} else {
-		m_f->Seek(file_offset);
-		m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
+		ReadSegmentBytes(vaddr, file_offset, size);
 	}
 }
 
@@ -531,6 +579,7 @@ bool Elf64::IsValid() const {
 
 void Elf64::Open(const std::filesystem::path& file_name) {
 	Clear();
+	m_file_name = Common::PathToString(file_name.filename());
 
 	m_f = std::make_unique<Common::File>();
 	m_f->Open(file_name, Common::File::Mode::Read);

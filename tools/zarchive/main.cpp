@@ -44,6 +44,7 @@ void PrintHelp()
 	puts("If input_path is a directory, then output_path will be the ZArchive output file path");
 	puts("If input_path is a ZArchive file path, then output_path will be the output directory");
 	puts("output_path is optional");
+	puts("zarchive.exe archive.zar output_dir /sub/folder extracts only that folder (Nova5: a .zar's sce_sys)");
 }
 
 bool ExtractFile(ZArchiveReader* reader, std::string_view srcPath, const fs::path& path)
@@ -113,7 +114,7 @@ bool ExtractRecursive(ZArchiveReader* reader, std::string srcPath, fs::path outp
 	return true;
 }
 
-int Extract(fs::path inputFile, fs::path outputDirectory)
+int Extract(fs::path inputFile, fs::path outputDirectory, const std::string& folder = "")
 {
 	std::error_code ec;
 	if (!fs::exists(inputFile, ec))
@@ -128,7 +129,9 @@ int Extract(fs::path inputFile, fs::path outputDirectory)
 		puts("Failed to open ZArchive");
 		return -11;
 	}
-	bool r = ExtractRecursive(reader, "", outputDirectory);
+	// A folder alone ("/sce_sys"): into outputDirectory/<its name>.
+	bool r = folder.empty() ? ExtractRecursive(reader, "", outputDirectory)
+	                        : ExtractRecursive(reader, folder, outputDirectory / fs::u8path(folder.substr(folder.find_last_of('/') + 1)));
 	if (!r)
 	{
 		puts("Extraction failed");
@@ -231,11 +234,16 @@ int ToolMain(int argc, char* argv[])
 	}
 	std::optional<std::string> strInput;
 	std::optional<std::string> strOutput;
+	std::string folder;
 	for (int i = 1; i < argc; i++)
 	{
 		if (strInput)
 		{
-			if (strOutput)
+			if (strOutput && folder.empty() && argv[i][0] == '/')
+			{
+				folder = argv[i];
+			}
+			else if (strOutput)
 			{
 				puts("Too many paths specified");
 				return -1;
@@ -278,7 +286,7 @@ int ToolMain(int argc, char* argv[])
 				puts("Failed to create output directory");
 				return -4;
 			}
-			return Extract(p, outputDirectory);
+			return Extract(p, outputDirectory, folder);
 		}
 		else if(fs::is_directory(p, ec))
 		{

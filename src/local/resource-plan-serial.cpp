@@ -14,7 +14,7 @@ namespace IR = Libs::Graphics::ShaderRecompiler::IR;
 
 namespace {
 
-constexpr uint32_t Magic = 0x4e4c5052u; // "RPLN"
+constexpr uint32_t Magic = 0x324c5052u; // "RPL2": bindless image plans
 
 // Audit added fields in Save/Load: derived runtime state must be rebuilt, not serialized.
 // ResourcePlan::linear_srt and activity_srt are JIT state, excluded from the wire format.
@@ -162,7 +162,7 @@ void PutInfo(Writer& w, const IR::ShaderInfo& info) {
 		w.Put(image.conversion_format);
 		w.Put(image.shader_swizzle);
 		w.Put(static_cast<uint8_t>(image.read | image.written << 1 | image.atomic << 2 | image.depth_compare << 3 |
-		                           image.cube << 4 | image.r128 << 5));
+		                           image.cube << 4 | image.r128 << 5 | image.bindless << 6));
 		w.Put(image.indirect_root);
 		w.Put(image.indirect_mapping_offset);
 		w.Put(image.indirect_search_iterations);
@@ -212,6 +212,7 @@ bool GetInfo(Reader& r, IR::ShaderInfo& info) {
 		image.depth_compare = (bits & 8u) != 0;
 		image.cube          = (bits & 16u) != 0;
 		image.r128          = (bits & 32u) != 0;
+		image.bindless      = (bits & 64u) != 0;
 	}
 	if (!r.GetVector(info.samplers) || !r.GetVector(info.sampled_pairs) || !r.Get(count)) return false;
 	info.inputs.resize(count);

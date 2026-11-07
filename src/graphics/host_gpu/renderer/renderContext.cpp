@@ -64,14 +64,17 @@ RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_guest_clock(*this), m_render_executor(*this), m_compute_render_executor(*this),
       m_command_scheduler(*this, graphics),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
-      m_pipeline_cache(graphics), m_sampler_cache(graphics),
-      m_gpu_resources(graphics, m_command_scheduler) {
+      m_gpu_resources(graphics, m_command_scheduler),
+      m_bindless_table(graphics, m_command_scheduler, m_gpu_resources.GetPageManager()),
+      m_pipeline_cache(graphics), m_sampler_cache(graphics) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	if (m_bindless_table.Enabled()) m_gpu_resources.SetBindlessTable(&m_bindless_table);
 }
 
 RenderContext::~RenderContext() {
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
+	m_gpu_resources.SetBindlessTable(nullptr);
 }
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {

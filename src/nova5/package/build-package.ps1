@@ -43,6 +43,16 @@ $redist = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\*\*\VC\Redist\
 if (-not $redist) { throw 'Visual C++ redistributable files not found' }
 Copy-Item (Join-Path $redist.FullName '*.dll') $stage
 
+# NovaS (the Switch 2 tab): its engine from novas\compilar-publico.cmd (no PC paths inside), with the same runtime next
+# to it, and its GPL-3.0 licenses.
+$novasSource = Join-Path $repo '..\novas\codigo'
+$novasEngine = Join-Path $novasSource '_Build\publico\bin\NovaSEmulator.exe'
+if (-not (Test-Path $novasEngine)) { throw 'NovaS engine not built (run novas\compilar-publico.cmd)' }
+$novasDir = Join-Path $stage 'novas'
+New-Item -ItemType Directory -Force $novasDir | Out-Null
+Copy-Item $novasEngine $novasDir
+Copy-Item (Join-Path $redist.FullName '*.dll') $novasDir
+
 # Licenses: GPL-2.0 for the emulator, Kyty's MIT notice and every third-party license.
 Copy-Item (Join-Path $repo 'LICENSE') (Join-Path $stage 'LICENSE.txt')
 $licenses = Join-Path $stage 'licenses'
@@ -56,6 +66,9 @@ foreach ($dir in Get-ChildItem (Join-Path $repo '3rdparty') -Directory) {
 	}
 }
 Copy-Item (Join-Path $PSScriptRoot 'LEEME.txt') $stage
+New-Item -ItemType Directory -Force (Join-Path $licenses 'novas') | Out-Null
+Copy-Item (Join-Path $novasSource 'LICENSE.txt') (Join-Path $licenses 'novas\LICENSE.txt')
+Copy-Item (Join-Path $novasSource 'LICENSES\*') (Join-Path $licenses 'novas')
 
 # PKG installer: pkg-to-anyps5 (GPL-3.0, https://github.com/awake-devel/pkg-to-anyps5), run by the launcher.
 # v0.2.5 source with pkg-to-anyps5.patch applied, built with cargo build --release.

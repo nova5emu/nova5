@@ -435,10 +435,15 @@ inline void ReportStall(uint64_t timeline, uint64_t reached, Counter&& counter) 
 				it->x = note.x, it->y = note.y, it->z = note.z;
 			}
 		}
-		for (const auto& s: sums)
-			Append(text, "    STALL dispatches tick %llu cs %016llx: %u (%u indirect), largest %llu groups (%u x %u x %u)\n",
-			       static_cast<unsigned long long>(s.tick), static_cast<unsigned long long>(s.hash), s.count, s.indirect,
-			       static_cast<unsigned long long>(s.largest), s.x, s.y, s.z);
+		for (const auto& s: sums) {
+			Append(text, "    STALL dispatches tick %llu cs %016llx: %u (%u indirect)",
+			       static_cast<unsigned long long>(s.tick), static_cast<unsigned long long>(s.hash), s.count, s.indirect);
+			if (s.count != s.indirect)
+				Append(text, ", largest direct %llu groups (%u x %u x %u)",
+				       static_cast<unsigned long long>(s.largest), s.x, s.y, s.z);
+			if (s.indirect != 0) Append(text, "; indirect GPU group counts unknown");
+			Append(text, "\n");
+		}
 	}
 	std::fwrite(text.data(), 1, text.size(), stdout);
 	std::fflush(stdout);

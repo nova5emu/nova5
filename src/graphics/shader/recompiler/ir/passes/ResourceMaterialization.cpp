@@ -735,6 +735,7 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 	snapshot.indirect_images.clear();
 	snapshot.resources.uniform_fill = {};
 	snapshot.resources.images.clear();
+	snapshot.resources.bindless_heaps.clear();
 	const auto fail = [report](const char* why) {
 		if (report != nullptr) {
 			report->reason = why;
@@ -789,7 +790,7 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 			const bool            has_bound = dense && indirect.bound_source !=
 			                                               DescriptorSource::IndirectImage::NoBoundSource;
 			std::vector<uint32_t> requests;
-			if (!dense) {
+			if (!dense && !indirect.bindless) {
 				requests.push_back(indirect.material_source);
 			}
 			requests.push_back(indirect.heap_source);
@@ -801,6 +802,18 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 			std::vector<DescriptorValue> tables;
 			if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables)) {
 				return fail("an indirect image table source did not evaluate");
+			}
+			if (indirect.bindless) {
+				ShaderBufferResource heap;
+				if (!DecodeBufferDescriptor(tables.front(), heap) || heap.Type() != 0 ||
+				    heap.AddTid() || (heap.PackedStride() & (1u << 14u)) != 0)
+					return fail("bindless image heap is not a linear scalar buffer");
+				const auto mapping = static_cast<uint32_t>(next.flattened_srt.size());
+				next.flattened_srt.resize(mapping + 2u, 0u); // renderer patches region and entry count
+				next.bindless_heaps.push_back({heap.Base48() & ~uint64_t {3}, ScalarBufferSize(heap),
+				                              indirect.table_offset, image_index, mapping});
+				next.images[image_index].dword_count = 8u;
+				continue;
 			}
 			IndirectImage table;
 			std::string   detail;
@@ -891,6 +904,7 @@ bool EnumerateAddressProbe(const DescriptorSource::IndirectImage& probe, const I
 
 bool TableIndirectForm(ResourceSpecialization& specialization, std::vector<DescriptorValue>* snapshot_images) {
 	auto&    images = specialization.images;
+	if (std::ranges::any_of(images, [](const auto& image) { return image.bindless; })) return false;
 	uint32_t root = ImageResource::NoIndirectImage, candidates = 0;
 	for (uint32_t index = 0; index < images.size(); index++) {
 		if (images[index].fmask) return false;
@@ -1187,6 +1201,22 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		    .cube                       = image.cube,
 		});
 	}
+	for (const auto& heap: next_snapshot.bindless_heaps) {
+		auto& image = next_specialization.images.at(heap.image);
+		const auto& base = program.info.images.at(heap.image);
+		using Decoder::ImageDimension;
+		if (base.resource_class != ImageResourceClass::Sampled || base.written || base.atomic || base.r128 ||
+		    base.depth_compare || (base.cube && base.dimension != ImageDimension::Dim2DArray) ||
+		    (base.dimension != ImageDimension::Dim2D && base.dimension != ImageDimension::Dim2DArray &&
+		     base.dimension != ImageDimension::Dim3D))
+			return SpecializationFail(report, fmt::format(
+			    "unsupported bindless image shape or access: image={} pc=0x{:x} class={} dimension={} "
+			    "cube={} written={} atomic={} r128={} depth_compare={}", heap.image, base.first_use_pc,
+			    static_cast<uint32_t>(base.resource_class), static_cast<uint32_t>(base.dimension),
+			    base.cube, base.written, base.atomic, base.r128, base.depth_compare));
+		image.bindless = true;
+		image.indirect_mapping_offset = heap.mapping_offset;
+	}
 	for (size_t table_index = 0; table_index < snapshot.indirect_images.size(); table_index++) {
 		const auto& table      = snapshot.indirect_images[table_index];
 		const auto  root_image = next_specialization.images[table.resource];
@@ -1275,7 +1305,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
 			                                  : Prospero::TextureNumericClass::Float;
 			image.dimension     = NullImageDimension(base.dimension);
-			image.cube          = false;
+			image.cube          = image.bindless && base.cube;
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
@@ -1413,6 +1443,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		if (target != UINT32_MAX && target >= program.info.samplers.size()) {
 			next_snapshot.samplers.push_back(next_snapshot.samplers[index]);
 		}
+	}
+	if (!next_snapshot.bindless_heaps.empty()) {
+		const ImageRemap remap(next_specialization);
+		for (auto& heap: next_snapshot.bindless_heaps) heap.image = remap.indices.at(heap.image);
 	}
 	if (kyty_local_preparation_trim_mode.load(std::memory_order_relaxed)) {
 		// Runtime snapshots only need stable compaction. The compiler still
@@ -1878,7 +1912,7 @@ ResourcePlan ExtractResourcePlan(const Program& program, bool linear) {
 		if (source == nullptr || !source->indirect_image.has_value()) {
 			continue;
 		}
-		if (source->indirect_image->key_bound == 0u) {
+		if (source->indirect_image->key_bound == 0u && !source->indirect_image->bindless) {
 			MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->material_source),
 			                   plan.clean_flat_slots);
 		}
@@ -1976,6 +2010,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
+		image.bindless                   = source.bindless;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {

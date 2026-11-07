@@ -25,6 +25,16 @@ public sealed class NovaSHome : Grid
 	private static readonly Color TextColor = Color.Parse("#F2F3F7");
 	private static readonly Color Dim       = Color.Parse("#9A9EAD");
 	private static readonly FontFamily Icons = new("Segoe Fluent Icons, Segoe MDL2 Assets");
+	// The console around the screen.
+	private static readonly Color Desk  = Color.Parse("#F2F3F5");
+	private static readonly Color Bezel = Color.Parse("#101115");
+	private static readonly Color Red   = Color.Parse("#FF4554");
+	private static readonly Color Blue  = Color.Parse("#00C3E3");
+	private static readonly Color Knob  = Color.Parse("#24262C");
+	private const double JoyWidth = 250, BezelSize = 30;
+
+	private readonly Grid _screen = new() { Width = 1920, Height = 1080, ClipToBounds = true, Background = new SolidColorBrush(Back) };
+	private readonly Grid _settingsHost = new() { IsVisible = false, Background = new SolidColorBrush(Colors.Black, 0.55) };
 
 	private sealed record Action(string Glyph, string Label, System.Action Run);
 
@@ -143,9 +153,23 @@ public sealed class NovaSHome : Grid
 		toastDock.Children.Add(_toast);
 		Place(stage, toastDock, 0, 680);
 
-		Children.Add(new Viewbox { Stretch = Stretch.Uniform, Child = stage });
+		// The home is the screen of a console: a red controller on the left, a blue one on the right, on a light desk
+		// (the same look as NovaS's web page). The drawn buttons work like the real ones.
+		_screen.Children.Add(stage);
+		_screen.Children.Add(_settingsHost);
+		Background = new SolidColorBrush(Desk);
+		var device = new StackPanel { Orientation = Orientation.Horizontal };
+		device.Children.Add(JoyCon(left: true));
+		device.Children.Add(new Border { Background = new SolidColorBrush(Bezel), Padding = new Thickness(0, BezelSize), Child = _screen });
+		device.Children.Add(JoyCon(left: false));
+		var shadow = new Border
+		{
+			Child = device, Margin = new Thickness(90, 70), CornerRadius = new CornerRadius(JoyWidth * 0.6, JoyWidth * 0.6, JoyWidth * 0.6, JoyWidth * 0.6),
+			BoxShadow = BoxShadows.Parse("0 34 70 0 #4426282E"),
+		};
+		Children.Add(new Viewbox { Stretch = Stretch.Uniform, Child = shadow });
 
-		var clock = new DispatcherTimer(TimeSpan.FromSeconds(1), DispatcherPriority.Background, (_, _) => _clock.Text = DateTime.Now.ToString("HH:mm"));
+		var clock =new DispatcherTimer(TimeSpan.FromSeconds(1), DispatcherPriority.Background, (_, _) => _clock.Text = DateTime.Now.ToString("HH:mm"));
 		clock.Start();
 		_clock.Text = DateTime.Now.ToString("HH:mm");
 	}
@@ -247,21 +271,17 @@ public sealed class NovaSHome : Grid
 				Background = new SolidColorBrush(Panel), BorderBrush = new SolidColorBrush(Line), BorderThickness = new Thickness(1),
 				HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
 			};
-			var shade = new Grid { Background = new SolidColorBrush(Colors.Black, 0.55), Children = { _settingsSheet } };
-			Children.Add(new Viewbox { Stretch = Stretch.Uniform, Child = new Grid { Width = 1920, Height = 1080, Children = { shade } } });
+			_settingsHost.Children.Add(_settingsSheet); // Over the home, inside the console's screen.
 		}
 		_setting = 0;
 		BuildSettings();
 		_settingsScroll.Offset = default;
-		((Control)_settingsSheet.Parent!.Parent!.Parent!).IsVisible = true;
+		_settingsHost.IsVisible = true;
 	}
 
-	public bool SettingsOpen => _settingsSheet?.Parent?.Parent?.Parent is Control { IsVisible: true };
+	public bool SettingsOpen => _settingsHost.IsVisible;
 
-	private void CloseSettings()
-	{
-		if (_settingsSheet?.Parent?.Parent?.Parent is Control host) host.IsVisible = false;
-	}
+	private void CloseSettings() => _settingsHost.IsVisible = false;
 
 	private void BuildSettings()
 	{
@@ -411,6 +431,73 @@ public sealed class NovaSHome : Grid
 	}
 
 	// ---- Pieces -------------------------------------------------------------------------------
+
+	// One controller beside the screen: red on the left (minus, stick, d-pad, capture), blue on the right (plus, A B X Y,
+	// stick, home). Clicking its buttons moves and chooses like a pad.
+	private Border JoyCon(bool left)
+	{
+		const double height = 1080 + BezelSize * 2, round = JoyWidth * 0.6;
+		var parts = new StackPanel { Spacing = 64, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 120, 0, 0) };
+
+		// Minus or plus.
+		var sign = new Grid { Width = 56, Height = 56, HorizontalAlignment = HorizontalAlignment.Center };
+		sign.Children.Add(new Rectangle { Width = 56, Height = 12, RadiusX = 6, RadiusY = 6, Fill = new SolidColorBrush(Knob) });
+		if (!left) sign.Children.Add(new Rectangle { Width = 12, Height = 56, RadiusX = 6, RadiusY = 6, Fill = new SolidColorBrush(Knob) });
+		var stick = PadButton(new Ellipse
+		{
+			Width = 132, Height = 132, StrokeThickness = 8, Stroke = new SolidColorBrush(Colors.Black, 0.25),
+			Fill = new RadialGradientBrush
+			{
+				GradientOrigin = new RelativePoint(0.4, 0.35, RelativeUnit.Relative),
+				GradientStops = { new GradientStop(Color.Parse("#4A4D56"), 0), new GradientStop(Color.Parse("#1F2025"), 0.75) },
+			},
+		}, left ? PadInput.Left : PadInput.Right);
+
+		// Four round buttons in a diamond: the d-pad on the left, A B X Y on the right.
+		var diamond = new Canvas { Width = 176, Height = 176, HorizontalAlignment = HorizontalAlignment.Center };
+		(string Label, PadInput? Input, double X, double Y)[] keys = left
+		    ? new (string, PadInput?, double, double)[] { ("\uE70E", PadInput.Up, 58, 0), ("\uE76B", PadInput.Left, 0, 58), ("\uE76C", PadInput.Right, 116, 58), ("\uE70D", PadInput.Down, 58, 116) }
+		    : new (string, PadInput?, double, double)[] { ("X", null, 58, 0), ("Y", PadInput.Options, 0, 58), ("A", PadInput.Accept, 116, 58), ("B", PadInput.Back, 58, 116) };
+		foreach (var key in keys)
+		{
+			var face = new Border
+			{
+				Width = 60, Height = 60, CornerRadius = new CornerRadius(30), Background = new SolidColorBrush(Knob),
+				Child = Label(key.Label, left ? 20 : 24, FontWeight.Bold, Color.Parse("#E9EAEE"), left ? Icons : null, center: true),
+			};
+			var button = key.Input is { } input ? PadButton(face, input) : face;
+			Canvas.SetLeft(button, key.X);
+			Canvas.SetTop(button, key.Y);
+			diamond.Children.Add(button);
+		}
+		var small = new Border
+		{
+			Width = 50, Height = 50, HorizontalAlignment = HorizontalAlignment.Center, Background = new SolidColorBrush(Knob),
+			CornerRadius = new CornerRadius(left ? 14 : 25), BorderThickness = new Thickness(left ? 0 : 5), BorderBrush = new SolidColorBrush(Color.Parse("#3A3D45")),
+		};
+
+		parts.Children.Add(sign);
+		if (left) { parts.Children.Add(stick); parts.Children.Add(diamond); }
+		else      { parts.Children.Add(diamond); parts.Children.Add(stick); }
+		parts.Children.Add(small);
+		return new Border
+		{
+			Width = JoyWidth, Height = height, Child = parts, Background = new SolidColorBrush(left ? Red : Blue),
+			CornerRadius = left ? new CornerRadius(round, 0, 0, round) : new CornerRadius(0, round, round, 0),
+		};
+	}
+
+	// A drawn controller button: it shrinks a little while pressed and acts like that pad input.
+	private Control PadButton(Control face, PadInput input)
+	{
+		face.Cursor = new Cursor(StandardCursorType.Hand);
+		face.HorizontalAlignment = HorizontalAlignment.Center;
+		face.RenderTransformOrigin = new RelativePoint(0.5, 0.5, RelativeUnit.Relative);
+		face.PointerPressed  += (_, e) => { face.RenderTransform = new ScaleTransform(0.9, 0.9); Input(input); e.Handled = true; };
+		face.PointerReleased += (_, _) => face.RenderTransform = null;
+		face.PointerExited   += (_, _) => face.RenderTransform = null;
+		return face;
+	}
 
 	private static Border GameTile(SwitchGame game)
 	{

@@ -194,6 +194,13 @@ void EnterTableMode(Program& program) {
 	const auto refuse = [&](const char* reason) {
 		EXIT("table mode refused: hash=0x%016" PRIx64 " %s\n", program.shader_hash, reason);
 	};
+	if (std::ranges::any_of(program.info.images, [](const auto& image) { return image.bindless; }))
+		refuse("bindless images use the resident descriptor set");
+	if (GetCodegenOptions().coherent_buffers &&
+	    std::ranges::any_of(program.memory_info, [](const auto& mem) {
+		    return mem.kind == ResourceKind::Buffer && mem.glc;
+	    }))
+		refuse("cache-bypassing buffers require the coherent descriptor path");
 	// Reads at offsets no slot fixes load by device address (LoadBda: the set binds the page table, and the read plan
 	// readies their ranges as the normal path's PrepareBdaBindings does): a compute shader's (the light loops' records).
 	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
@@ -414,6 +421,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool ena
 
 	std::array<std::vector<uint32_t>, ImageBindingCount> image_groups;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		if (program.info.images[i].bindless) continue;
 		const auto kind = DescriptorBindingForImage(program.info.images[i]);
 		if (!kind.has_value()) {
 			EXIT("shader binding layout failed: image %u has an invalid binding class", i);
@@ -455,7 +463,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool ena
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
 	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		    return image.indirect_search_iterations != 0u;
+		    return image.bindless || image.indirect_search_iterations != 0u;
 	    });
 	if (uses_flattened_runtime && !program.table_mode) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);

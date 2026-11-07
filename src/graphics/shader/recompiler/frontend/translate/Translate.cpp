@@ -1223,12 +1223,12 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				return entry_ir.ISub(lhs, minimum(lhs, rhs));
 			};
 			const auto local = builtin(IR::StageInputKind::LocalInvocationIndex);
-			const auto primitive_chunk = entry_ir.IMul(builtin(IR::StageInputKind::WorkgroupId, 0),
-			                                           u32(mesh.primitives_per_group));
+			const auto group = builtin(IR::StageInputKind::WorkgroupId, 0);
+			const auto primitive_chunk = mesh.fast_launch ? group : entry_ir.IMul(group, u32(mesh.primitives_per_group));
 			const auto step  = u32(mesh.InputPrimitiveStep());
 			const auto size  = u32(mesh.InputPrimitiveSize());
-			const auto chunk = entry_ir.IMul(primitive_chunk, step);
-			const auto vertices =
+			const auto chunk = mesh.fast_launch ? group : entry_ir.IMul(primitive_chunk, step);
+			const auto vertices = mesh.fast_launch ? u32(mesh.vertices_per_group) :
 			    minimum(subtract_saturate(draw(0), chunk), u32(mesh.vertices_per_group));
 			const auto primitives = entry_ir.Select(
 			    entry_ir.ULessThan(vertices, size), u32(0),
@@ -1244,65 +1244,74 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			const auto wave_info = entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(wave, u32(24)),
 			                                          u32(((total_threads + options.wave_size - 1u) /
 			                                               options.wave_size) << 28u));
-			entry_ir.SetScalarReg(
-			    static_cast<IR::ScalarReg>(2),
-			    entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(vertices, u32(12)),
-			                       entry_ir.ShiftLeftLogical(primitives, u32(22))));
+			if (!mesh.fast_launch) {
+				entry_ir.SetScalarReg(
+				    static_cast<IR::ScalarReg>(2),
+				    entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(vertices, u32(12)),
+				                       entry_ir.ShiftLeftLogical(primitives, u32(22))));
+			}
 			entry_ir.SetScalarReg(
 			    static_cast<IR::ScalarReg>(3),
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
 			                                                         primitive_count, u32(8)),
 			                                                     vertex_count)));
-			// GS adjacency addresses local ES records in LDS. Fans retain the draw's
-			// center in every subgroup; strip winding follows the global primitive.
-			const auto vertex = entry_ir.IMul(local, step);
-			auto       first  = vertex;
-			auto       second = u32(0);
-			auto       third  = u32(0);
-			if (mesh.InputPrimitiveSize() >= 2u) {
-				second = entry_ir.IAdd(vertex, u32(1));
+			if (mesh.fast_launch) {
+				// All lanes receive the same meshlet ID. The shader adds its start-instance
+				// SGPR itself, so v6 must exclude draw(2) (Frank 8e9e5c6d).
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), entry_ir.IAdd(draw(1), group));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(6), builtin(IR::StageInputKind::WorkgroupId, 1));
+			} else {
+				// GS adjacency addresses local ES records in LDS. Fans retain the draw's
+				// center in every subgroup; strip winding follows the global primitive.
+				const auto vertex = entry_ir.IMul(local, step);
+				auto       first  = vertex;
+				auto       second = u32(0);
+				auto       third  = u32(0);
+				if (mesh.InputPrimitiveSize() >= 2u) {
+					second = entry_ir.IAdd(vertex, u32(1));
+				}
+				if (mesh.InputPrimitiveSize() == 3u) {
+					third = entry_ir.IAdd(vertex, u32(2));
+				}
+				auto input_vertex = entry_ir.IAdd(chunk, local);
+				if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriFan)) {
+					first = u32(0);
+					input_vertex = entry_ir.Select(entry_ir.IEqual(local, u32(0)), u32(0), input_vertex);
+				} else if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)) {
+					const auto parity = entry_ir.BitwiseAnd(entry_ir.IAdd(primitive_chunk, local), u32(1));
+					first = entry_ir.IAdd(first, parity);
+					second = entry_ir.ISub(second, parity);
+				}
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
+				                      entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
+				                                         entry_ir.ShiftLeftLogical(second, u32(18))));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
+				                      entry_ir.ShiftLeftLogical(third, u32(2)));
+				const auto index_bytes  = draw(3);
+				const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
+				const auto index_low    = draw(4);
+				const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
+				                                           entry_ir.IMul(input_vertex, index_bytes));
+				const auto index_resource = entry_ir.Emit(
+				    IR::ValueOpcode::GetAddressResource,
+				    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(5)});
+				const auto memory_index = static_cast<uint32_t>(result.memory_info.size());
+				result.memory_info.push_back({.kind = IR::ResourceKind::Global});
+				const auto packed_index = entry_ir.Emit(
+				    IR::ValueOpcode::LoadAddressU32,
+				    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
+				     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))},
+				    IR::MemoryFlags {.index = memory_index});
+				const auto index = IR::U32(entry_ir.Emit(
+				    IR::ValueOpcode::BitFieldUExtract,
+				    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
+				     entry_ir.IMul(index_bytes, u32(8))}));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
+				                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
+				// The instance ID counts from 0; the start instance is the draw's.
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
+				                      builtin(IR::StageInputKind::WorkgroupId, 1));
 			}
-			if (mesh.InputPrimitiveSize() == 3u) {
-				third = entry_ir.IAdd(vertex, u32(2));
-			}
-			auto input_vertex = entry_ir.IAdd(chunk, local);
-			if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriFan)) {
-				first = u32(0);
-				input_vertex = entry_ir.Select(entry_ir.IEqual(local, u32(0)), u32(0), input_vertex);
-			} else if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)) {
-				const auto parity = entry_ir.BitwiseAnd(entry_ir.IAdd(primitive_chunk, local), u32(1));
-				first = entry_ir.IAdd(first, parity);
-				second = entry_ir.ISub(second, parity);
-			}
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
-			                      entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
-			                                         entry_ir.ShiftLeftLogical(second, u32(18))));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
-			                      entry_ir.ShiftLeftLogical(third, u32(2)));
-			const auto index_bytes  = draw(3);
-			const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
-			const auto index_low    = draw(4);
-			const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
-			                                           entry_ir.IMul(input_vertex, index_bytes));
-			const auto index_resource = entry_ir.Emit(
-			    IR::ValueOpcode::GetAddressResource,
-			    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(5)});
-			const auto memory_index = static_cast<uint32_t>(result.memory_info.size());
-			result.memory_info.push_back({.kind = IR::ResourceKind::Global});
-			const auto packed_index = entry_ir.Emit(
-			    IR::ValueOpcode::LoadAddressU32,
-			    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
-			     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))},
-			    IR::MemoryFlags {.index = memory_index});
-			const auto index = IR::U32(entry_ir.Emit(
-			    IR::ValueOpcode::BitFieldUExtract,
-			    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
-			     entry_ir.IMul(index_bytes, u32(8))}));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
-			                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
-			// The instance ID counts from 0; the start instance is the draw's.
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
-			                      builtin(IR::StageInputKind::WorkgroupId, 1));
 			if (options.vertex->start_instance_sgpr >= 0) {
 				entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(options.vertex->start_instance_sgpr),
 				                      draw(2));

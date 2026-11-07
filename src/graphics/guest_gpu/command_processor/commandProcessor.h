@@ -12,6 +12,8 @@
 
 namespace Libs::Graphics {
 
+namespace DrawPrep { class Engine; }
+
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
 enum class Pm4ProcessResult { Complete, Blocked };
@@ -57,6 +59,7 @@ public:
 	KYTY_CLASS_NO_COPY(CommandProcessor);
 
 	void Reset();
+	void DrainDrawPrep();
 	void ApplyContextStateOperation(ContextStateOperation operation);
 
 	void            BufferInit();
@@ -157,6 +160,12 @@ public:
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
+	bool SubmitDrawPrep(const DrawIndexArgs* index, const DrawAutoArgs* automatic);
+	// Shared ownership only to keep this header's inline constructor/destructor
+	// independent of Engine's definition. The command processor is its sole owner.
+	std::shared_ptr<DrawPrep::Engine> m_draw_prep;
+	bool m_draw_prep_submitted = false;
+	bool m_draw_prep_packet = false;
 	uint32_t m_draw_run_skip = 0;
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,

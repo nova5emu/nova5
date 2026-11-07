@@ -37,6 +37,8 @@
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/host_gpu/renderer/wolverine.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "kernel/memory.h"
@@ -938,6 +940,49 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		supported_features2.pNext  = &fragment_barycentric;
 	}
 	physical_device.getFeatures2(&supported_features2);
+	std::string bindless_title;
+	Loader::SystemContentParamSfoGetString("TITLE_ID", &bindless_title);
+	const bool want_bindless = Wolverine::BindlessImagesEnabled(
+	    bindless_title, std::getenv("NOVA5_WOLVERINE_BINDLESS_IMAGES"));
+	graphics.bindless_enabled = want_bindless && supported_features12.runtimeDescriptorArray &&
+	    supported_features12.shaderSampledImageArrayNonUniformIndexing &&
+	    supported_features12.descriptorBindingPartiallyBound &&
+	    supported_features12.descriptorBindingSampledImageUpdateAfterBind &&
+	    supported_features12.descriptorBindingUpdateUnusedWhilePending;
+	if (graphics.bindless_enabled) {
+		vk::PhysicalDeviceVulkan12Properties indexing {};
+		vk::PhysicalDeviceProperties2 properties {};
+		properties.pNext = &indexing;
+		physical_device.getProperties2(&properties);
+		// Leave room for set 0 and the feedback/translation buffers in every stage.
+		const auto reserve = [](uint32_t limit, uint32_t used) { return limit > used ? limit - used : 0u; };
+		graphics.bindless_max_sampled_images = std::min({4u * 65536u,
+		    reserve(indexing.maxDescriptorSetUpdateAfterBindSampledImages, 1024),
+		    reserve(indexing.maxPerStageDescriptorUpdateAfterBindSampledImages, 1024),
+		    reserve(indexing.maxPerStageUpdateAfterBindResources, 2048),
+		    reserve(indexing.maxUpdateAfterBindDescriptorsInAllPools, 2048)});
+		graphics.bindless_enabled = graphics.bindless_max_sampled_images >= 4u * 256u;
+	}
+	if (graphics.bindless_enabled) {
+		features12.runtimeDescriptorArray = VK_TRUE;
+		features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+		features12.descriptorBindingPartiallyBound = VK_TRUE;
+		features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+		features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+	}
+	auto codegen = ShaderRecompiler::GetCodegenOptions();
+	codegen.bindless_images = graphics.bindless_enabled;
+	codegen.coherent_buffers = Wolverine::CoherentBuffersEnabled(
+	    bindless_title, std::getenv("NOVA5_WOLVERINE_COHERENT_BUFFERS"));
+	codegen.wolverine_loop_guard = Wolverine::LoopGuardEnabled(
+	    bindless_title, std::getenv("NOVA5_WOLVERINE_LOOP_GUARD"));
+	ShaderRecompiler::SetCodegenOptions(codegen);
+	if (bindless_title == "PPSA03671")
+		std::printf("[WOLVERINE] coherent_buffers=%u rt_loop_guard=%u hash=dc76e1223a9bf673 limit=2048\n",
+		            codegen.coherent_buffers, codegen.wolverine_loop_guard);
+	if (want_bindless)
+		LOGF("[WOLVERINE] bindless_images=%u sampled_image_capacity=%u\n",
+		     graphics.bindless_enabled ? 1u : 0u, graphics.bindless_max_sampled_images);
 	graphics.copy_memory_indirect_enabled = copy_indirect_extension && supported_copy_indirect.indirectCopy;
 	graphics.pipeline_statistics_enabled  = executable_extension && supported_executables.pipelineExecutableInfo;
 	LOGF("Vulkan indirect memory copies: %s\n", graphics.copy_memory_indirect_enabled ? "true" : "false");

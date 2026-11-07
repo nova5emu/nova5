@@ -44,6 +44,8 @@ struct ImageBinding {
 	bool             is_target     = false;
 	bool             needs_rebind  = false;
 	bool             force_general = false;
+	// Resident descriptors keep one layout even when a draw also binds this image directly.
+	bool             bindless_general = false;
 	bool             shader_write  = false;
 	vk::ImageAspectFlags pixel_sampled_aspects;
 	vk::ImageAspectFlags other_sampled_aspects;
@@ -366,6 +368,7 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	bool             cpu_read_tracked = false; // TextureCache's demand readback hold, separate from buffer ownership.
 	// Mode-1 whole-surface aliases. Only the group's explicit writer owns GPU bytes;
 	// other representations must be synchronized before their next acquisition.
 	bool             kept_alias     = false;

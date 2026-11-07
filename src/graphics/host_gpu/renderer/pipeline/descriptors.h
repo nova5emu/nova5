@@ -4,7 +4,9 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/drawPrep/bindingPlan.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
@@ -12,6 +14,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <type_traits>
 #include <vector>
 
@@ -19,6 +22,8 @@ namespace Libs::Graphics {
 
 // 1: reuse PreparedBindings storage across operations (fresh contents each time).
 extern "C" volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
+// 0 off, 1 consume pure serial plans, 2 compare/use serial, 3 compare/exit on mismatch.
+extern "C" volatile std::atomic_uint32_t kyty_local_draw_prep_bindings_mode;
 // 1: table dispatches (src/local/table-xpr.inc, KYTY_TABLE_DISPATCH).
 extern "C" volatile std::atomic_uint32_t kyty_local_table_dispatch_mode;
 
@@ -43,6 +48,11 @@ struct PreparedBindings {
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
 	const ShaderStageRuntime* runtime = nullptr;
+	std::vector<std::array<uint32_t, 3>> bindless_patches;
+	std::vector<BindlessTable::Heap*> bindless_heaps;
+	// Rebuilt for this invocation only; runtime's snapshot remains immutable until commit.
+	DrawPrep::StageBindingPlan binding_plan;
+	uint32_t binding_plan_mode = 0;
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
@@ -61,6 +71,19 @@ NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
 NativeDescriptorCount(const ShaderRecompiler::IR::DescriptorBinding& binding);
 [[nodiscard]] vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture,
                                                     uint32_t              element = 0);
+// Set 0 only: resident images retain their resource indices but occupy no slots.
+[[nodiscard]] uint32_t Set0ImageDescriptorCount(const PreparedBindings& prepared, size_t resource);
+[[nodiscard]] bool ImageDescriptorCountsMatch(const PreparedBindings& prepared,
+                                              std::span<const uint32_t> occurrences);
+// CPU payload assembly shared with the direct commit regression (no Vulkan calls).
+void AppendImageDescriptorInfos(const PreparedBindings& prepared,
+                                const ShaderRecompiler::IR::DescriptorBinding& binding,
+                                std::vector<uint32_t>& occurrences,
+                                std::vector<vk::DescriptorImageInfo>& infos);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+// CPU-only regression of the local packet planner; creates no Vulkan objects.
+[[nodiscard]] bool TestLocalDescriptorPlanBindless();
+#endif
 
 template <typename T>
 [[nodiscard]] T DecodeNativeDescriptor(const ShaderRecompiler::IR::DescriptorValue& value) {

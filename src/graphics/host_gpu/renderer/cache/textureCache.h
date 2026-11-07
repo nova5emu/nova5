@@ -31,12 +31,14 @@ class BufferCache;
 class CommandBuffer;
 class CommandScheduler;
 class RenderExecutor;
+class BindlessTable;
 struct TextureCacheTestAccess;
 
 [[nodiscard]] uint64_t KytyGcLiveBudgetValue(const GraphicContext& graphics);
 
 class TextureCache {
 public:
+	void SetBindlessTable(BindlessTable* table) { m_bindless_table = table; }
 	// Every image as a tab-separated row (live "images <path>").
 	void WriteReport(const char* path);
 
@@ -169,6 +171,10 @@ public:
 	void MapMemory(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// Publish guarded linear images before a CPU read or partial write, including
+	// neighbouring bytes on the same host page. Does not require a guest flip.
+	void ReadMemory(uint64_t address, uint64_t size);
+	[[nodiscard]] bool HasPendingCpuReadback(uint64_t address, uint64_t size);
 	void RunGarbageCollector();
 	// KYTY_TEXTURE_OFFLOAD(_PROBE) (texture-offload.h): the guest bytes of clean sampled textures probed for touches, or
 	// dropped from RAM after a download checked to give them back exactly (RunGarbageCollector).
@@ -205,6 +211,7 @@ public:
 	[[nodiscard]] uint64_t GcTick() const noexcept { return m_gc_tick; }
 
 private:
+	BindlessTable* m_bindless_table = nullptr;
 	enum class TransferDirection { Upload, Download };
 	struct TextureTransferPlan;
 	struct DownloadPlan;
@@ -341,6 +348,8 @@ private:
 	[[nodiscard]] bool RefreshTextureLevels(ImageId id, const ImageViewInfo& view);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
+	void                      TrackImageReads(Image& image);
+	void                      UntrackImageReads(Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
@@ -464,6 +473,7 @@ private:
 		// the page first, ReleaseDownloadPages: it keeps the CPU's bytes).
 		uint64_t          first_page = 0;
 		std::vector<bool> held;
+		bool read_tracked = false; // Keeps CPU access blocked even if the source image is retired.
 	};
 	// A CPU or host write over pages pending downloads hold: they are let go, and not written back.
 	void ReleaseDownloadPages(uint64_t address, uint64_t size);
@@ -499,6 +509,8 @@ private:
 	// m_lock.ReadShared can ask it.
 	[[nodiscard]] bool            MayHaveImagesRead(uint64_t address, uint64_t size) const;
 	bool             m_readback_linear_images = false;
+	bool             m_demand_linear_readback = false;
+	std::atomic<uint32_t> m_cpu_readback_holds {0}; // Image holds plus pending download holds.
 	bool             m_readback_tiled_images = false;
 
 	friend struct TextureCacheTestAccess;

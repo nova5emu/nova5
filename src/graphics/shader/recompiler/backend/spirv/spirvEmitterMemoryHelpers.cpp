@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include <atomic>
 
@@ -123,6 +124,8 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
 	MemoryResourceAccess access {.kind = mem.kind};
 	access.object_pointer = state.builder.AllocateId();
+	if (GetCodegenOptions().coherent_buffers && mem.kind == IR::ResourceKind::Buffer && mem.glc)
+		access.memory_access = MemoryAccessVolatileMask;
 	state.builder.AddFunction({OpAccessChain, pointer_type, access.object_pointer, variable,
 	                           ConstantU32(state, array_index)});
 	access.byte_offset = state.memory_byte_offsets[array_index];

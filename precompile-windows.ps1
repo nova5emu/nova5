@@ -493,7 +493,8 @@ while ($first.Count -or $second.Count -or $running.Count) {
 			Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
 		}
 	}
-	if (((Get-Date) - $shown).TotalSeconds -ge 60) {
+	# Every few seconds: Nova5's launcher turns these lines into its progress bar (once a minute looked stuck).
+	if (((Get-Date) - $shown).TotalSeconds -ge 5) {
 		$shown = Get-Date
 		Write-Host ("  {0:hh\:mm\:ss} shards: {1} done, {2} running, {3} waiting ({4} split)" -f ((Get-Date) - $begin), $finished,
 			$running.Count, ($first.Count + $second.Count), $split)

@@ -20,6 +20,7 @@ namespace Libs::Graphics {
 
 class CommandScheduler;
 class GuestGpu;
+class BindlessTable;
 
 class GpuResourceManager {
 public:
@@ -29,6 +30,11 @@ public:
 
 	[[nodiscard]] BufferCache&  GetBufferCache() { return m_buffer_cache; }
 	[[nodiscard]] TextureCache& GetTextureCache() { return m_texture_cache; }
+	PageManager& GetPageManager() { return m_page_manager; }
+	void SetBindlessTable(BindlessTable* table) {
+		m_bindless_table = table;
+		m_texture_cache.SetBindlessTable(table);
+	}
 	[[nodiscard]] bool          HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept {
         return m_page_manager.HasReadWatchers(vaddr, size);
 	}
@@ -114,6 +120,7 @@ private:
 	std::unordered_map<uint64_t, std::vector<uint64_t>> m_fresh_granules; // the addresses of the parts of a granule
 	uint64_t                                            m_fresh_report_flip = 0;
 	PageManager               m_page_manager;
+	BindlessTable*            m_bindless_table = nullptr;
 	CommandScheduler&         m_scheduler;
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;

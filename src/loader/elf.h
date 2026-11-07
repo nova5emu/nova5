@@ -290,7 +290,9 @@ public:
 
 private:
 	void Clear();
+	void ReadSegmentBytes(uint64_t vaddr, uint64_t file_offset, uint64_t size);
 
+	std::string                  m_file_name;
 	std::unique_ptr<Common::File>  m_f;
 	std::unique_ptr<SelfHeader>    m_self;
 	std::unique_ptr<SelfSegment[]> m_self_segments;

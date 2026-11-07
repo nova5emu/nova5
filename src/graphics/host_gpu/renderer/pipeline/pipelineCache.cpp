@@ -7,6 +7,8 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/drawPrep/readSet.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -21,6 +23,8 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ShaderCompileRecovery.h"
+#include "graphics/host_gpu/renderer/wolverine.h"
 #include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
@@ -80,6 +84,15 @@ volatile std::atomic<uint32_t> kyty_local_pipeline_index_mode {1};
 namespace Libs::Graphics {
 
 namespace {
+
+bool WolverineShaderRecovery() {
+	static const bool enabled = [] {
+		std::string title;
+		Loader::SystemContentParamSfoGetString("TITLE_ID", &title);
+		return Wolverine::ShaderRecoveryEnabled(title, std::getenv("NOVA5_WOLVERINE_SHADER_RECOVERY"));
+	}();
+	return enabled;
+}
 
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
@@ -1950,8 +1963,10 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword) {
-		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-		                                               specialization, push_data_start_dword);
+		auto result = ShaderRecompiler::RecoverShaderCompile(WolverineShaderRecovery(), [&] {
+			return ShaderRecompiler::CompileProgram(std::move(translated), options,
+			                                       specialization, push_data_start_dword);
+		});
 		return FinishPermutation(params, options, std::move(result), std::move(specialization));
 	}
 
@@ -2082,11 +2097,83 @@ struct PipelineCache::ProgramCache {
 		};
 	}
 
+	// Called under m_mutex. No shared scratch/guard mutation; misses refuse.
+	template <typename InputInfo>
+	ShaderProgram Probe(const ShaderParams& params, InputInfo& info, uint32_t& cursor) {
+		using namespace ShaderRecompiler::IR;
+		ProgramKey key;
+		key.stage = std::is_same_v<InputInfo, ShaderPixelInputInfo> ? ShaderType::Pixel : ShaderType::Vertex;
+		key.hash = params.hash;
+		key.user_data_count = static_cast<uint32_t>(params.user_data.size());
+		key.code_size = static_cast<uint32_t>(params.code.size());
+		BuildStageStaticKey(info, key.static_state);
+		const auto found = programs.find(key);
+		if (found == programs.end()) return {};
+		const auto& source = found->second;
+		if (source.plan_out || !source.warm_code.empty() || !source.warm_back_code.empty()) return {};
+		const auto read = +[](void*, uint64_t address, uint32_t* value) {
+			return DrawPrep::ReadMemory(address, value, sizeof(*value));
+		};
+		const SrtRuntime runtime {
+		    .user_data = params.user_data, .shader_base = params.Base(),
+		    .read_memory = read, .read_specialization_memory = read,
+		    .sync_memory = +[](void*, uint64_t address, uint64_t size) {
+			    if (size == 0) return true;
+			    if (size > DrawPrep::ReadSet::MaxBytes) {
+				    DrawPrep::FailActive(DrawPrep::ReadFailure::Overflow); return false;
+			    }
+			    thread_local std::vector<uint8_t> bytes;
+			    bytes.resize(size);
+			    return DrawPrep::ReadMemory(address, bytes.data(), size);
+		    },
+		    .try_read_memory_span = +[](void*, uint64_t address, uint32_t* values, uint32_t count, bool) {
+			    return DrawPrep::ReadMemory(address, values, uint64_t {count} * 4);
+		    },
+		    .mapping_end = +[](void*, uint64_t) -> uint64_t {
+			    // A mapping boundary is not covered by a byte-value certificate.
+			    DrawPrep::FailActive(DrawPrep::ReadFailure::Uncertified); return 0;
+		    },
+		};
+		ResourceSpecialization specialization;
+		if (!MaterializeResources(source.resource_plan, runtime, info.stage.resources, specialization) ||
+		    DrawPrep::SpeculativeFailed()) return {};
+		for (const auto& candidate : source.permutations) {
+			const auto& layout = candidate.program.bindings;
+			if (!candidate.table_mode && candidate.handle && candidate.specialization == specialization &&
+			    layout.push_data_start_dword == PushData::StartFor(cursor, layout.ShaderDataDwords())) {
+				info.stage.program = &candidate.program;
+				layout.AdvancePushData(cursor);
+				return candidate.handle;
+			}
+		}
+		return {};
+	}
+
 	template <typename InputInfo>
 	// `table_mode`: the permutation compiled in table mode (ShaderRecompiler::IR::EnterTableMode), empty
 	// when the program does not allow it.
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor, bool table_mode = false, uint32_t table_portable = 0) {
+		try {
+			return GetImpl(params, input_info, push_data_cursor, table_mode, table_portable);
+		} catch (const ShaderRecompiler::ShaderCompileRejected& failure) {
+			// Frank's gave-up behavior, restricted to Wolverine. No Vulkan call is
+			// inside RecoverShaderCompile; device errors cannot reach this handler.
+			rejected_programs[lookup_key] = SourceDigest(params.code, params.back_code);
+			input_info.stage.program = nullptr;
+			if (g_unevaluated != nullptr) *g_unevaluated = failure.message + "\n";
+			else g_materialization_failed = true;
+			std::fprintf(stderr, "[WOLVERINE][gave-up] %s hash=0x%016llx: %s\n",
+			             StageName(lookup_key.stage), static_cast<unsigned long long>(params.hash),
+			             failure.message.c_str());
+			std::fflush(stderr);
+			return {};
+		}
+	}
+
+	template <typename InputInfo>
+	ShaderProgram GetImpl(const ShaderParams& params, InputInfo& input_info,
+	                      uint32_t& push_data_cursor, bool table_mode, uint32_t table_portable) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.mesh.threads_num[0] != 0 ? ShaderType::Mesh : ShaderType::Vertex;
@@ -2111,6 +2198,17 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		if (const auto rejected = rejected_programs.find(lookup_key); rejected != rejected_programs.end()) {
+			if (rejected->second == SourceDigest(params.code, params.back_code)) {
+				input_info.stage.program = nullptr;
+				if (g_unevaluated != nullptr)
+					*g_unevaluated = fmt::format("shader rejected earlier in this session: stage={} hash=0x{:016x}\n",
+					                            static_cast<uint32_t>(stage), params.hash);
+				else g_materialization_failed = true;
+				return {};
+			}
+			rejected_programs.erase(rejected);
+		}
 		auto* entry = FindSourceMemo(lookup_key);
 		if (entry != nullptr && !entry->warm_code.empty()) {
 			if (!std::ranges::equal(params.code, entry->warm_code) ||
@@ -2379,7 +2477,9 @@ struct PipelineCache::ProgramCache {
 				            known_program ? "specialization" : "program");
 			}, SlowLog::HitchThreshold());
 			LiveCensus::WaitScope compiling(LiveCensus::WaitCompile);
-			auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+			auto translated = ShaderRecompiler::RecoverShaderCompile(WolverineShaderRecovery(), [&] {
+				return ShaderRecompiler::TranslateProgram(params.code, options);
+			});
 			front_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - front_begin).count();
 			translate_ms = front_ms;
 			if (entry == nullptr) {
@@ -2480,6 +2580,9 @@ struct PipelineCache::ProgramCache {
 		auto                      job = std::make_unique<WarmJob>();
 		LocalShaderWarmup::Reader reader {saved};
 		if (!LocalShaderWarmup::Visit(reader, job->record) || !LocalShaderWarmup::ValidKey(job->record)) return nullptr;
+		if (!ShaderRecompiler::GetCodegenOptions().bindless_images &&
+		    std::ranges::any_of(job->record.specialization.images, [](const auto& image) { return image.bindless; }))
+			return nullptr;
 		job->user_data.resize(job->record.user_data_count);
 		const auto options = LocalShaderWarmup::Options(job->record, job->user_data);
 		// (Not a module whose SPIR-V is validated or dumped: CreateModule does that of a translation.)
@@ -2492,13 +2595,20 @@ struct PipelineCache::ProgramCache {
 			                                     record.code.size());
 			if (TakeDiskTranslation(device, *cache, options, listed, *job)) return job;
 		}
-		auto translated    = ShaderRecompiler::TranslateProgram(job->record.code, options);
-		job->plan          = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		// Recorded before buffer words (or without them): the permutation the game now selects.
-		ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, job->record.specialization);
-		job->result        = ShaderRecompiler::CompileProgram(std::move(translated), options, job->record.specialization,
-		                                                      job->record.push_cursor);
-		job->info          = TakeOnWorker(job->result);
+		try {
+			ShaderRecompiler::RecoverShaderCompile(WolverineShaderRecovery(), [&] {
+				auto translated = ShaderRecompiler::TranslateProgram(job->record.code, options);
+				job->plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+				ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, job->record.specialization);
+				job->result = ShaderRecompiler::CompileProgram(std::move(translated), options, job->record.specialization,
+				                                               job->record.push_cursor);
+				job->info = TakeOnWorker(job->result);
+			});
+		} catch (const ShaderRecompiler::ShaderCompileRejected& failure) {
+			std::fprintf(stderr, "[WOLVERINE][gave-up] warmup hash=0x%016llx: %s\n",
+			             static_cast<unsigned long long>(options.shader_hash), failure.message.c_str());
+			return nullptr;
+		}
 		if (cache != nullptr) job->module = KeepWarmTranslation(*cache, options, listed.plan, *job);
 		if (PlanEvictionEnabled() && job->spilled.bytes == 0) (void)SpillPlanBytes(job->plan, job->spilled);
 		if (job->module == nullptr) job->module = CreateModule(device, options, job->result.spirv);
@@ -2837,6 +2947,8 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	// Session-local only: a new executable/port retries every previously rejected shader.
+	std::unordered_map<ProgramKey, uint64_t, ProgramKeyHash> rejected_programs;
 	// While a warmup runs beside the game (PipelineCache::RunWarmup): programs whose recorded code the game no longer
 	// has (Get) wait here, their modules alive, until it is done (it may be making their pipelines).
 	bool                                       warming = false;
@@ -4511,24 +4623,21 @@ bool PipelineCache::RematerializeStage(const ShaderRecompiler::IR::CompiledShade
 	return (borrowed != nullptr ? *borrowed : specialization) == permutation->specialization;
 }
 
-PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
+// Identical static inputs for ordered and speculative program lookup.
+static void PrepareGraphicsInputs(const GraphicContext& graphics,
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info, bool table_mode,
-    std::array<uint32_t, 2> table_portable) {
-	LiveCensus::Scope census(LiveCensus::GraphicsPrograms, 0);
-	m_program_cache->table_pending = false;
-	m_program_cache->table_waiting.reset();
-	// Reused per thread: every normal-path draw prepares both (their user data were new vectors).
-	thread_local ShaderParams vertex_params, pixel_params;
+    ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info,
+    ShaderParams& vertex_params, ShaderParams& pixel_params) {
 	PrepareProgramInto(vertex_regs, context, user_config, vertex_info, vertex_params);
+	if (DrawPrep::SpeculativeFailed()) return;
 	const bool mesh_active   = vertex_info.mesh.threads_num[0] != 0;
 	if (mesh_active) {
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
+		EXIT_NOT_IMPLEMENTED(!graphics.mesh_shader_enabled);
 		auto& mesh              = vertex_info.mesh;
-		mesh.host_subgroup_size = m_graphics.subgroup_size;
-		const auto& limits      = m_graphics.mesh_shader_properties;
+		mesh.host_subgroup_size = graphics.subgroup_size;
+		const auto& limits      = graphics.mesh_shader_properties;
 		const auto  logical_threads =
 		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
 		const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
@@ -4545,9 +4654,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	if (pixel_active) {
 		PrepareProgramInto(pixel_regs, sh, target_export_mapping, pixel_info, pixel_params);
 	}
+	if (DrawPrep::SpeculativeFailed()) return;
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
-		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
+		const auto& limits   = graphics.GetPhysicalDeviceProperties().limits;
 		auto&       clip     = vertex_info.clip_space;
 		clip.scale[0]        = viewport.xscale;
 		clip.scale[1]        = viewport.yscale;
@@ -4559,6 +4669,23 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
+}
+
+PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
+    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
+    ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info, bool table_mode,
+    std::array<uint32_t, 2> table_portable) {
+	LiveCensus::Scope census(LiveCensus::GraphicsPrograms, 0);
+	DrawPrep::FreshHashScope fresh_hash(DrawPrep::GetMode() != DrawPrep::Mode::Off);
+	m_program_cache->table_pending = false;
+	m_program_cache->table_waiting.reset();
+	// Reused per thread: every normal-path draw prepares both (their user data were new vectors).
+	thread_local ShaderParams vertex_params, pixel_params;
+	PrepareGraphicsInputs(m_graphics, vertex_regs, pixel_regs, sh, context, user_config,
+	                      target_export_mapping, pixel_active, vertex_info, pixel_info, vertex_params, pixel_params);
+	const bool mesh_active = vertex_info.mesh.threads_num[0] != 0;
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
@@ -4569,6 +4696,50 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor, table_mode, table_portable[0]);
 	return result;
+}
+
+bool PipelineCache::PrepareGraphicsProgramsSpeculative(
+    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
+    const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
+    ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info,
+    GraphicsPrograms& programs, uint64_t& publication,
+    DrawPrep::StageBindingPlan* vertex_bindings, DrawPrep::StageBindingPlan* pixel_bindings) {
+	if (!DrawPrep::Speculative()) return false;
+	thread_local ShaderParams vertex_params, pixel_params;
+	PrepareGraphicsInputs(m_graphics, vertex_regs, pixel_regs, sh, context, user_config,
+	                      target_export_mapping, pixel_active, vertex_info, pixel_info, vertex_params, pixel_params);
+	if (DrawPrep::SpeculativeFailed()) return false;
+	const auto lock_start = std::chrono::steady_clock::now();
+	Common::LockGuard lock(m_mutex);
+	LiveCounters::Add(LiveCounters::DrawPrepCacheWaitUs, static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - lock_start).count()));
+	publication = m_program_cache->programs_erased;
+	uint32_t cursor = 0;
+	programs = {};
+	if (pixel_active) {
+		pixel_info.lod_stats_subgroup = m_graphics.fragment_subgroup_reduction;
+		programs.pixel = m_program_cache->Probe(pixel_params, pixel_info, cursor);
+		if (!programs.pixel) return false;
+	}
+	programs.vertex = m_program_cache->Probe(vertex_params, vertex_info, cursor);
+	if (!programs.vertex || DrawPrep::SpeculativeFailed()) return false;
+	// Copy binding plans while publication is pinned by the cache mutex. The CP
+	// can erase a source after unlocking; workers must not dereference it later.
+	const auto build = [](const ShaderStageRuntime& stage, DrawPrep::StageBindingPlan* plan) {
+		if (!plan) return;
+		const auto& program = *stage.program;
+		(void)DrawPrep::BuildStageBindingPlan(program.bindings, program.user_data_base,
+		                                    program.info.buffers.size(), stage.resources, *plan);
+	};
+	build(vertex_info.stage, vertex_bindings);
+	if (pixel_active) build(pixel_info.stage, pixel_bindings);
+	return true;
+}
+
+bool PipelineCache::SpeculativePublicationCurrent(uint64_t publication) {
+	Common::LockGuard lock(m_mutex);
+	return m_program_cache->programs_erased == publication;
 }
 
 bool PipelineCache::TakeMaterializationFailure() {

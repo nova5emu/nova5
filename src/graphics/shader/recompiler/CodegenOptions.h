@@ -12,6 +12,11 @@ constexpr uint32_t RtNodeStatsGdsFromEnd = 3;
 constexpr uint32_t RtNodeStatsBins = 16;
 
 struct CodegenOptions {
+	// Enabled by the device only for Wolverine, after descriptor-indexing feature checks.
+	bool bindless_images = false;
+	// Title-gated by device initialization, before prefetch/compilation starts.
+	bool coherent_buffers = false;
+	bool wolverine_loop_guard = false;
 	// KYTY_PS_APPEND_LIVE_ELECTION=0 restores election from EXEC including helpers.
 	bool ps_append_live_election = true;
 	// KYTY_PS_LIVE_EXEC=0|1|all: start with the pixel valid mask for append/consume shaders or all PS.

@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/virtualMemory.h"
+#include "kernel/ammAddressSpace.h"
 
 #include <utility>
 #include <vector>
@@ -122,6 +123,9 @@ bool TryCompareExchangeBacking64(uint64_t vaddr, uint64_t expected, uint64_t val
 // Destination must be ordinary host storage: copying must not enter guest fault
 // handling. Used by uploads; guest destinations keep TryReadBacking's lock path.
 bool                   TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size);
+// Bounded nonblocking backing transaction only: refuses spanning mappings and
+// active writers. DrawPrep workers must never wait for a VM callback on the CP.
+bool                   TryProbeBackingToHost(uint64_t vaddr, void* data, uint64_t size);
 // The backing bytes of a guest range inside one mapping (readable regardless of the guest
 // range's protection), or null.
 const uint8_t*         TryGetBackingPointer(uint64_t vaddr, uint64_t size);

@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -247,6 +248,10 @@ static void PrefetchNextDraw(const uint32_t* packet, uint32_t remaining_dw) {
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
+		// Drain before removing the command: a draw's ordered fault/readback may
+		// reenter here, and must still see the same FIFO head.
+		if (g_current_processor != nullptr) g_current_processor->DrainDrawPrep();
+		if (m_pending_commands.load(std::memory_order_acquire) == 0) continue;
 		Common::UniqueFunction<void> command;
 		{
 			Common::LockGuard lock(m_queue_mutex);
@@ -373,6 +378,7 @@ CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 }
 
 void CommandProcessor::Reset() {
+	DrainDrawPrep();
 	m_draw_run_skip = 0;
 	m_sh_ctx.Reset();
 	m_ucfg.Reset();
@@ -416,18 +422,22 @@ void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operatio
 }
 
 void CommandProcessor::BufferInit() {
+	DrainDrawPrep();
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
 }
 
 void CommandProcessor::BufferFlush() {
+	DrainDrawPrep();
 	GetScheduler().Flush();
 }
 
 void CommandProcessor::BufferFlushDeferrable() {
+	DrainDrawPrep();
 	GetScheduler().DeferrableFlush();
 }
 
 void CommandProcessor::BufferFlushAndWait() {
+	DrainDrawPrep();
 	GetScheduler().FlushAndWait();
 }
 
@@ -1001,6 +1011,8 @@ static int32_t GsUserSgprAt(uint32_t location) {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
+	const bool draw_prep = !IsAsyncComputeQueue() && DrawPrep::GetMode() != DrawPrep::Mode::Off;
+	struct DrainAtExit { CommandProcessor& cp; ~DrainAtExit() { cp.DrainDrawPrep(); } } drain {*this};
 	while (execution.m_buffer_stack.size() > stop_depth) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
@@ -1025,6 +1037,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
+		if (draw_prep && !DrawPrep::WindowSafePacket(packet_header)) DrainDrawPrep();
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
 		if (packet_header == 0x80000000u) {
@@ -1157,7 +1170,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					    },
 					    log);
 				}
-			} else if (packet_header == 0xc0012d00u && !GraphicsRunDebugDumpEnabled()) {
+			} else if (packet_header == 0xc0012d00u && !GraphicsRunDebugDumpEnabled() && !draw_prep) {
 				// A draw of vertices as a table draw (the normal path stores the pair's state).
 				const auto consumed = TryNativeAutoDraw({packet, remaining_dw});
 				if (consumed) {
@@ -1167,7 +1180,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					continue;
 				}
 			} else if ((packet_header == 0xc0042700u || packet_header == 0xc0033500u) &&
-			           !GraphicsRunDebugDumpEnabled()) {
+			           !GraphicsRunDebugDumpEnabled() && !draw_prep) {
 				// Direct indexed draws from the same records (the normal path stores them).
 				const auto consumed = TryNativeDirectDraw({packet, remaining_dw});
 				if (consumed) {
@@ -1216,7 +1229,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		m_draw_prep_submitted = false;
+		m_draw_prep_packet = draw_prep && (opcode == Pm4::IT_DRAW_INDEX_2 ||
+		    opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		if (m_draw_prep_packet) m_renderer.GetRenderExecutor().NativeXprForgetState();
+#endif
 		const uint32_t packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		m_draw_prep_packet = false;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			if (execution.m_buffer_stack.size() > buffer_index + 1) {
@@ -1227,9 +1247,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		EXIT_IF(execution.m_buffer_stack.size() != buffer_index + 1);
 		execution.m_buffer_stack[buffer_index].offset_dw += packet_dw;
 		execution.m_made_progress = true;
-		if (opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO ||
+		if (!m_draw_prep_submitted && (opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO ||
 		    opcode == Pm4::IT_DRAW_INDIRECT || opcode == Pm4::IT_DRAW_INDEX_INDIRECT ||
-		    opcode == Pm4::IT_DRAW_INDIRECT_MULTI || opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI)
+		    opcode == Pm4::IT_DRAW_INDIRECT_MULTI || opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI))
 			GetScheduler().CompleteDraws(1);
 	}
 }
@@ -1266,6 +1286,7 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 
 uint32_t CommandProcessor::NumInstances() {
 	if (m_pending_instances_address != 0) {
+		DrainDrawPrep();
 		const auto address = std::exchange(m_pending_instances_address, 0);
 		NativeIndirect::Count(NativeIndirect::Outcome::InstanceRead, address);
 		(void)LibKernel::Memory::SyncGpuCleanBacking(address, sizeof(uint32_t));
@@ -1308,7 +1329,30 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
+// HUD transforms may read or patch guest constants. They retain the immediate
+// path until those CPU effects are represented explicitly in the window.
+static bool DrawPrepHudSensitive() {
+	return ::Loader::DemonsSoulsRenderSize::WideAspect() > 0.0 || HudAnchor::OutputScale() > 0.0f ||
+	       FrameGen::FsrMarksHud() || HudAnchor::g_state.patched;
+}
+
+void CommandProcessor::DrainDrawPrep() {
+	if (m_draw_prep) m_draw_prep->Drain();
+}
+
+bool CommandProcessor::SubmitDrawPrep(const DrawIndexArgs* index, const DrawAutoArgs* automatic) {
+	if (!m_draw_prep_packet || DrawPrepHudSensitive() || XprCapture::Enabled() || GraphicsRunDebugDumpEnabled() ||
+	    (index ? index->gpu_args != 0 : automatic->gpu_args != 0)) {
+		DrainDrawPrep();
+		return false;
+	}
+	if (!m_draw_prep) m_draw_prep = std::make_shared<DrawPrep::Engine>(m_renderer);
+	m_draw_prep_submitted = m_draw_prep->Submit(m_submit_id, index, automatic, m_ctx, m_ucfg, m_sh_ctx);
+	return m_draw_prep_submitted;
+}
+
 bool CommandProcessor::DrawIndex(DrawIndexArgs args) {
+	if (m_draw_prep && DrawPrepHudSensitive()) DrainDrawPrep();
 	CheckBuffer();
 	if (args.index_count != 0) m_renderer.GetResolutionTrace().Observe(m_ctx, std::max(args.gpu_args_count, 1u));
 
@@ -1323,6 +1367,7 @@ bool CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	// KYTY_OUTPUT_HEIGHT: the interface's HD layout scaled to the output (hud-anchor.h).
 	std::optional<HudAnchor::ScaleScope> scaled;
 	if (HudAnchor::Scaled(m_ctx, m_sh_ctx.GetVs(), m_sh_ctx.GetPs())) scaled.emplace(m_ctx, m_sh_ctx.GetPs());
+	if (m_draw_prep_packet && SubmitDrawPrep(&args, nullptr)) return true;
 	return m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 }
 
@@ -1907,6 +1952,7 @@ void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode
 }
 
 bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	if (m_draw_prep && DrawPrepHudSensitive()) DrainDrawPrep();
 	CheckBuffer();
 	if (args.vertex_count != 0) m_renderer.GetResolutionTrace().Observe(m_ctx, std::max(args.gpu_args_count, 1u));
 
@@ -1931,6 +1977,7 @@ bool CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 			if (HudAnchor::Stretched(m_ctx)) widen.emplace(m_ctx, m_sh_ctx.GetPs());
 			else if (HudAnchor::Scaled(m_ctx, m_sh_ctx.GetVs(), m_sh_ctx.GetPs())) scaled.emplace(m_ctx, m_sh_ctx.GetPs());
 		}
+		if (m_draw_prep_packet && SubmitDrawPrep(nullptr, &args)) return true;
 		return m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 	}
 	HudAnchor::RestoreMask(m_sh_ctx.GetPs());

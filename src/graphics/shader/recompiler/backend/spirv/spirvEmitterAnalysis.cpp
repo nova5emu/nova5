@@ -165,9 +165,28 @@ uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {
 	}
 }
 
+uint32_t BindlessImageBinding(const IR::ImageResource& image) {
+	return image.cube ? IR::BindlessImagesCube
+	       : image.dimension == ImageDimension::Dim3D ? IR::BindlessImages3D
+	       : image.dimension == ImageDimension::Dim2DArray ? IR::BindlessImages2DArray
+	       : IR::BindlessImages2D;
+}
+
 uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource) {
 	const auto& image_resource = state.program.info.images.at(resource);
 	EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
+	if (image_resource.bindless) {
+		const auto type = ImageType(state, image_resource);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction({OpAccessChain, TypePointer(state, StorageClassUniformConstant, type),
+		                           pointer, state.bindless_image_variables.at(BindlessImageBinding(image_resource)),
+		                           state.bindless_slot});
+		state.builder.AddAnnotation({OpDecorate, pointer, DecorationNonUniform});
+		const auto image = state.builder.AllocateId();
+		state.builder.AddFunction({OpLoad, type, image, pointer});
+		state.builder.AddAnnotation({OpDecorate, image, DecorationNonUniform});
+		return image;
+	}
 	const auto kind = IR::DescriptorBindingForImage(image_resource);
 	EXIT_IF(!kind.has_value());
 	const auto array_index  = ResourceForDescriptor(state, *kind, resource);
@@ -204,6 +223,8 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 	const auto  sampled_type  =
 	    state.builder.Type(OpTypeSampledImage, {ImageType(state, image_resource)});
 	state.builder.AddFunction({OpSampledImage, sampled_type, sampled_image, image, sampler_id});
+	if (image_resource.bindless)
+		state.builder.AddAnnotation({OpDecorate, sampled_image, DecorationNonUniform});
 	return sampled_image;
 }
 

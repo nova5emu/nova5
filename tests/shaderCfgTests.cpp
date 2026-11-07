@@ -14,6 +14,9 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/ShaderCompileRecovery.h"
+#include "graphics/host_gpu/renderer/wolverine.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
@@ -22,6 +25,7 @@
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -67,6 +71,63 @@ void Check(bool value, const char *text) {
     std::fprintf(stderr, "ShaderCfgTests: failed: %s\n", text);
     std::abort();
   }
+}
+
+// A compiler assertion exits with 321 and Check aborts. Run each case in a fresh
+// process so --keep-going reports both kinds of failure and cannot inherit a
+// failed case's compiler globals. The normal suite still runs in one process.
+int RunIsolatedTest(const char *executable, const char *name) {
+  std::fflush(nullptr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  (void)executable;
+  wchar_t path[32768];
+  const auto length = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
+  if (length == 0 || length >= std::size(path)) {
+    std::fprintf(stderr, "ShaderCfgTests: executable path failed: %lu\n", GetLastError());
+    return 1;
+  }
+  std::wstring command = L"\"" + std::wstring(path, length) + L"\" --case ";
+  for (const char *p = name; *p; ++p) command += static_cast<wchar_t>(*p);
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(path, command.data(), nullptr, nullptr, TRUE, 0, nullptr,
+                      nullptr, &startup, &process)) {
+    std::fprintf(stderr, "ShaderCfgTests: CreateProcess failed: %lu\n", GetLastError());
+    return 1;
+  }
+  CloseHandle(process.hThread);
+  DWORD code = 1;
+  const auto waited = WaitForSingleObject(process.hProcess, INFINITE);
+  if (waited != WAIT_OBJECT_0 || !GetExitCodeProcess(process.hProcess, &code)) {
+    std::fprintf(stderr, "ShaderCfgTests: collecting child failed: %lu\n", GetLastError());
+    code = 1;
+  }
+  CloseHandle(process.hProcess);
+  return static_cast<int>(code);
+#else
+  const pid_t pid = ::fork();
+  if (pid < 0) {
+    std::perror("ShaderCfgTests: fork");
+    return 1;
+  }
+  if (pid == 0) {
+    ::execlp(executable, executable, "--case", name, static_cast<char *>(nullptr));
+    std::perror("ShaderCfgTests: exec");
+    ::_exit(127);
+  }
+  int status = 0;
+  pid_t waited;
+  do {
+    waited = ::waitpid(pid, &status, 0);
+  } while (waited < 0 && errno == EINTR);
+  if (waited != pid) {
+    std::perror("ShaderCfgTests: waitpid");
+    return 1;
+  }
+  return WIFEXITED(status) ? WEXITSTATUS(status) :
+         WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
+#endif
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -9151,8 +9212,12 @@ void TestComputeDispatchWaveSize() {
         "dispatch with CS_W32_EN did not select wave32");
 }
 
+#include "ShaderLoopGuardInterpreter.inc"
+#include "WolverineGpuStabilityTests.inc"
+
 void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const uint32_t shader[] = {
+      EncodeVopc(0xd4, 128 + 24, 0), // v_cmpx_gt_u32 24, v0: EXEC = local_id.x < 24
       EncodeMubuf0(0x0c),
       EncodeMubuf1(0, 0, 1), // buffer_load_dword
                              // v0
@@ -9161,8 +9226,10 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
       EncodeSopp(0x01),
   };
 
-  // A partial wave64 on a 32-wide host starts with a lane-dependent EXEC, so the guard is a
-  // branch (a guard on a constant EXEC is emitted as straight-line code).
+  // Since 9907780e a lane-local wave64 runs one guest lane per invocation.
+  // A partial workgroup alone no longer gives it a dynamic initial EXEC.
+  // Set EXEC explicitly from the local ID so this tests the guard with either
+  // lane-local translation or the two-lane wave64 fallback.
   auto compute = RegressionComputeInputInfo();
   compute.threads_num[0]     = 48;
   compute.host_subgroup_size = 32;
@@ -9170,7 +9237,29 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   options.input_info.compute = &compute;
   options.dump_ir = true;
 
+  const auto load_guard = [](const ShaderRecompiler::IR::Program &program) {
+    for (const auto *block : program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::LoadBufferU32)
+          return inst.Arg(inst.NumArgs() - 1).Resolve();
+      }
+    }
+    Check(false, "buffer load guard fixture lost its load");
+    return ShaderRecompiler::IR::Value{};
+  };
+  // Retain the original fixture too: with lane-local enabled its guard really
+  // is constant true, explaining why demanding an EXEC branch was obsolete.
+  auto original = RecompileForTest(std::span<const uint32_t>(shader).subspan(1), options);
+  CheckSpirvBinaryValidates(original.spirv);
+  if (original.program.lane_local) {
+    Check(load_guard(original.program) == ShaderRecompiler::IR::Value(true),
+          "lane-local full EXEC buffer load did not have a constant true guard");
+  }
+
+  compute.thread_ids_num = 1;
   auto result = RecompileForTest(shader, options);
+  Check(!load_guard(result.program).IsImmediate(),
+        "buffer load guard fixture did not produce dynamic EXEC");
   Check(Common::ContainsStr(result.decoded_dump, "BUFFER_LOAD_DWORD"),
         "buffer load guard regression did not decode MUBUF load");
   CheckSpirvBinaryValidates(result.spirv);
@@ -9884,6 +9973,121 @@ void TestNggPreparation() {
   }
 }
 
+void TestMeshFastLaunch() {
+  using namespace ShaderRecompiler;
+  using namespace ShaderRecompiler::IR;
+  // Frank 11001c97 / 8e9e5c6d: Wolverine title meshlet, GS=0 ES=1,
+  // 32 output vertices but 64 output primitives, with a separate start-instance SGPR.
+  const uint32_t code[] = {
+      EncodeSMovB32(124, 255), 0x1003u, EncodeSopp(0x10, 9),
+      EncodeVop1(0x01, 0, 128),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(5, 6, 5, 6),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
+  };
+  HW::VertexShaderInfo regs{};
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(code);
+  regs.gs_regs.rsrc2.user_sgpr = 4;
+  regs.start_instance_user_sgpr = 2;
+  regs.gs_regs.rsrc2.lds_size = 8;
+  regs.gs_regs.rsrc1.gs_vgpr_component_count = 0;
+  regs.gs_regs.rsrc2.es_vgpr_component_count = 1;
+  ShaderMappedData mapped{};
+  mapped.type = Prospero::ShaderBinaryType::kGs;
+  mapped.code_size_bytes = sizeof(code);
+  ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  HW::Context context;
+  context.SetMaxOutputPerSubgroup(32);
+  context.SetGsMaxVertOut(32);
+  context.SetGsOutPrimType(2);
+  HW::UserConfig user_config;
+  user_config.SetGeControl({1, 1});
+  user_config.SetPrimitiveType(Prospero::PrimitiveType::kPointList);
+  for (const uint32_t wave : {32u, 64u}) {
+    for (const uint32_t explicit_threads : {0u, 96u}) {
+      context.SetShaderStages(0x20u | (1u << 19u) | (wave == 32u ? 0x00400000u : 0u));
+      context.SetNggSubgrpCntl(64u | (explicit_threads << 9u));
+      ShaderVertexInputInfo input{};
+      auto params = PrepareProgram(regs, context, user_config, input);
+      auto &mesh = input.mesh;
+      const uint32_t threads = explicit_threads == 0 ? 64 : wave == 32 ? 96 : 128;
+      Check(mesh.fast_launch && mesh.primitives_per_group == 1 && mesh.vertices_per_group == 1 &&
+                mesh.max_vertices == 32 && mesh.max_primitives == 64 && mesh.threads_num[0] == threads &&
+                input.start_instance_sgpr == 10 && params.user_data.size() == 12,
+            "fast launch lost its ABI, primitive amplification, explicit threads or user SGPR prefix");
+      std::vector<uint32_t> fast_key, ordinary_key;
+      BuildStageStaticKey(input, fast_key);
+      mesh.fast_launch = false;
+      BuildStageStaticKey(input, ordinary_key);
+      mesh.fast_launch = true;
+      Check(fast_key != ordinary_key, "mesh launch ABIs collided in the shader cache");
+      for (const bool fast : {false, true}) {
+        LocalShaderWarmup::Record saved;
+        saved.stage = ShaderType::Mesh;
+        saved.code.assign(std::begin(code), std::end(code));
+        saved.vertex = input;
+        saved.vertex.mesh.fast_launch = fast;
+        BuildStageStaticKey(saved.vertex, saved.static_key);
+        LocalShaderWarmup::Writer writer;
+        Check(LocalShaderWarmup::Visit(writer, saved), "serialize mesh launch ABI");
+        LocalShaderWarmup::Record restored;
+        LocalShaderWarmup::Reader reader{writer.words};
+        Check(LocalShaderWarmup::Visit(reader, restored) && reader.cursor == writer.words.size() &&
+                  LocalShaderWarmup::ValidKey(restored) && restored.vertex.mesh.fast_launch == fast &&
+                  restored.vertex.mesh.provoking_vertex == input.mesh.provoking_vertex,
+              "mesh fast launch was lost or changed the warmup record layout");
+      }
+      for (const uint32_t lane : {0u, wave - 1u, threads - 1u}) {
+        Decoder::Program decoded;
+        CFG::Graph graph;
+        CFG::BasicBlock block;
+        block.id = 0;
+        block.terminator.kind = CFG::TerminatorKind::Return;
+        graph.blocks.push_back(std::move(block));
+        graph.entry_block = 0;
+        Frontend::TranslateOptions options{};
+        options.stage = ShaderType::Mesh;
+        options.wave_size = wave;
+        options.user_data_count = 0;
+        options.vertex = &input;
+        auto program = Frontend::TranslateProgram(decoded, graph, options);
+        // Nonzero base/instance deliberately distinguish broadcast IDs from ordinary vertex assembly.
+        const uint32_t draw[] = {12, 100, 7, 0, 0, 0};
+        for (auto &inst : *program.blocks.front()) {
+          if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
+            inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
+          } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
+            const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
+            inst.ReplaceUsesWith(Value(kind == StageInputKind::LocalInvocationIndex
+                                           ? lane : inst.Arg(1).U32() == 0 ? 4u : 2u));
+          }
+        }
+        ConstantPropagationPass(program.blocks);
+        std::array<uint32_t, 9> vgprs{};
+        std::array<uint32_t, 11> sgprs{};
+        for (const auto &inst : *program.blocks.front()) {
+          if (inst.GetOpcode() == ValueOpcode::SetVectorRegister)
+            vgprs[RegIndex(inst.Arg(0).VectorRegister())] = inst.Arg(1).Resolve().U32();
+          else if (inst.GetOpcode() == ValueOpcode::SetScalarRegister)
+            sgprs[RegIndex(inst.Arg(0).ScalarRegister())] = inst.Arg(1).Resolve().U32();
+        }
+        const uint32_t wave_info = (threads / wave << 28u) | (lane / wave << 24u) |
+                                  (lane / wave == 0 ? 0x101u : 0u);
+        Check(program.memory_info.empty() && vgprs[5] == 104 && vgprs[6] == 2 &&
+                  sgprs[10] == 7 && sgprs[3] == wave_info,
+              "fast launch indexed vertices, added start-instance twice or used per-lane meshlet IDs");
+      }
+      mesh.host_subgroup_size = 32;
+      CompileOptions options{};
+      options.stage = ShaderType::Mesh;
+      options.wave_size = wave;
+      options.input_info.vertex = &input;
+      options.user_data = params.user_data;
+      const auto compiled = RecompileForTest(code, options);
+      CheckSpirvBinaryValidates(compiled.spirv);
+    }
+  }
+}
+
 void TestMeshInputAssembly() {
   using namespace ShaderRecompiler;
   using namespace ShaderRecompiler::IR;
@@ -10514,13 +10718,13 @@ void TestTypedEntryStateIsMinimal() {
   using namespace ShaderRecompiler;
 
   const auto check = [](uint32_t wave_size) {
+    // Since 9907780e, wave64 lane-local analysis builds the guest CFG from
+    // decoded instructions. Use a real no-op shader, not an empty program
+    // paired with a fabricated return block. S_ENDPGM adds no register state.
+    const uint32_t shader[] = {EncodeSopp(0x01)};
     Decoder::Program decoded;
-    CFG::Graph graph;
-    CFG::BasicBlock source_block;
-    source_block.id = 0;
-    source_block.terminator.kind = CFG::TerminatorKind::Return;
-    graph.blocks.push_back(std::move(source_block));
-    graph.entry_block = 0;
+    Decoder::DecodeProgram(shader, decoded);
+    const auto graph = CFG::BuildGraph(decoded);
     IR::Program values;
     ShaderComputeInputInfo compute{};
     Frontend::TranslateOptions translate_options{};
@@ -13371,11 +13575,17 @@ int main(int argc, char** argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--ngg-assembly") == 0) {
     TestNggPreparation();
+    TestMeshFastLaunch();
     TestMeshInputAssembly();
     TestMergedShaderUserDataSnapshot();
     TestFusedShaderHandoffPreservesRegisters();
     TestMeshExportStorage();
     std::puts("ShaderCfgTests: NGG preparation, input assembly, fused handoff and SPIR-V exports passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wolverine-fast-launch-only") == 0) {
+    TestMeshFastLaunch();
+    std::puts("ShaderCfgTests: mesh fast launch preparation, ABI, cache and SPIR-V passed");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--shared-continuation") == 0) {
@@ -13399,144 +13609,191 @@ int main(int argc, char** argv) {
     std::puts("ShaderCfgTests: unified barriers/debug branches passed (decode/CFG/IR/SPIR-V)");
     return 0;
   }
-  TestShaderStageBarriers();
-  TestDisabledDebugBranches();
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-exec-only") == 0) {
+    TestNewShaderRecompilerBufferLoadsGuardedByExec();
+    std::puts("ShaderCfgTests: buffer load EXEC and bounds guards passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wolverine-gpu-stability-only") == 0) {
+    TestWolverineCoherentBuffers();
+    TestWolverineRtLoopGuard();
+    std::puts("ShaderCfgTests: Wolverine coherent buffers and RT loop guard passed (host only)");
+    return 0;
+  }
+  const bool keep_going = argc == 2 && std::strcmp(argv[1], "--keep-going") == 0;
+  const bool single = argc == 3 && std::strcmp(argv[1], "--case") == 0;
+  if (argc != 1 && !keep_going && !single) {
+    std::fprintf(stderr, "ShaderCfgTests: unknown arguments (use --keep-going or --case TestName)\n");
+    return 2;
+  }
+  struct TestCase {
+    const char *name;
+    void (*run)();
+  };
+#define CASE(test) {#test, test},
+  const TestCase cases[] = {
+    CASE(TestShaderStageBarriers)
+    CASE(TestDisabledDebugBranches)
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
-  TestShaderWarmupCacheFiles();
+    CASE(TestShaderWarmupCacheFiles)
 #endif
-  TestResourceDescriptorClassification();
-  TestNativeShaderResourceDependencies();
-  TestNormalizedImageContracts();
-  TestSpirvRequirementsAnalysis();
-  TestNewShaderRecompilerSpirvSizeBaselines();
-  TestDemandDrivenSpirvDeclarations();
-  TestNewShaderRecompilerSMovB32();
-  TestNewShaderRecompilerClipDisabledPosition();
-  TestNewShaderRecompilerAuxPositionExports();
-  TestNewShaderRecompilerNativeWideScalarMemoryIr();
-  TestNewShaderRecompilerNativeWideBufferIr();
-  TestNewShaderRecompilerScalarB64LaneTranslation();
-  TestNewShaderRecompilerMubufFormatTranslation();
-  TestNewShaderRecompilerTypedBufferTranslation();
-  TestNewShaderRecompilerDsReadWrite2Translation();
-  TestNewShaderRecompilerDsWideAndAtomicTranslation();
-  TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
-  TestNewShaderRecompilerScalarMemoryBindingDomains();
+    CASE(TestResourceDescriptorClassification)
+    CASE(TestNativeShaderResourceDependencies)
+    CASE(TestNormalizedImageContracts)
+    CASE(TestSpirvRequirementsAnalysis)
+    CASE(TestNewShaderRecompilerSpirvSizeBaselines)
+    CASE(TestDemandDrivenSpirvDeclarations)
+    CASE(TestNewShaderRecompilerSMovB32)
+    CASE(TestNewShaderRecompilerClipDisabledPosition)
+    CASE(TestNewShaderRecompilerAuxPositionExports)
+    CASE(TestNewShaderRecompilerNativeWideScalarMemoryIr)
+    CASE(TestNewShaderRecompilerNativeWideBufferIr)
+    CASE(TestNewShaderRecompilerScalarB64LaneTranslation)
+    CASE(TestNewShaderRecompilerMubufFormatTranslation)
+    CASE(TestNewShaderRecompilerTypedBufferTranslation)
+    CASE(TestNewShaderRecompilerDsReadWrite2Translation)
+    CASE(TestNewShaderRecompilerDsWideAndAtomicTranslation)
+    CASE(TestNewShaderRecompilerCapturedVop1SdwaByteConvert)
+    CASE(TestNewShaderRecompilerScalarMemoryBindingDomains)
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
-  TestNewShaderDecoderArchitecture();
-  TestImageAddressOperands();
-  TestSopkCompareImmediateExtension();
-  TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
-  TestNewShaderRecompilerIrLookupMissFailsExplicitly();
-  TestNewShaderRecompilerRejectsDppOn64BitCompares();
-  TestPsInputCountRegisterDecode();
-  TestPixelAncillaryLayerInput();
-  TestNewShaderRecompilerUnbasedFlatUsesBda();
-  TestNewShaderRecompilerFlatUserPointerUsesDma();
-  TestNewShaderRecompilerFlatAddressDomainsUseDma();
-  TestNewShaderRecompilerCfgStraightLine();
-  TestNewShaderRecompilerCfgIfElse();
-  TestNewShaderRecompilerCfgConsecutiveNativePhis();
-  TestNewShaderRecompilerStructuredU64Phi();
-  TestNewShaderRecompilerCfgTerminalExitMergePS();
-  TestNewShaderRecompilerCfgPostEndTargetMergePS();
-  TestNewShaderRecompilerCfgLoopBreakContinue();
+    CASE(TestNewShaderDecoderArchitecture)
+    CASE(TestImageAddressOperands)
+    CASE(TestSopkCompareImmediateExtension)
+    CASE(TestNewShaderRecompilerCapturedVopcSdwaCmpxClass)
+    CASE(TestNewShaderRecompilerIrLookupMissFailsExplicitly)
+    CASE(TestNewShaderRecompilerRejectsDppOn64BitCompares)
+    CASE(TestPsInputCountRegisterDecode)
+    CASE(TestPixelAncillaryLayerInput)
+    CASE(TestNewShaderRecompilerUnbasedFlatUsesBda)
+    CASE(TestNewShaderRecompilerFlatUserPointerUsesDma)
+    CASE(TestNewShaderRecompilerFlatAddressDomainsUseDma)
+    CASE(TestNewShaderRecompilerCfgStraightLine)
+    CASE(TestNewShaderRecompilerCfgIfElse)
+    CASE(TestNewShaderRecompilerCfgConsecutiveNativePhis)
+    CASE(TestNewShaderRecompilerStructuredU64Phi)
+    CASE(TestNewShaderRecompilerCfgTerminalExitMergePS)
+    CASE(TestNewShaderRecompilerCfgPostEndTargetMergePS)
+    CASE(TestNewShaderRecompilerCfgLoopBreakContinue)
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();
-  TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
+    CASE(TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured)
+    CASE(TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher)
 #endif
-  TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
-  TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
-  TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
-  TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
-  TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection();
-  TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher();
-  TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection();
-  TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit();
-  TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher();
-  TestNewShaderRecompilerCfgConditionalLatchNoSelection();
-  TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection();
-  TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection();
-  TestNewShaderRecompilerCfgLoopGatewaySelection();
-  TestNewShaderRecompilerCfgConditionalLoopHeaderSelection();
-  TestNewShaderRecompilerCfgMultipleLoopLatches();
-  TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
-  TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
-  TestNewShaderRecompilerCfgExecSccSharedArm();
-  TestSharedReturnPreservesDescriptorDominance();
-  TestNewShaderRecompilerCfgNestedTailEarlyExit();
-  TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections();
-  TestNewShaderRecompilerCfgAlternatingSharedReturns();
-  TestNewShaderRecompilerCfgLoopSharedRegion();
-  TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop();
-  TestNewShaderRecompilerCfgOverlappingEarlyExitLadder();
-  TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal();
-  TestNewShaderRecompilerCfgSharedTerminalEarlyExit();
-  TestCfgEarlyReturnSharedContinuation();
-  TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry();
-  TestNewShaderRecompilerCfgIrreducibleDispatcher();
-  TestNewShaderRecompilerDispatcherSpillsU32x3();
-  TestNewShaderRecompilerU64PairTranslation();
-  TestComputeDispatchWaveSize();
-  TestNewShaderRecompilerBufferLoadsGuardedByExec();
-  TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
-  TestCapturedBufferAtomicsX2();
-  TestNewShaderRecompilerPixelImageSampleLodSelection();
-  TestNewShaderRecompilerBranchConditionForms();
-  TestNewShaderRecompilerSetpcBranch();
-  TestFusedShaderHandoffPreservesRegisters();
-  TestMeshExportStorage();
-  TestMergedShaderUserDataSnapshot();
-  TestMeshInputAssembly();
-  TestNggPreparation();
+    CASE(TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured)
+    CASE(TestNewShaderRecompilerCfgLoopHeaderDsReadStructured)
+    CASE(TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured)
+    CASE(TestNewShaderRecompilerCfgSharedOuterAndLoopMerge)
+    CASE(TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection)
+    CASE(TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher)
+    CASE(TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection)
+    CASE(TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit)
+    CASE(TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher)
+    CASE(TestNewShaderRecompilerCfgConditionalLatchNoSelection)
+    CASE(TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection)
+    CASE(TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection)
+    CASE(TestNewShaderRecompilerCfgLoopGatewaySelection)
+    CASE(TestNewShaderRecompilerCfgConditionalLoopHeaderSelection)
+    CASE(TestNewShaderRecompilerCfgMultipleLoopLatches)
+    CASE(TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit)
+    CASE(TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders)
+    CASE(TestNewShaderRecompilerCfgExecSccSharedArm)
+    CASE(TestSharedReturnPreservesDescriptorDominance)
+    CASE(TestNewShaderRecompilerCfgNestedTailEarlyExit)
+    CASE(TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections)
+    CASE(TestNewShaderRecompilerCfgAlternatingSharedReturns)
+    CASE(TestNewShaderRecompilerCfgLoopSharedRegion)
+    CASE(TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop)
+    CASE(TestNewShaderRecompilerCfgOverlappingEarlyExitLadder)
+    CASE(TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal)
+    CASE(TestNewShaderRecompilerCfgSharedTerminalEarlyExit)
+    CASE(TestCfgEarlyReturnSharedContinuation)
+    CASE(TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry)
+    CASE(TestNewShaderRecompilerCfgIrreducibleDispatcher)
+    CASE(TestNewShaderRecompilerDispatcherSpillsU32x3)
+    CASE(TestNewShaderRecompilerU64PairTranslation)
+    CASE(TestComputeDispatchWaveSize)
+    CASE(TestNewShaderRecompilerBufferLoadsGuardedByExec)
+    CASE(TestWolverineCoherentBuffers)
+    CASE(TestWolverineRtLoopGuard)
+    CASE(TestNewShaderRecompilerBufferAtomicsGuardedByBounds)
+    CASE(TestCapturedBufferAtomicsX2)
+    CASE(TestNewShaderRecompilerPixelImageSampleLodSelection)
+    CASE(TestNewShaderRecompilerBranchConditionForms)
+    CASE(TestNewShaderRecompilerSetpcBranch)
+    CASE(TestFusedShaderHandoffPreservesRegisters)
+    CASE(TestMeshExportStorage)
+    CASE(TestMergedShaderUserDataSnapshot)
+    CASE(TestMeshInputAssembly)
+    CASE(TestNggPreparation)
+    CASE(TestMeshFastLaunch)
 #ifdef KYTY_LOCAL_NATIVE_RESOURCES
-  TestPreparationVertexInputReuse();
+    CASE(TestPreparationVertexInputReuse)
 #endif
-  TestEmbeddedVertexFormatSwizzle();
-  TestNewShaderRecompilerSetpcJumpTable();
-  TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
-  TestNewShaderRecompilerSetpcDwordJumpTable();
-  TestTypedEntryStateIsMinimal();
+    CASE(TestEmbeddedVertexFormatSwizzle)
+    CASE(TestNewShaderRecompilerSetpcJumpTable)
+    CASE(TestNewShaderRecompilerPrunesUnreachableSetpcMetadata)
+    CASE(TestNewShaderRecompilerSetpcDwordJumpTable)
+    CASE(TestTypedEntryStateIsMinimal)
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  TestFinalSsaRejectsRegisterStatePseudos();
+    CASE(TestFinalSsaRejectsRegisterStatePseudos)
 #endif
-  TestValuePhiValidation();
-  TestU64ShiftConstantPropagation();
+    CASE(TestValuePhiValidation)
+    CASE(TestU64ShiftConstantPropagation)
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  TestNativeWideValueValidation();
+    CASE(TestNativeWideValueValidation)
 #endif
-  TestNewShaderRecompilerZeroInitialRegisterState();
-  TestNewShaderRecompilerVertexSystemInputsWithoutMirrors();
-  TestNewShaderRecompilerVertexStartInstanceSgpr();
-  TestNewShaderRecompilerVertexExportUsesInvocationExecMask();
-  TestNewShaderRecompilerPerInvocationMasksWithoutMirrors();
-  TestNewShaderRecompilerPerInvocationU64Complement();
-  TestNewShaderRecompilerExpPixelOutputs();
-  TestRenderTargetReverseExportMapping();
-  TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
-  TestTypedDescriptorRealWideMoveTranslation();
-  TestComputeImageFill();
-  TestTypedDescriptorRealCarryAndScalarLoads();
-  TestSrtWalkerRealSmemTranslation();
-  TestSrtWalkerVccBaseTranslation();
-  TestSrtWalkerRealSBufferTranslation();
-  TestScalarMemorySourcesCapturedBeforeWrites();
-  TestScalarMemoryLoadCrossesIntoVcc();
-  TestScalarMemoryUnusedTailDce();
-  TestResourceTrackingRealDensePatching();
-  TestDirectTranslationResetsAnalysisState();
-  TestNewShaderRecompilerNativeBindingPlan();
-  TestNewShaderRecompilerStageInputInfo();
-  TestCustomVintrpMovTranslation();
-  TestNewShaderRecompilerSharedParameterPerVertexInput();
-  TestGraphicsCreateInterpolantMapping();
-  TestNewShaderRecompilerPixelPipelineEntry();
-  TestComputeLdsAllocationIdentity();
-  TestPixelProgramCacheBindingIdentity();
-  TestGraphicsPushConstantPlacement();
-  TestNewShaderRecompilerUnsupportedMemoryDecode();
+    CASE(TestNewShaderRecompilerZeroInitialRegisterState)
+    CASE(TestNewShaderRecompilerVertexSystemInputsWithoutMirrors)
+    CASE(TestNewShaderRecompilerVertexStartInstanceSgpr)
+    CASE(TestNewShaderRecompilerVertexExportUsesInvocationExecMask)
+    CASE(TestNewShaderRecompilerPerInvocationMasksWithoutMirrors)
+    CASE(TestNewShaderRecompilerPerInvocationU64Complement)
+    CASE(TestNewShaderRecompilerExpPixelOutputs)
+    CASE(TestRenderTargetReverseExportMapping)
+    CASE(TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled)
+    CASE(TestTypedDescriptorRealWideMoveTranslation)
+    CASE(TestComputeImageFill)
+    CASE(TestTypedDescriptorRealCarryAndScalarLoads)
+    CASE(TestSrtWalkerRealSmemTranslation)
+    CASE(TestSrtWalkerVccBaseTranslation)
+    CASE(TestSrtWalkerRealSBufferTranslation)
+    CASE(TestScalarMemorySourcesCapturedBeforeWrites)
+    CASE(TestScalarMemoryLoadCrossesIntoVcc)
+    CASE(TestScalarMemoryUnusedTailDce)
+    CASE(TestResourceTrackingRealDensePatching)
+    CASE(TestDirectTranslationResetsAnalysisState)
+    CASE(TestNewShaderRecompilerNativeBindingPlan)
+    CASE(TestNewShaderRecompilerStageInputInfo)
+    CASE(TestCustomVintrpMovTranslation)
+    CASE(TestNewShaderRecompilerSharedParameterPerVertexInput)
+    CASE(TestGraphicsCreateInterpolantMapping)
+    CASE(TestNewShaderRecompilerPixelPipelineEntry)
+    CASE(TestComputeLdsAllocationIdentity)
+    CASE(TestPixelProgramCacheBindingIdentity)
+    CASE(TestGraphicsPushConstantPlacement)
+    CASE(TestNewShaderRecompilerUnsupportedMemoryDecode)
 
-  return 0;
+  };
+#undef CASE
+  unsigned executed = 0;
+  unsigned failed = 0;
+  for (const auto &test : cases) {
+    if (single && std::strcmp(argv[2], test.name) != 0) continue;
+    ++executed;
+    if (keep_going) {
+      std::printf("[RUN] %s\n", test.name);
+      const int code = RunIsolatedTest(argv[0], test.name);
+      if (code != 0) ++failed;
+      std::printf("[%s] %s (exit=%d)\n", code == 0 ? "PASS" : "FAIL", test.name, code);
+    } else {
+      test.run();
+    }
+  }
+  if (executed == 0) {
+    std::fprintf(stderr, "ShaderCfgTests: unknown case: %s\n", argv[2]);
+    return 2;
+  }
+  std::printf("ShaderCfgTests: %u executed, %u failed\n", executed, failed);
+  return failed == 0 ? 0 : 1;
 }

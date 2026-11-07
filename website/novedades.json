@@ -2,6 +2,21 @@
   "_comment": "Novedades de cada versión, de la más nueva a la más antigua. Las leen la web (sección Novedades) y el lanzador (cuadro al actualizar y Ajustes > Información de la versión). Añade la versión nueva arriba antes de publicarla.",
   "versions": [
     {
+      "version": "0.8.0",
+      "date": "2026-11-07",
+      "title": "NovaS: juegos de Switch 2 dentro de Nova5",
+      "items": [
+        "Nueva pestaña NovaS (Switch 2) con su propio menú de consola: añade tus .nsp, .xci, .nup o juegos descifrados, instala tus claves y el firmware de tu consola desde el menú y juega con mando.",
+        "The Legend of Zelda: Ocarina of Time a 60 FPS reales en zonas tranquilas y 54-57 en el pueblo Kokiri (1440p); con la generación de fotogramas FSR3 se ven hasta 120 en pantalla.",
+        "Ajustes de NovaS: resolución hasta 3x, generación de fotogramas FSR3, precisión de la GPU, modo de consola, idioma y FPS de Zelda (60 fijos, 30 estables o 60 dinámicos).",
+        "Nova5 y NovaS se abren en una ventana mediana que puedes agrandar, maximizar o poner a pantalla completa con F11. Los juegos siguen abriéndose a pantalla completa.",
+        "Los juegos en .rar, .zip o .7z (también en varias partes) se descomprimen solos desde el lanzador.",
+        "«Preparar shaders» está en el menú del clic derecho, con su progreso y los fallos en un cuadro.",
+        "Los .zar que han perdido su archivo .zar.meta lo recuperan solos.",
+        "Marvel's Wolverine: correcciones de memoria, de imágenes y de la GPU para que avance más. Todavía no es jugable y estas correcciones no se han probado a fondo."
+      ]
+    },
+    {
       "version": "0.7.2",
       "date": "2026-11-01",
       "title": "Astro Bot con toda su iluminación y shaders preparados",

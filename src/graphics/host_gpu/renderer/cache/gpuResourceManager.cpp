@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/passTiming.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "live-census.h"
 #include "live-counters.h"
 #include "async-upload.h"
@@ -111,7 +112,10 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	// Publish image pixels before a CPU load or a partial store can access them.
+	m_texture_cache.ReadMemory(fault_vaddr, fault_size);
 	if (access == PageFaultAccess::Write) {
+		if (m_bindless_table) m_bindless_table->OnCpuWrite(fault_vaddr, fault_size);
 		// A never-written granule's first write (fresh memory): unwatched, done unless another watcher holds the page.
 		if (FreshFirstWrite(fault_vaddr)) {
 			uint64_t first = 0, end = 0;
@@ -145,10 +149,12 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 }
 
 bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	if (m_bindless_table) m_bindless_table->OnCpuWrite(vaddr, size);
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
 	TextureOffload::OnHostAccess(vaddr, size, false, false);
+	m_texture_cache.ReadMemory(vaddr, size);
 	FreshOverwrite(vaddr, size); // (a host write follows: its pages are writable, its granules written)
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
@@ -156,17 +162,21 @@ bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 bool GpuResourceManager::InvalidateImages(uint64_t vaddr, uint64_t size) {
+	if (m_bindless_table) m_bindless_table->OnCpuWrite(vaddr, size);
 	if (!IsMapped(vaddr, size)) return false;
 	TextureOffload::OnHostAccess(vaddr, size, false, true); // (its caller writes all of it: CompareMove)
+	m_texture_cache.ReadMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
 }
 
 bool GpuResourceManager::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
+	if (m_bindless_table) m_bindless_table->OnCpuWrite(vaddr, size);
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
 	TextureOffload::OnHostAccess(vaddr, size, false, true); // (it writes all of it)
+	m_texture_cache.ReadMemory(vaddr, size);
 	FreshOverwrite(vaddr, size);
 	m_buffer_cache.InvalidateMemoryForWrite(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
@@ -218,6 +228,10 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 	}
 	TextureOffload::OnHostAccess(vaddr, size, true, false);
 	const auto unmap = [this, vaddr, size, releasing] {
+		if (m_bindless_table) {
+			m_bindless_table->OnCpuWrite(vaddr, size);
+			m_bindless_table->UnwatchRange(vaddr, size);
+		}
 		// Released memory loses its host protection with the mapping: the watchers removed
 		// below need not restore it page run by page run first.
 		struct UnmappingRange {

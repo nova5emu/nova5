@@ -5,28 +5,34 @@
 	const REPO = 'nova5emu/novas';
 	const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-	// Real Switch 2 games. state: probado (played by us), arreglos (has game-specific fixes, not fully played), sin.
+	// Real Switch 2 games. state: probado (played by us in NovaS), jugable / medias / arreglo (what the community reports
+	// with emulators of the same base, not checked in NovaS yet), sin (no reports).
 	const GAMES = [
-		{ id: 'zelda-ocarina-of-time', name: 'The Legend of Zelda: Ocarina of Time', state: 'probado',
-		  note: '60 FPS reales en zonas tranquilas y 49 a 57 en el pueblo Kokiri. Con FSR3 se ven hasta 120 en pantalla.' },
-		{ id: 'mario-kart-world', name: 'Mario Kart World', state: 'arreglos',
-		  note: 'Lleva arreglos para el modo foto y varios efectos. Aún no lo hemos jugado de principio a fin.' },
-		{ id: 'donkey-kong-bananza', name: 'Donkey Kong Bananza', state: 'arreglos',
-		  note: 'Tiene dos mejoras de rendimiento propias, apagadas de momento mientras las probamos.' },
-		{ id: 'kirby-air-riders', name: 'Kirby Air Riders', state: 'arreglos',
-		  note: 'Lleva una corrección de texturas para este juego. Sin probar a fondo.' },
-		{ id: 'yoshi-and-the-mysterious-book', name: 'Yoshi and the Mysterious Book', state: 'arreglos',
-		  note: 'Lleva un arreglo de sombreado para este juego. Sin probar a fondo.' },
-		{ id: 'star-fox', name: 'Star Fox', state: 'sin', note: 'Todavía no lo hemos probado en NovaS.' },
-		{ id: 'metroid-prime-4-beyond', name: 'Metroid Prime 4: Beyond', state: 'sin', note: 'Todavía no lo hemos probado en NovaS.' },
-		{ id: 'pokemon-legends-z-a', name: 'Pokémon Legends: Z-A', state: 'sin', note: 'Todavía no lo hemos probado en NovaS.' },
-		{ id: 'hyrule-warriors-age-of-imprisonment', name: 'Hyrule Warriors: Age of Imprisonment', state: 'sin', note: 'Todavía no lo hemos probado en NovaS.' },
-		{ id: 'drag-x-drive', name: 'Drag x Drive', state: 'sin', note: 'Todavía no lo hemos probado en NovaS.' },
-		{ id: 'mario-tennis-fever', name: 'Mario Tennis Fever', state: 'sin', note: 'Todavía no lo hemos probado en NovaS.' },
-		{ id: 'splatoon-raiders', name: 'Splatoon Raiders', state: 'sin', note: 'Todavía no lo hemos probado en NovaS.' },
-		{ id: 'pokemon-pokopia', name: 'Pokémon Pokopia', state: 'sin', note: 'Todavía no lo hemos probado en NovaS.' },
+		{ id: 'mario-kart-world', name: 'Mario Kart World', state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros. Lleva además arreglos propios para el modo foto y varios efectos.' },
+		{ id: 'zelda-ocarina-of-time', name: 'The Legend of Zelda: Ocarina of Time', state: 'probado', note: 'Probado en NovaS: 60 FPS reales en zonas tranquilas y 49 a 57 en el pueblo Kokiri. Con FSR3 se ven hasta 120 en pantalla.' },
+		{ id: 'pokemon-pokopia', name: 'Pokémon Pokopia', state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'pokemon-legends-z-a', name: 'Pokémon Legends: Z-A', state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'donkey-kong-bananza', name: 'Donkey Kong Bananza', state: 'medias', note: 'La comunidad lo reporta jugable a medias en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros. NovaS trae dos mejoras de rendimiento propias para este juego, apagadas mientras las probamos.' },
+		{ id: 'nintendo-switch-sports-resort', name: 'Nintendo Switch Sports Resort', state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'splatoon-raiders', name: 'Splatoon Raiders', state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'kirby-air-riders', name: 'Kirby Air Riders', state: 'medias', note: 'La comunidad lo reporta jugable a medias en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros. NovaS lleva una corrección de texturas para este juego.' },
+		{ id: 'super-mario-bros-wonder', name: 'Super Mario Bros. Wonder: Nintendo Switch 2 Edition', state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'mario-tennis-fever', name: 'Mario Tennis Fever', state: 'arreglo', note: 'La comunidad lo reporta todavía en arreglo (no se puede jugar entero) en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'super-mario-galaxy-2', name: 'Super Mario Galaxy 2', state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'fire-emblem-fortunes-weave', name: "Fire Emblem: Fortune's Weave", state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'yoshi-and-the-mysterious-book', name: 'Yoshi and the Mysterious Book', state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros. NovaS lleva un arreglo de sombreado para este juego.' },
+		{ id: 'pragmata', name: 'Pragmata', state: 'arreglo', note: 'La comunidad lo reporta todavía en arreglo (no se puede jugar entero) en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'hyrule-warriors-age-of-imprisonment', name: 'Hyrule Warriors: Age of Imprisonment', state: 'medias', note: 'La comunidad lo reporta jugable a medias en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'cyberpunk-2077', name: 'Cyberpunk 2077: Ultimate Edition', state: 'medias', note: 'La comunidad lo reporta jugable a medias en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'deltarune', name: 'Deltarune', state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'fast-fusion', name: 'Fast Fusion', state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'red-dead-redemption', name: 'Red Dead Redemption', state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'resident-evil-4', name: 'Resident Evil 4', state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'metroid-prime-4-beyond', name: 'Metroid Prime 4: Beyond', state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'star-fox', name: 'Star Fox', state: 'jugable', note: 'La comunidad lo reporta jugable a 60 FPS en emuladores con la misma base que NovaS. Aún no lo hemos comprobado nosotros.' },
+		{ id: 'drag-x-drive', name: 'Drag x Drive', state: 'sin', note: 'Todavía no hay informes de este juego.' },
 	];
-	const STATE_LABEL = { probado: 'Probado', arreglos: 'Con arreglos', sin: 'Sin probar' };
+	const STATE_LABEL = { probado: 'Probado en NovaS', jugable: 'Jugable', medias: 'Jugable a medias', arreglo: 'En arreglo', sin: 'Sin datos' };
 	const cover = g => `assets/novas/juegos/${g.id}.webp`;
 	const $ = (sel, root = document) => root.querySelector(sel);
 	const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -61,7 +67,7 @@
 	const buttons = $$('[data-buttons] button');
 	const boot = $('[data-boot]');
 	const toastEl = $('[data-toast]');
-	let index = 0, onButtons = false, button = 0, booted = false, toastTimer;
+	let index = Math.max(0, GAMES.findIndex(g => g.state === 'probado')), onButtons = false, button = 0, booted = false, toastTimer;
 
 	GAMES.forEach((g, i) => {
 		const li = document.createElement('li');
@@ -113,7 +119,7 @@
 		} else if (index < GAMES.length) {
 			const g = GAMES[index];
 			name.textContent = g.name;
-			detail.textContent = g.state === 'probado' ? 'Probado: 60 FPS reales, hasta 120 con FSR3' : STATE_LABEL[g.state];
+			detail.textContent = g.state === 'probado' ? 'Probado en NovaS: 60 FPS reales, hasta 120 con FSR3' : g.state === 'jugable' ? 'Jugable a 60 FPS, según la comunidad' : STATE_LABEL[g.state];
 		} else {
 			name.textContent = 'Añadir carpeta';
 			detail.textContent = 'Elige dónde guardas tus juegos de Switch 2';
@@ -218,7 +224,7 @@
 	$$('[data-filter]').forEach(chip => chip.addEventListener('click', () => {
 		$$('[data-filter]').forEach(c => { c.classList.toggle('on', c === chip); c.setAttribute('aria-pressed', String(c === chip)); });
 		const f = chip.dataset.filter;
-		$$('li', shelf).forEach(li => { li.hidden = f !== 'todos' && li.dataset.state !== f; });
+		$$('li', shelf).forEach(li => { li.hidden = f !== 'todos' && !(f === 'jugable' ? ['probado', 'jugable'] : [f]).includes(li.dataset.state); });
 	}));
 
 	// ---- FPS tuner: values measured with NovaS's Zelda benchmark (see the 07/11 night notes) ----

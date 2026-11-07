@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -605,6 +606,60 @@ private:
 		const auto* selector_inst = selector.TryInstruction();
 		return stride != 0u && selector_inst != nullptr &&
 		       selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane;
+	}
+
+	// Preserve the GPU key. It can be a waterfall's ReadFirstLane of arbitrary GPU
+	// data; evaluating/enumerating a material buffer on the CPU cannot recover it.
+	bool TryMakeBindlessImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+		if (!GetCodegenOptions().bindless_images ||
+		    handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) return false;
+		const auto sampled_handle = [](const Inst& image) {
+			return image.GetOpcode() == ValueOpcode::GetImageResource && !image.Uses().empty() &&
+			       std::ranges::all_of(image.Uses(), [](const Use& use) {
+				       return use.user->GetOpcode() == ValueOpcode::ImageSampleRaw;
+			       });
+		};
+		if (!sampled_handle(handle)) return false;
+		Inst* heap_handle = nullptr;
+		Value offset;
+		for (uint32_t word = 0; word < 8u; ++word) {
+			auto* read = handle.Arg(word).Resolve().TryInstruction();
+			if (read == nullptr) return false;
+			uint32_t index = 0;
+			const auto* memory = ScalarReadMemory(*read, index);
+			if (memory == nullptr || memory->offset != word * 4u ||
+			    !MemoryIndexBelongsTo(index, *read)) return false;
+			// One s_buffer_load_dwordx8 can feed several image_sample instructions.
+			// Remove its loads only when every consumer is an eligible image handle.
+			if (read->Uses().empty() || !std::ranges::all_of(read->Uses(), [&](const Use& use) {
+				return sampled_handle(*use.user);
+			})) return false;
+			auto* current = read->Arg(0).Resolve().TryInstruction();
+			if (current == nullptr || (heap_handle != nullptr && current != heap_handle)) return false;
+			heap_handle = current;
+			if (word == 0) offset = read->Arg(1).Resolve();
+			else if (!EquivalentValue(m_program, offset, read->Arg(1))) return false;
+			plan.memory[word] = index;
+			plan.reads[word] = read;
+		}
+		const auto* shift = offset.TryInstruction();
+		uint32_t amount = 0;
+		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+		    !ImmediateU32(shift->Arg(1), amount) || amount != 5u) return false;
+		DescriptorSource heap, image;
+		uint32_t heap_source = 0;
+		if (!MakeRuntimeBufferSource(*heap_handle, pc, heap_source, heap)) return false;
+		image.dword_count = 8;
+		image.dwords.fill(Value(0u));
+		std::copy_n(heap.dwords.begin(), 4, image.dwords.begin() + 4);
+		image.indirect_image = DescriptorSource::IndirectImage {};
+		image.indirect_image->heap_source = heap_source;
+		image.indirect_image->bindless = true;
+		plan.handle = &handle;
+		plan.source = InternSource(image);
+		plan.key = shift->Arg(0).Resolve();
+		plan.roots = image.dwords;
+		return true;
 	}
 
 	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
@@ -1479,7 +1534,8 @@ private:
 				IndirectImagePlan plan;
 				const auto        pc = inst.Flags<MemoryFlags>().pc;
 				m_indirect_reason.clear();
-				if (TryMakeIndirectImage(*handle, pc, plan) ||
+				if (TryMakeBindlessImage(*handle, pc, plan) ||
+				    TryMakeIndirectImage(*handle, pc, plan) ||
 				    TryMakeDenseIndirectImage(*handle, pc, plan)) {
 					m_indirect_images.push_back(std::move(plan));
 				} else if (!m_indirect_reason.empty()) {

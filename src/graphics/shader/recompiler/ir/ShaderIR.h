@@ -69,7 +69,7 @@ struct MemoryInfo {
 	bool                    image_has_mip                                         = false;
 	bool                    image_r128                                            = false;
 	bool                    image_cube                                            = false;
-	bool                    glc                                                   = false;
+	bool                    glc                                                   = false; // buffer cache bypass: GLC or enabled DLC
 	bool                    slc                                                   = false;
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
@@ -140,6 +140,7 @@ struct ImageResource {
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
+	bool                          bindless          = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
@@ -538,6 +539,7 @@ struct DescriptorSource {
 		bool                      bound_signed  = false;
 		uint32_t item_bound = 0;
 		uint32_t selector_immediate = 0;
+		bool bindless = false;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};

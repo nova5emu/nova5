@@ -4,8 +4,10 @@
 #include "common/assert.h"
 #include "common/virtualMemory.h"
 #include "common/termination.h"
+#include "common/memoryWriteWatch.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/x64InstructionEmulator.h"
+#include "loader/wolverine.h"
 #include <windows.h>
 #include <Zydis/Zydis.h>
 #include <algorithm>
@@ -950,6 +952,8 @@ void TestCpuExtensionPatches() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 void* g_red_zone_fault_page = nullptr;
+size_t g_red_zone_fault_offset = 0x18;
+uint32_t g_red_zone_fault_count = 0;
 
 LONG CALLBACK RedZoneFaultHandler(EXCEPTION_POINTERS* exception) {
 	if (exception == nullptr || exception->ExceptionRecord == nullptr ||
@@ -962,7 +966,8 @@ LONG CALLBACK RedZoneFaultHandler(EXCEPTION_POINTERS* exception) {
 
 	// Model the Windows exception stack footprint that prompted the static patch:
 	// data below the interrupted RSP is not part of the Windows ABI contract.
-	*reinterpret_cast<uint64_t*>(exception->ContextRecord->Rsp - 0x18) = 0;
+	*reinterpret_cast<uint64_t*>(exception->ContextRecord->Rsp - g_red_zone_fault_offset) = 0;
+	++g_red_zone_fault_count;
 	DWORD old_protection = 0;
 	if (VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_READWRITE, &old_protection) == FALSE) {
 		return EXCEPTION_CONTINUE_SEARCH;
@@ -970,6 +975,94 @@ LONG CALLBACK RedZoneFaultHandler(EXCEPTION_POINTERS* exception) {
 	return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+
+void TestWolverineRedZonePointer() {
+	using Loader::Wolverine::RedZoneProtectionEnabled;
+	static_assert(RedZoneProtectionEnabled(false, "PPSA03671", nullptr));
+	static_assert(RedZoneProtectionEnabled(false, "PPSA03671", "1"));
+	static_assert(!RedZoneProtectionEnabled(false, "PPSA03671", "0"));
+	static_assert(!RedZoneProtectionEnabled(false, "PPSA03671", "invalid"));
+	static_assert(RedZoneProtectionEnabled(true, "PPSA03671", "0"));
+	static_assert(!RedZoneProtectionEnabled(false, "PPSA01341", nullptr));
+	static_assert(!RedZoneProtectionEnabled(false, "PPSA01341", "1"));
+	static_assert(!RedZoneProtectionEnabled(false, "", "1"));
+	static_assert(RedZoneProtectionEnabled(true, "", nullptr));
+	const char* test = "WolverineRedZonePointer";
+	constexpr uint64_t code_size = 0x4000;
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x902000000, code_size * 2, Common::VirtualMemory::Mode::ExecuteReadWrite, test);
+	Check(test, mapping != 0, "allocate generated code");
+	InstructionTestScope restore {mapping, code_size * 2};
+	g_red_zone_fault_page = VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	Check(test, g_red_zone_fault_page != nullptr, "allocate fault destination");
+	struct FaultScope {
+		void* handler = nullptr;
+		~FaultScope() {
+			if (handler != nullptr) RemoveVectoredExceptionHandler(handler);
+			VirtualFree(g_red_zone_fault_page, 0, MEM_RELEASE);
+			g_red_zone_fault_page = nullptr;
+			g_red_zone_fault_offset = 0x18;
+		}
+	} fault;
+	fault.handler = AddVectoredExceptionHandler(1, RedZoneFaultHandler);
+	Check(test, fault.handler != nullptr, "install exception handler");
+	g_red_zone_fault_offset = 0x38;
+	Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+	Xbyak::Label loop, bad, finish;
+	// Shape of eboot+5e95610: five pushes, a live descriptor pointer at
+	// [rsp-38h], an indexed YMM store and a reload after the loop. No guest bytes.
+	code.push(code.r15); code.push(code.r14); code.push(code.r13); code.push(code.r12); code.push(code.rbx);
+	code.mov(code.r13, code.rsi);
+	code.mov(code.r12, code.rsi);
+	code.mov(code.qword[code.rsp - 0x38], code.r13);
+	code.mov(code.qword[code.rsp - 0x30], code.rsi);
+	code.vmovups(code.ymm1, code.ptr[code.rsi]);
+	code.mov(code.r10, code.rdi);
+	code.xor_(code.r8d, code.r8d);
+	code.mov(code.r14d, 2);
+	code.L(loop);
+	code.vmovups(code.ptr[code.r10 + code.r8], code.ymm1);
+	code.dec(code.r14d);
+	code.jnz(loop);
+	code.mov(code.rsi, code.qword[code.rsp - 0x30]);
+	code.mov(code.r13, code.qword[code.rsp - 0x38]);
+	// The control returns failure instead of dereferencing the destroyed pointer.
+	code.cmp(code.r13, code.r12); code.jne(bad);
+	code.cmp(code.rsi, code.r12); code.jne(bad);
+	code.mov(code.eax, code.dword[code.r13]);
+	code.cmp(code.eax, 0x40001234); code.jne(bad);
+	code.mov(code.eax, 1); code.jmp(finish);
+	code.L(bad); code.xor_(code.eax, code.eax);
+	code.L(finish);
+	code.vzeroupper();
+	code.pop(code.rbx); code.pop(code.r12); code.pop(code.r13); code.pop(code.r14); code.pop(code.r15);
+	code.ret();
+	Check(test, Xbyak::GetError() == 0, "generate pointer-spill fixture");
+	const std::array<uintptr_t, 1> starts {mapping};
+	const std::array<uint32_t, 8> descriptor {0x40001234, 2, 3, 4, 5, 6, 7, 8};
+	using GuestFunction = uint64_t(KYTY_SYSV_ABI*)(void*, const uint32_t*);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	const auto run = [&] {
+		std::memset(g_red_zone_fault_page, 0, 32);
+		DWORD old = 0;
+		Check(test, VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_NOACCESS, &old) != 0, "arm page fault");
+		const auto before = g_red_zone_fault_count;
+		const bool intact = function(g_red_zone_fault_page, descriptor.data()) == 1;
+		Check(test, g_red_zone_fault_count == before + 1, "exactly one real access violation");
+		Check(test, std::memcmp(g_red_zone_fault_page, descriptor.data(), 32) == 0, "vector store completed");
+		return intact;
+	};
+	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()), "flush fixture");
+	Check(test, !run(), "control did not reproduce the destroyed descriptor pointer");
+	Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), code_size,
+	    reinterpret_cast<void*>(mapping + code_size), code_size);
+	const auto result = Loader::PatchGuestInstructions(mapping, code.getSize(), starts,
+	    RedZoneProtectionEnabled(false, "PPSA03671", nullptr), false);
+	Check(test, result.red_zone_function_count == 1 && result.patched_memory_instruction_count > 0 &&
+	            result.unrelocatable_memory_instruction_count == 0, "protect live pointer across indexed YMM store");
+	Check(test, run(), "protected fault destroyed the descriptor pointer");
+	std::printf("[host]    %-48s ok\n", test);
+}
 
 void TestWindowsGuestRedZoneStaticPatcher() {
 	const char* test = "WindowsGuestRedZoneStaticPatcher";
@@ -1176,10 +1269,78 @@ void BenchmarkPatcher() {
     std::printf("[PATCH_BENCHMARK] functions=%llu instructions=%llu elapsed_ms=%lld debugger=%d\n",
         counts.function_count, counts.instruction_count, ms, IsDebuggerPresent());
 }
+// Real Windows faults through two views of one section; no game or GPU. A
+// neighbour's write must rearm the watch before a later write changes the table.
+void TestMemoryWriteWatch() {
+    const char* test = "MemoryWriteWatch";
+    using namespace Common::MemoryWriteWatch;
+    struct Views {
+        HANDLE section = nullptr;
+        uint8_t* guest = nullptr;
+        uint8_t* backing = nullptr;
+        ~Views() {
+            Disarm();
+            if (guest) UnmapViewOfFile(guest);
+            if (backing) UnmapViewOfFile(backing);
+            if (section) CloseHandle(section);
+        }
+    } views;
+    views.section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 0x10000, nullptr);
+    Check(test, views.section != nullptr, "section allocation failed");
+    views.guest = static_cast<uint8_t*>(MapViewOfFile(views.section, FILE_MAP_ALL_ACCESS, 0, 0, 0x10000));
+    views.backing = static_cast<uint8_t*>(MapViewOfFile(views.section, FILE_MAP_ALL_ACCESS, 0, 0, 0x10000));
+    Check(test, views.guest && views.backing, "alias mapping failed");
+    constexpr size_t Offset = 0xf70;
+    auto* table = reinterpret_cast<volatile uint64_t*>(views.guest + Offset);
+    auto* mirror = reinterpret_cast<volatile uint64_t*>(views.backing + Offset);
+    for (unsigned path = 0; path < 3; ++path) {
+        for (unsigned i = 0; i < 8; ++i) table[i] = i + 1;
+        Check(test, Arm(reinterpret_cast<uint64_t>(views.guest + Offset),
+                        reinterpret_cast<uint64_t>(views.backing + Offset)), "watch failed to arm");
+        *reinterpret_cast<volatile uint64_t*>(views.guest + 0x20) = 0xabcdef;
+        Check(test, writes.load() == 1 && active.load() && !changed.load(), "neighbour write ended watch");
+        Check(test, Protection(reinterpret_cast<uint64_t>(views.guest)) == PAGE_READONLY,
+              "neighbour write did not rearm page");
+        // Model an external guest protection change: the backing watch survives.
+        if (path == 2) {
+            DWORD ignored = 0;
+            {
+                ProtectionScope protection(reinterpret_cast<uint64_t>(views.guest), Page);
+                Check(test, VirtualProtect(views.guest, Page, PAGE_READONLY, &ignored) != 0,
+                      "external read protection failed");
+            }
+            Check(test, !aliases[0].owned.load() && Protection(reinterpret_cast<uint64_t>(views.guest)) == PAGE_READONLY,
+                  "watch took ownership of another reader's protection");
+            {
+                ProtectionScope protection(reinterpret_cast<uint64_t>(views.guest), Page);
+                Check(test, VirtualProtect(views.guest, Page, PAGE_READWRITE, &ignored) != 0,
+                      "external write protection failed");
+            }
+            Check(test, aliases[0].owned.load() && Protection(reinterpret_cast<uint64_t>(views.guest)) == PAGE_READONLY,
+                  "watch was not rearmed when external protection became writable");
+            Notify("test-protect", reinterpret_cast<uint64_t>(views.guest), Page, true);
+            Check(test, !aliases[0].owned.load() && aliases[1].owned.load(), "lost backing watch on VM change");
+        }
+        if (path == 0) table[0] = 0;
+        else mirror[0] = 0;
+        Check(test, changed.load() && !active.load() && table[0] == 0 && mirror[0] == 0,
+              "writer was not observed or instruction was not executed");
+        Check(test, table[1] == 2 && writes.load() == 2 && !step.pending,
+              "watch damaged neighbouring data or left a pending step");
+        Check(test, Protection(reinterpret_cast<uint64_t>(views.guest)) == PAGE_READWRITE &&
+                    Protection(reinterpret_cast<uint64_t>(views.backing)) == PAGE_READWRITE,
+              "watch did not restore both aliases");
+    }
+    std::puts("[host] MemoryWriteWatch ok (guest, backing, neighbour rearm, VM change)");
+}
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::strcmp(argv[1], "--patch-benchmark") == 0) { BenchmarkPatcher(); return 0; }
+        if (argc == 2 && std::strcmp(argv[1], "--wolverine-redzone-only") == 0) { TestWolverineRedZonePointer(); return 0; }
+        if (argc == 2 && std::strcmp(argv[1], "--memory-write-watch-only") == 0) { TestMemoryWriteWatch(); return 0; }
+        TestMemoryWriteWatch();
         TestWindowsGuestRedZoneStaticPatcher();
+        TestWolverineRedZonePointer();
         TestGuestCallStackArgument();
         TestForkTlsCallProtection(false);
         TestForkTlsCallProtection(true);

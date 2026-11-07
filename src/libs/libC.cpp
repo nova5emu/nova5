@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "common/memoryWriteWatch.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/hostMemory.h"
@@ -647,14 +648,17 @@ int KYTY_SYSV_ABI fflush(FILE* stream) {
 void* KYTY_SYSV_ABI memset(void* s, int c, size_t n) {
 	PRINT_NAME();
 
+	Common::MemoryWriteWatch::Notify("LibcInternal::memset", reinterpret_cast<uint64_t>(s), n, false, static_cast<uint8_t>(c));
 	return ::memset(s, c, n);
 }
 
 void* KYTY_SYSV_ABI memcpy(void* dest, const void* src, size_t n) {
+	Common::MemoryWriteWatch::Notify("LibcInternal::memcpy", reinterpret_cast<uint64_t>(dest), n, false, reinterpret_cast<uint64_t>(src));
 	return ::memcpy(dest, src, n);
 }
 
 void* KYTY_SYSV_ABI memmove(void* dest, const void* src, size_t n) {
+	Common::MemoryWriteWatch::Notify("LibcInternal::memmove", reinterpret_cast<uint64_t>(dest), n, false, reinterpret_cast<uint64_t>(src));
 	return ::memmove(dest, src, n);
 }
 

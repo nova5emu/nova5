@@ -217,6 +217,10 @@ struct GraphicContext {
 	uint64_t                      simulation_ballast_bytes = 0;
 
 	uint32_t screen_width  = 0;
+	bool bindless_enabled = false;
+	uint32_t bindless_max_sampled_images = 0;
+	vk::DescriptorSetLayout bindless_layout = nullptr;
+	vk::DescriptorSet bindless_set = nullptr;
 	uint32_t screen_height = 0;
 
 private:

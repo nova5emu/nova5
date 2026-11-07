@@ -7,6 +7,7 @@
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -26,6 +27,10 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 enum : uint32_t {
+	CapabilityShaderNonUniform = 5301,
+	CapabilityRuntimeDescriptorArray = 5302,
+	CapabilitySampledImageArrayNonUniformIndexing = 5307,
+	DecorationNonUniform = 5300,
 	ExecutionModelVertex                     = 0,
 	ExecutionModelFragment                   = 4,
 	ExecutionModelGLCompute                  = 5,
@@ -83,6 +88,8 @@ enum : uint32_t {
 	DecorationNoPerspective = 13,
 	DecorationFlat          = 14,
 	DecorationAliased       = 20,
+	DecorationCoherent      = 23,
+	DecorationNonWritable   = 24,
 	DecorationLocation      = 30,
 	DecorationArrayStride   = 6,
 	DecorationBinding       = 33,
@@ -296,6 +303,7 @@ enum : uint32_t {
 
 enum : uint32_t {
 	MemoryAccessAlignedMask = 0x2,
+	MemoryAccessVolatileMask = 0x1,
 };
 
 enum : uint32_t {
@@ -431,6 +439,11 @@ struct EmitterState {
 	std::unordered_map<uint32_t, uint32_t>             function_lds_index_slots;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
+	// Keyed by set-1 binding: cubes and 2D arrays share an OpTypeImage, but not a heap.
+	std::unordered_map<uint32_t, uint32_t> bindless_image_variables;
+	uint32_t bindless_translation_variable = 0;
+	uint32_t bindless_feedback_variable = 0;
+	uint32_t bindless_slot = 0;
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;
@@ -625,6 +638,7 @@ uint32_t ImageVectorType(EmitterState& state, Prospero::TextureNumericClass nume
                          uint32_t components);
 
 uint32_t ImageType(EmitterState& state, const IR::ImageResource& image);
+uint32_t BindlessImageBinding(const IR::ImageResource& image);
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 
@@ -734,6 +748,7 @@ uint32_t LdsDwordCount(const EmitterState& state);
 uint32_t LdsStorageDwordCount(const EmitterState& state);
 
 struct MemoryResourceAccess {
+	uint32_t         memory_access    = 0;
 	IR::ResourceKind kind             = IR::ResourceKind::None;
 	uint32_t         object_pointer   = 0;
 	uint32_t         length           = 0;

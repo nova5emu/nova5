@@ -1,6 +1,9 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/drawPrep/drawPrep.h"
 #include "frame-gen.h"
 #include "slow-log.h"
+#include "live-counters.h"
+#include "live-census.h"
 #include "local/resource-provenance.h"
 
 #include "common/assert.h"
@@ -51,6 +54,7 @@
 
 extern "C" {
 [[gnu::used]] volatile std::atomic_uint32_t kyty_local_binding_scratch_mode {1};
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_draw_prep_bindings_mode {0};
 }
 
 namespace Libs::Graphics {
@@ -98,6 +102,42 @@ vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t el
 	}
 	EXIT_IF(!texture.image_id || view == nullptr || texture.layout == vk::ImageLayout::eUndefined);
 	return {nullptr, view, texture.layout};
+}
+
+uint32_t Set0ImageDescriptorCount(const PreparedBindings& prepared, size_t resource) {
+	if (prepared.runtime->program->info.images.at(resource).bindless) return 0;
+	const auto& image = prepared.images.at(resource);
+	return image.mip_views.empty() ? 1u : static_cast<uint32_t>(image.mip_views.size());
+}
+
+bool ImageDescriptorCountsMatch(const PreparedBindings& prepared, std::span<const uint32_t> occurrences) {
+	if (occurrences.size() != prepared.images.size() ||
+	    prepared.images.size() != prepared.runtime->program->info.images.size()) return false;
+	for (size_t i = 0; i < occurrences.size(); ++i) {
+		if (occurrences[i] != Set0ImageDescriptorCount(prepared, i)) return false;
+	}
+	return true;
+}
+
+void AppendImageDescriptorInfos(const PreparedBindings& prepared,
+                                const ShaderRecompiler::IR::DescriptorBinding& binding,
+                                std::vector<uint32_t>& occurrences,
+                                std::vector<vk::DescriptorImageInfo>& infos) {
+	if (binding.kind == BindingKind::Samplers) {
+		for (const auto resource: binding.resources) {
+			const auto sampler = prepared.samplers.at(resource);
+			EXIT_IF(sampler == nullptr);
+			infos.emplace_back(sampler, nullptr, vk::ImageLayout::eUndefined);
+		}
+		return;
+	}
+	EXIT_IF(ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) ==
+	        ShaderRecompiler::IR::ImageResourceClass::None);
+	for (const auto resource: binding.resources) {
+		const auto element = occurrences.at(resource)++;
+		EXIT_IF(element >= Set0ImageDescriptorCount(prepared, resource));
+		infos.push_back(MakeImageInfo(prepared.images.at(resource), element));
+	}
 }
 
 static const char* ShaderStageResourceName(ShaderType stage) {
@@ -1302,6 +1342,18 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	return prepared;
 }
 
+// Compare only pure values. Never repeat a cache lookup, clamp, upload or guest read.
+static void VerifyBindingPlan(const PreparedBindings& prepared, bool equal, const char* item) {
+	LiveCounters::Add(LiveCounters::BindingPlanChecks);
+	if (equal) return;
+	LiveCounters::Add(LiveCounters::BindingPlanMismatches);
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+		std::printf("DrawPrep binding plan mismatch: %s shader=0x%016llx\n", item,
+		            static_cast<unsigned long long>(prepared.runtime->program->shader_hash));
+	if (prepared.binding_plan_mode == 3) EXIT("DrawPrep binding plan mismatch: %s\n", item);
+}
+
 void RenderExecutor::PrepareBindingsInto(const ShaderStageRuntime& runtime,
                                          PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -1324,6 +1376,21 @@ void RenderExecutor::PrepareBindingsInto(const ShaderStageRuntime& runtime,
 	prepared.flattened_srt = vk::DescriptorBufferInfo {};
 	prepared.shader_data_buffer = vk::DescriptorBufferInfo {};
 	prepared.runtime = &runtime;
+	PrepareBindlessHeaps(runtime, prepared);
+	prepared.binding_plan_mode = kyty_local_draw_prep_bindings_mode.load(std::memory_order_relaxed);
+	if (prepared.binding_plan_mode != 0) {
+		LiveCensus::Scope census(LiveCensus::BindingPlan, program.shader_hash, prepared.binding_plan_mode);
+		LiveCounters::Add(LiveCounters::BindingPlans);
+		if (!DrawPrep::TakeBindingPlan(runtime, prepared.binding_plan_mode, prepared.binding_plan) &&
+		    !DrawPrep::BuildStageBindingPlan(program.bindings, program.user_data_base,
+		                                    program.info.buffers.size(), snapshot, prepared.binding_plan)) {
+			LiveCounters::Add(LiveCounters::BindingPlanFallbacks);
+		} else if (prepared.binding_plan_mode == 1) {
+			LiveCounters::Add(LiveCounters::BindingPlanUses);
+		}
+	} else {
+		prepared.binding_plan.Reset();
+	}
 	prepared.images.reserve(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
@@ -1336,8 +1403,14 @@ void RenderExecutor::PrepareBindingsInto(const ShaderStageRuntime& runtime,
 		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i], material));
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
-	for (const auto reg: program.bindings.user_data_registers) {
-		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
+	if (prepared.binding_plan.valid && prepared.binding_plan_mode == 1) {
+		prepared.shader_data.assign(prepared.binding_plan.user_data.begin(), prepared.binding_plan.user_data.end());
+	} else {
+		for (const auto reg: program.bindings.user_data_registers) {
+			prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
+		}
+		if (prepared.binding_plan.valid && prepared.binding_plan_mode >= 2)
+			VerifyBindingPlan(prepared, prepared.shader_data == prepared.binding_plan.user_data, "user data");
 	}
 	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
 	if (ShaderRecompiler::IR::FindBinding(
@@ -1356,12 +1429,20 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	prepared.buffer_sources.clear();
 	prepared.buffer_sources.reserve(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
-		const auto address = descriptor.Base48();
-		const auto stride  = descriptor.Stride();
-		const auto records = descriptor.NumRecords();
-		// The descriptor has a 14-bit stride and 32-bit record count, so the product fits u64.
-		const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+		DrawPrep::StageBindingPlan::Range range;
+		if (prepared.binding_plan.valid && prepared.binding_plan_mode == 1) {
+			range = prepared.binding_plan.ranges[i];
+		} else {
+			auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+			const auto address = descriptor.Base48();
+			const auto stride = descriptor.Stride();
+			const auto records = descriptor.NumRecords();
+			const auto bytes = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+			if (address != 0 && bytes != 0) range = {address, bytes};
+			if (prepared.binding_plan.valid && prepared.binding_plan_mode >= 2)
+				VerifyBindingPlan(prepared, range == prepared.binding_plan.ranges[i], "buffer range");
+		}
+		const auto [address, requested_size] = range;
 		if (address == 0 || requested_size == 0) {
 			prepared.buffer_sources.push_back({});
 			continue;
@@ -1389,10 +1470,18 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
 	for (uint32_t i = 0; i < layout.lod_stats_count; ++i) {
-		const auto desc = DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[i]);
-		prepared.shader_data[layout.LodStatsDword() + i] = desc.MipStatsCntEn()
-		    ? (0x80000000u | desc.MipStatsCntId() | (uint32_t(desc.BaseLevel()) << 8u) |
-		       (uint32_t(desc.MinLodWarn5()) << 12u)) : 0u;
+		uint32_t value = 0;
+		if (prepared.binding_plan.valid && prepared.binding_plan_mode == 1) {
+			value = prepared.binding_plan.lod_stats[i];
+		} else {
+			const auto desc = DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[i]);
+			value = desc.MipStatsCntEn()
+			    ? (0x80000000u | desc.MipStatsCntId() | (uint32_t(desc.BaseLevel()) << 8u) |
+			       (uint32_t(desc.MinLodWarn5()) << 12u)) : 0u;
+			if (prepared.binding_plan.valid && prepared.binding_plan_mode >= 2)
+				VerifyBindingPlan(prepared, value == prepared.binding_plan.lod_stats[i], "LOD stats");
+		}
+		prepared.shader_data[layout.LodStatsDword() + i] = value;
 	}
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
 		const auto dword = layout.memory_offset_dword + index / 4u;
@@ -1412,7 +1501,16 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		if (prepared.bindless_patches.empty()) {
+			prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		} else {
+			auto words = snapshot.flattened_srt;
+			for (const auto& patch: prepared.bindless_patches) {
+				words.at(patch[0]) = patch[1];
+				words.at(patch[0] + 1) = patch[2];
+			}
+			prepared.flattened_srt = NativeUpload(m_context, words);
+		}
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
@@ -1679,6 +1777,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	const TransitGroup transit_group;
 	KYTY_PROFILER_FUNCTION();
 	auto   vk_buffer        = compute_chain ? buffer.ChainHandle() : buffer.Handle();
+	if (const auto set = m_context.GetBindlessTable().Set(); set != nullptr)
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 1, 1, &set, 0, nullptr);
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
@@ -1720,6 +1820,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		auto&       descriptors   = *prepared;
 		const auto  shader_stage  = NativeShaderStage(program.stage);
 		const auto  shader_stages = ShaderPipelineStages(shader_stage);
+		for (const auto* heap: descriptors.bindless_heaps) {
+			for (const auto id: heap->resolved) {
+				auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
+				if (image == nullptr || !image->registered || image->info.data.Empty()) continue;
+				auto access = vk::AccessFlags2 {vk::AccessFlagBits2::eShaderRead};
+				if (image->binding.shader_write) access |= vk::AccessFlagBits2::eShaderWrite;
+				if (image->binding.is_target) access |= image->binding.attachment_access;
+				image->Transit(vk::ImageLayout::eGeneral, access, {}, vk_buffer);
+			}
+		}
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();
 			const auto barrier = MakeGdsDependency(descriptors.gds.buffer);
@@ -1773,7 +1883,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
 				                                              : vk::AccessFlags2 {}),
 				              {}, vk_buffer);
-			} else if (image.binding.force_general && !image.info.IsDepth()) {
+			} else if (image.binding.bindless_general || (image.binding.force_general && !image.info.IsDepth())) {
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
@@ -1811,10 +1921,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const auto image_start  = m_descriptor_images.size();
 			if (ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) !=
 			    ShaderRecompiler::IR::ImageResourceClass::None) {
-				for (const auto resource: binding.resources) {
-					m_descriptor_images.push_back(MakeImageInfo(
-					    descriptors.images.at(resource), m_image_occurrences.at(resource)++));
-				}
+				AppendImageDescriptorInfos(descriptors, binding, m_image_occurrences, m_descriptor_images);
 			} else {
 				switch (binding.kind) {
 					case BindingKind::Buffers:
@@ -1853,16 +1960,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						break;
 					}
 					case BindingKind::Samplers:
-						for (const auto resource: binding.resources) {
-							const auto sampler = descriptors.samplers.at(resource);
-							EXIT_IF(sampler == nullptr);
-							m_descriptor_images.emplace_back(sampler, nullptr,
-							                                 vk::ImageLayout::eUndefined);
-						}
+						AppendImageDescriptorInfos(descriptors, binding, m_image_occurrences, m_descriptor_images);
 						break;
 					case BindingKind::Count: EXIT("invalid descriptor binding kind");
 				}
 			}
+			EXIT_IF((m_descriptor_buffers.size() - buffer_start) +
+			            (m_descriptor_images.size() - image_start) != write.descriptorCount);
 			if (m_descriptor_buffers.size() != buffer_start) {
 				write.pBufferInfo = m_descriptor_buffers.data() + buffer_start;
 			}
@@ -1871,13 +1975,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			m_descriptor_writes.push_back(write);
 		}
-		for (uint32_t i = 0; i < descriptors.images.size(); i++) {
-			const auto expected =
-			    descriptors.images[i].mip_views.empty()
-			        ? 1u
-			        : static_cast<uint32_t>(descriptors.images[i].mip_views.size());
-			EXIT_IF(m_image_occurrences[i] != expected);
-		}
+		EXIT_IF(!ImageDescriptorCountsMatch(descriptors, m_image_occurrences));
 
 		const auto shader_data_dwords = program.bindings.ShaderDataDwords();
 		EXIT_IF(prepared->shader_data.size() != shader_data_dwords);

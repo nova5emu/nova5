@@ -25,7 +25,10 @@ enum Kind : uint32_t {
 	CommandSync   = 11, // GPU-written command memory check before parsing (indirect tables)
 	DrawPhase     = 12, // a: pixel shader, b: phase (LogDrawPhase marks; DrawPhases below)
 	Barrier       = 13, // a: return address of the recorded vkCmdPipelineBarrier(2), b: 1 for the 2 form
-	Kinds         = 14
+	BindingPlan   = 14, // a: shader hash, b: KYTY_DRAW_PREP_BINDINGS mode; pure inline plan build
+	DrawPrepValidate = 15,
+	DrawPrepWait = 16,
+	Kinds         = 17
 };
 
 struct Entry {

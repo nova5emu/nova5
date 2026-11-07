@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "local/shader-loop-guard.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
 #include <algorithm>
 
@@ -183,6 +184,34 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 }
 
 void DefineDescriptorVariables(EmitterState& state) {
+	for (const auto& image: state.program.info.images) {
+		if (!image.bindless) continue;
+		const auto type = ImageType(state, image);
+		const auto binding = BindlessImageBinding(image);
+		if (state.bindless_image_variables.contains(binding)) continue;
+		const auto array = state.builder.Type(OpTypeRuntimeArray, {type});
+		const auto variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, StorageClassUniformConstant, array), StorageClassUniformConstant);
+		state.builder.AddAnnotation({OpDecorate, variable, DecorationDescriptorSet, IR::BindlessDescriptorSet});
+		state.builder.AddAnnotation({OpDecorate, variable, DecorationBinding, binding});
+		state.bindless_image_variables[binding] = variable;
+		state.builder.RequireCapability(CapabilityRuntimeDescriptorArray);
+		state.builder.RequireCapability(CapabilitySampledImageArrayNonUniformIndexing);
+		state.builder.RequireCapability(CapabilityShaderNonUniform);
+		state.builder.RequireVersion(0x00010500u);
+	}
+	if (!state.bindless_image_variables.empty()) {
+		const auto buffer = [&](uint32_t binding) {
+			const auto variable = state.builder.DefineGlobalVariable(TypeStorageBufferPointer(state),
+			                                                         StorageClassStorageBuffer);
+			state.builder.AddAnnotation({OpDecorate, variable, DecorationDescriptorSet, IR::BindlessDescriptorSet});
+			state.builder.AddAnnotation({OpDecorate, variable, DecorationBinding, binding});
+			return variable;
+		};
+		state.bindless_translation_variable = buffer(IR::BindlessTranslation);
+		state.bindless_feedback_variable = buffer(IR::BindlessFeedback);
+		state.builder.AddAnnotation({OpDecorate, state.bindless_translation_variable, DecorationNonWritable});
+	}
 	if (DescriptorBinding(state, IR::DescriptorBindingKind::Buffers) != nullptr) {
 		const auto count =
 		    ConstantU32(state, DescriptorCount(state, IR::DescriptorBindingKind::Buffers));
@@ -196,6 +225,16 @@ void DefineDescriptorVariables(EmitterState& state) {
 			state.storage_buffer_u64_variable = state.builder.DefineGlobalVariable(
 			    TypePointer(state, StorageClassStorageBuffer, u64_array_type),
 			    StorageClassStorageBuffer);
+		}
+		if (GetCodegenOptions().coherent_buffers &&
+		    std::ranges::any_of(state.program.memory_info, [](const auto& mem) {
+			    return mem.kind == IR::ResourceKind::Buffer && mem.glc;
+		    })) {
+			// Frank dc9280d7: all aliases participate, including ordinary writes
+			// publishing the value that another workgroup polls through GLC/DLC.
+			state.builder.AddAnnotation({OpDecorate, state.storage_buffer_variable, DecorationCoherent});
+			if (state.storage_buffer_u64_variable != 0)
+				state.builder.AddAnnotation({OpDecorate, state.storage_buffer_u64_variable, DecorationCoherent});
 		}
 	}
 	if (DescriptorBinding(state, IR::DescriptorBindingKind::BdaPagetable) != nullptr) {

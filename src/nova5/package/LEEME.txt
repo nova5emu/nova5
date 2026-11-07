@@ -21,6 +21,13 @@ Primeros pasos
    (cada juego es una carpeta con eboot.bin y sce_sys).
 3. Elige un juego y pulsa Jugar (botón A del mando o Enter).
 
+Juegos de Switch 2 (NovaS)
+--------------------------
+La pestaña "NovaS · Switch 2" abre el menú de NovaS, el emulador de Switch 2
+incluido. Pulsa "Claves" y elige el prod.keys de tu consola, "Firmware" para
+el firmware de tu consola y "Añadir carpeta" para tus .nsp, .xci o .nup.
+NovaS no incluye juegos, claves ni firmware.
+
 Controles del lanzador
 ----------------------
 Mando: cruceta o stick para moverte, A aceptar, B atrás, Y ajustes,
@@ -37,10 +44,12 @@ Licencia y código fuente
 Nova5 se distribuye bajo la Licencia Pública General de GNU, versión 2
 (GPL-2.0), la misma que KytyPS5; ver LICENSE.txt. El Kyty original está bajo
 licencia MIT y los componentes de terceros conservan sus propias licencias
-(carpeta licenses).
+(carpeta licenses). El motor de NovaS (carpeta novas) se distribuye bajo la
+GPL-3.0; su código fuente está en https://github.com/nova5emu/novas.
 
 Código fuente completo: https://github.com/nova5emu/nova5
 Web oficial: https://nova5emu.github.io/nova5/
 
 Nova5 no está afiliado, respaldado ni patrocinado por Sony Interactive
-Entertainment. "PlayStation" y "PS5" son marcas de sus respectivos dueños.
+Entertainment ni por Nintendo. "PlayStation", "PS5" y "Nintendo Switch 2" son
+marcas de sus respectivos dueños.

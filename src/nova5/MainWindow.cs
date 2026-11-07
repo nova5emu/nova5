@@ -131,6 +131,7 @@ public sealed class MainWindow : Window
 	private readonly TextBlock  _updateText = Text("", 20, FontWeight.SemiBold, Palette.AuroraA);
 	private Border              _updatePill = new();
 	private readonly NovaSHome  _novas = new();
+	private WindowState         _shownState = WindowState.Normal, _windowedState = WindowState.Normal;
 	private UpdateInfo?         _update;
 	private bool                _updating;
 
@@ -141,7 +142,17 @@ public sealed class MainWindow : Window
 		FontFamily = Palette.Font;
 		Width      = 1600;
 		Height     = 900;
-		WindowState = SnapshotPath is null ? WindowState.FullScreen : WindowState.Normal;
+		// Opens as a window half as wide as the screen, centered; the player can maximize it or go full screen (F11).
+		// Games still open full screen on their own.
+		WindowState = WindowState.Normal;
+		WindowStartupLocation = WindowStartupLocation.CenterScreen;
+		MinWidth  = 640;
+		MinHeight = 360;
+		if (SnapshotPath is null && Screens.Primary is { } screen)
+		{
+			Width  = screen.WorkingArea.Width / screen.Scaling * 0.5;
+			Height = Width * (Edition.NovaSOnly ? 0.5 : 9.0 / 16); // NovaS's console is wider than 16:9.
+		}
 
 		_buttons = new[] { ActionButton("Jugar", primary: true), ActionButton("Opciones del juego"), ActionButton("Abrir carpeta") };
 		_tabs    = new[] { Text("Juegos", 24, FontWeight.SemiBold), Text("Trofeos", 24, FontWeight.Normal, Palette.Muted), Text("Ajustes", 24, FontWeight.Normal, Palette.Muted), Text("NovaS · Switch 2", 24, FontWeight.Normal, Palette.Muted) };
@@ -195,7 +206,11 @@ public sealed class MainWindow : Window
 		};
 		PropertyChanged += (_, e) =>
 		{
-			if (e.Property == WindowStateProperty) _fullscreenLabel.Text = WindowState == WindowState.FullScreen ? "Ventana" : "Pantalla completa";
+			if (e.Property != WindowStateProperty) return;
+			_fullscreenLabel.Text = WindowState == WindowState.FullScreen ? "Ventana" : "Pantalla completa";
+			// What to come back to after a game (the launcher minimizes while it runs) and when leaving full screen.
+			if (WindowState != WindowState.Minimized) _shownState = WindowState;
+			if (WindowState is WindowState.Normal or WindowState.Maximized) _windowedState = WindowState;
 		};
 		Opened  += (_, _) =>
 		{
@@ -244,6 +259,26 @@ public sealed class MainWindow : Window
 		donate.Margin            = new Thickness(12, 4, 0, 0);
 		donate.PointerPressed += (_, _) => Process.Start(new ProcessStartInfo("https://ko-fi.com/nova5emu") { UseShellExecute = true });
 		brand.Children.Add(donate);
+		// The way to the Switch 2 side, in plain sight: NovaS's mark and name, like Nova5's own at the left.
+		if (!Edition.NovaSOnly)
+		{
+			var novasLabel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12, VerticalAlignment = VerticalAlignment.Center };
+			novasLabel.Children.Add(NovaSMark(34));
+			novasLabel.Children.Add(Text("NovaS", 22, FontWeight.Bold));
+			novasLabel.Children.Add(Text("Switch 2", 18, FontWeight.Normal, Palette.Muted));
+			var novas = Pill(novasLabel);
+			novas.Padding           = new Thickness(10, 7, 22, 7);
+			novas.BorderBrush       = new LinearGradientBrush
+			{
+				StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative), EndPoint = new RelativePoint(1, 0, RelativeUnit.Relative),
+				GradientStops = { new GradientStop(Color.Parse("#FF4554"), 0), new GradientStop(Color.Parse("#00C3E3"), 1) },
+			};
+			novas.Cursor            = new Cursor(StandardCursorType.Hand);
+			novas.VerticalAlignment = VerticalAlignment.Center;
+			novas.Margin            = new Thickness(28, 4, 0, 0);
+			novas.PointerPressed   += (_, _) => { if (_zone != Zone.Prompt) ShowTab(NovaSTab); };
+			brand.Children.Add(novas);
+		}
 		Place(stage, brand, 72, 34);
 
 		var status = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 28, VerticalAlignment = VerticalAlignment.Center };
@@ -396,14 +431,14 @@ public sealed class MainWindow : Window
 		var bar = new DockPanel { LastChildFill = false, Margin = new Thickness(20, 0) };
 		var brand = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, VerticalAlignment = VerticalAlignment.Center };
 		brand.Children.Add(Logo(26));
-		brand.Children.Add(Text("Nova5", 18, FontWeight.SemiBold));
+		brand.Children.Add(Text(Edition.Name, 18, FontWeight.SemiBold));
 		DockPanel.SetDock(brand, Dock.Left);
 		bar.Children.Add(brand);
 		var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
 		buttons.Children.Add(ChromeButton(Text("Minimizar", 20, FontWeight.Normal), Palette.Brush(Colors.White, 0.12), () => WindowState = WindowState.Minimized));
 		buttons.Children.Add(ChromeButton(_fullscreenLabel, Palette.Brush(Colors.White, 0.12),
-		    () => WindowState = WindowState == WindowState.FullScreen ? WindowState.Maximized : WindowState.FullScreen));
-		buttons.Children.Add(ChromeButton(Text("Cerrar Nova5", 20, FontWeight.SemiBold), Palette.Brush(Color.Parse("#E5484D"), 0.9), Close));
+		    () => WindowState = WindowState == WindowState.FullScreen ? _windowedState : WindowState.FullScreen));
+		buttons.Children.Add(ChromeButton(Text($"Cerrar {Edition.Name}", 20, FontWeight.SemiBold), Palette.Brush(Color.Parse("#E5484D"), 0.9), Close));
 		DockPanel.SetDock(buttons, Dock.Right);
 		bar.Children.Add(buttons);
 		return new Border
@@ -1489,7 +1524,7 @@ public sealed class MainWindow : Window
 		BuildChoiceRows();
 		_choiceSheet.IsVisible = true;
 		_zone = Zone.Choice;
-		WindowState = WindowState.FullScreen;
+		WindowState = _shownState;
 		Activate();
 	}
 
@@ -1937,7 +1972,7 @@ public sealed class MainWindow : Window
 		}
 		if (e.Key == Key.F11)
 		{
-			WindowState = WindowState == WindowState.FullScreen ? WindowState.Maximized : WindowState.FullScreen;
+			WindowState = WindowState == WindowState.FullScreen ? _windowedState : WindowState.FullScreen;
 			e.Handled   = true;
 			return;
 		}
@@ -2640,7 +2675,7 @@ public sealed class MainWindow : Window
 		_trophyCache.Clear(); // It may have earned trophies.
 		_running     = null;
 		_runningGame = null;
-		WindowState  = WindowState.FullScreen;
+		WindowState  = _shownState; // As the player had it before the game.
 		Activate();
 		Select(_index, force: true);
 		if (_tab == NovaSTab) _novas.Load(SwitchGames.Scan(SwitchRoots()));
@@ -2791,11 +2826,31 @@ public sealed class MainWindow : Window
 
 	public static Control Logo(double size)
 	{
+		if (Edition.NovaSOnly) return NovaSMark(size); // NovaS on its own: its own mark.
 		var canvas = new Canvas { Width = 64, Height = 64 };
 		canvas.Children.Add(new Ellipse { Width = 56, Height = 56, Stroke = Palette.Aurora(), StrokeThickness = 4, [Canvas.LeftProperty] = 4, [Canvas.TopProperty] = 4 });
 		canvas.Children.Add(new Avalonia.Controls.Shapes.Path { Data = Geometry.Parse("M21,44 V20 L43,44 V20"), Stroke = Brushes.White, StrokeThickness = 5, StrokeLineCap = PenLineCap.Round, StrokeJoin = PenLineJoin.Round });
 		canvas.Children.Add(new Ellipse { Width = 10, Height = 10, Fill = Palette.Brush(Palette.AuroraA), [Canvas.LeftProperty] = 45, [Canvas.TopProperty] = 8 });
 		return new Viewbox { Width = size, Height = size, Child = canvas };
+	}
+
+	// NovaS's mark (as in novas.ico): a rounded square, half red and half blue, with a white S.
+	public static Control NovaSMark(double size)
+	{
+			return new Border
+			{
+				Width = size, Height = size, CornerRadius = new CornerRadius(size * 0.27),
+				Background = new LinearGradientBrush
+				{
+					StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative), EndPoint = new RelativePoint(1, 0, RelativeUnit.Relative),
+					GradientStops = { new GradientStop(Color.Parse("#FF4554"), 0.5), new GradientStop(Color.Parse("#00C3E3"), 0.5) },
+				},
+				Child = new TextBlock
+				{
+					Text = "S", FontSize = size * 0.72, FontWeight = FontWeight.Black, Foreground = Brushes.White,
+					HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
+				},
+			};
 	}
 
 	// --snapshot <file.png>: renders the home screen at 1920x1080 and exits, to review the UI without a session.

@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "kernel/eventQueue.h"
 #include "graphics/host_gpu/renderer/guestClock.h"
 #include "graphics/host_gpu/renderer/resolutionTrace.h"
@@ -111,6 +112,7 @@ public:
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	GpuResourceManager& GetGpuResources() { return m_gpu_resources; }
+	BindlessTable&      GetBindlessTable() { return m_bindless_table; }
 	BufferCache&        GetBufferCache() { return m_gpu_resources.GetBufferCache(); }
 	TextureCache&       GetTextureCache() { return m_gpu_resources.GetTextureCache(); }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
@@ -136,9 +138,10 @@ private:
 	RenderExecutor            m_compute_render_executor;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;
+	GpuResourceManager        m_gpu_resources;
+	BindlessTable             m_bindless_table;
 	PipelineCache             m_pipeline_cache;
 	SamplerCache              m_sampler_cache;
-	GpuResourceManager        m_gpu_resources;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 

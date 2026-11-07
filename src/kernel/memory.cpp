@@ -10,14 +10,17 @@
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
+#include "common/memoryWriteWatch.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/systemContent.h"
 #include "native-resource-state.h"
 #include "texture-offload.h"
 
@@ -268,6 +271,10 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 #endif
+
+static AmmAddressLayout g_amm_address_layout = LegacyAmmLayout;
+AmmAddressLayout GetAmmAddressLayout() { return g_amm_address_layout; }
+static_assert(WolverineAmmLayout.end < Graphics::TRACKER_ADDRESS_SIZE);
 
 #include "memoryAddressSpace.inc"
 
@@ -1332,12 +1339,18 @@ bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBackingToHost(vaddr, data, size);
 }
 
+bool TryProbeBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryReadBackingToHost(vaddr, data, size, true);
+}
+
 bool TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) return false;
 		auto& resources = GetGpuResources();
 		auto& buffers = resources.GetBufferCache();
 		auto& images = resources.GetTextureCache();
+		if (images.HasPendingCpuReadback(vaddr, size)) return false;
 		static const int mode = [] {
 			const auto* value = std::getenv("KYTY_CLEAN_READ_CACHE");
 			return value ? std::atoi(value) : 1;
@@ -1891,11 +1904,29 @@ void Initialize() {
 	AllowHotReadLocks();
 #endif
 	VirtualMemory::Init();
+	g_amm_address_layout = LegacyAmmLayout;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::string title_id;
+	Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id);
+	g_amm_address_layout = SelectAmmAddressLayout(title_id, std::getenv("NOVA5_WOLVERINE_AMM_ISOLATION"));
+#endif
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
 	g_physical_memory     = std::make_unique<PhysicalMemory>();
 	g_flexible_memory     = std::make_unique<FlexibleMemory>();
 	g_pooled_memory       = std::make_unique<PooledMemory>();
 	g_virtual_ranges      = std::make_unique<VirtualRanges>();
+	if (g_amm_address_layout.isolated) {
+		const auto begin = g_amm_address_layout.begin;
+		const auto end = g_amm_address_layout.end;
+		// The host owner must already hold the WHOLE aperture. A custom reserve
+		// ceiling or an occupied host range must not silently advertise unusable VA.
+		if (!g_guest_address_space->ReserveFixed(begin, end - begin))
+			EXIT("Wolverine AMM aperture unavailable: 0x%llx..0x%llx; check KYTY_RESERVE_CEILING\n",
+			     static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end));
+		std::printf("[WOLVERINE][AMM] isolated VA=0x%llx..0x%llx ordinary allocations excluded (NOVA5_WOLVERINE_AMM_ISOLATION)\n",
+		            static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end));
+		std::fflush(stdout);
+	}
 	EXIT_IF(!g_guest_address_space->SelfTest());
 	EXIT_IF(!SelfTestSub64SharedPlaceholderAlias());
 }
