@@ -1,0 +1,88 @@
+{
+  "versions": [
+    {
+      "version": "0.1.4",
+      "date": "",
+      "title": "Novedades al actualizar",
+      "items": [
+        "Después de cada actualización, NovaS te enseña lo nuevo de esa versión al abrirse.",
+        "En los ajustes de NovaS, «Novedades» enseña lo que trajo cada versión."
+      ],
+      "title_en": "What's new after updating",
+      "items_en": [
+        "After each update, NovaS shows what that version brings when it opens.",
+        "In NovaS's settings, «What's new» shows what each version brought."
+      ]
+    },
+    {
+      "version": "0.1.3",
+      "date": "2026-11-07",
+      "title": "Botón para donar y actualizaciones en los ajustes",
+      "items": [
+        "NovaS tiene su botón «Donar» en la fila de inicio, que abre Ko-fi.",
+        "En los ajustes de NovaS: «Buscar actualizaciones» y cómo actualizarse (Avisar, Automáticas o Desactivadas)."
+      ],
+      "title_en": "A Donate button and updates in the settings",
+      "items_en": [
+        "NovaS has its «Donate» button on the home row, which opens Ko-fi.",
+        "In NovaS's settings: «Check for updates» and how it updates (Notify, Automatic or Off)."
+      ]
+    },
+    {
+      "version": "0.1.2",
+      "date": "2026-11-07",
+      "title": "Español e inglés, aspecto de consola y carátulas automáticas",
+      "items": [
+        "NovaS en español o en inglés: por defecto el idioma de tu PC, y se cambia en los ajustes.",
+        "NovaS se ve como una consola en tu escritorio, sin marco, con su barrita para minimizar, agrandar y cerrar.",
+        "Carátulas automáticas para 23 juegos de Switch 2.",
+        "Encuentra los juegos en carpetas sueltas (base, actualizaciones y DLC) y los empaqueta en .nup para jugarlos con su actualización.",
+        "Logo nuevo, también en la barra de tareas y en la ventana del juego."
+      ],
+      "title_en": "English and Spanish, a console look and automatic covers",
+      "items_en": [
+        "NovaS in English or Spanish: your PC's language by default, changeable in the settings.",
+        "NovaS looks like a console on your desktop, with no frame and a small bar to minimize, enlarge and close.",
+        "Automatic covers for 23 Switch 2 games.",
+        "Finds games in loose folders (base, updates and DLC) and packs them into .nup so they play with their update.",
+        "New logo, on the taskbar and the game window too."
+      ]
+    },
+    {
+      "version": "0.1.1",
+      "date": "2026-11-07",
+      "title": "El menú es una consola",
+      "items": [
+        "El menú de NovaS es una consola: la pantalla con tus juegos entre un mando rojo y otro azul. Los botones dibujados funcionan con el ratón.",
+        "NovaS se abre en una ventana mediana que puedes agrandar o poner a pantalla completa con F11. Los juegos se siguen abriendo a pantalla completa.",
+        "La barra de la ventana dice «NovaS» con su propio icono."
+      ],
+      "title_en": "The menu is a console",
+      "items_en": [
+        "NovaS's menu is a console: the screen with your games between a red controller and a blue one. The drawn buttons work with the mouse.",
+        "NovaS opens in a medium window that you can enlarge or make full screen with F11. Games still open full screen.",
+        "The window's bar says «NovaS» with its own icon."
+      ]
+    },
+    {
+      "version": "0.1.0",
+      "date": "2026-11-07",
+      "title": "Primera versión de NovaS",
+      "items": [
+        "Menú propio de estilo consola, con mando, teclado y ratón.",
+        "Instalación de tus claves (prod.keys) y del firmware de tu consola desde el propio menú.",
+        "Juegos .nsp, .xci, .nup y carpetas descifradas.",
+        "Generación de fotogramas FSR3, resolución hasta 3x y «Zelda FPS» (60 fijos, 30 estables o 60 dinámicos).",
+        "Actualizaciones automáticas desde el propio NovaS."
+      ],
+      "title_en": "The first version of NovaS",
+      "items_en": [
+        "Its own console-style menu, with controller, keyboard and mouse.",
+        "Installs your keys (prod.keys) and your console's firmware from the menu itself.",
+        ".nsp, .xci and .nup games and decrypted folders.",
+        "FSR3 frame generation, resolution up to 3x and «Zelda FPS» (locked 60, stable 30 or dynamic 60).",
+        "Automatic updates from NovaS itself."
+      ]
+    }
+  ]
+}

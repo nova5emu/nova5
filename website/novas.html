@@ -16,7 +16,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@400;500;700;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="novas.css?v=20261107d">
+<link rel="stylesheet" href="novas.css?v=20261107e">
 </head>
 <body>
 <a class="skip" href="#principal">Saltar al contenido</a>
@@ -33,7 +33,7 @@
     <a href="#juegos">Juegos</a>
     <a href="#preguntas">Preguntas</a>
     <a href="index.html">Nova5 (PS5)</a>
-    <a href="#comentarios"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" style="vertical-align:-3px;margin-right:6px"><circle cx="12" cy="8" r="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>Iniciar sesión</a>
+    <a href="#comentarios" data-account><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" style="vertical-align:-3px;margin-right:6px"><circle cx="12" cy="8" r="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>Iniciar sesión</a>
     <a href="https://ko-fi.com/nova5emu" target="_blank" rel="noopener">Donar</a>
   </nav>
   <a class="pill pill-red" data-download href="https://github.com/nova5emu/novas/releases/latest">Descargar</a>
@@ -50,6 +50,7 @@
         <svg aria-hidden="true" viewBox="0 0 24 24" width="22" height="22"><path d="M12 3v12m0 0-5-5m5 5 5-5M4 20h16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
         Descargar NovaS
       </a>
+      <a class="pill pill-line big" href="https://github.com/nova5emu/novas" target="_blank" rel="noopener" data-stars="nova5emu/novas"><svg class="gh-mark" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> Ver código fuente</a>
       <a class="pill pill-line big" href="#video">Ver Zelda en NovaS</a>
       <a class="pill pill-line big" href="https://ko-fi.com/nova5emu" target="_blank" rel="noopener">☕ Donar en Ko-fi</a>
     </div>
@@ -221,6 +222,12 @@
   </dl>
 </section>
 
+<section class="wrap section" id="novedades">
+  <h2>Novedades</h2>
+  <p class="section-lede">Lo que trae cada versión de NovaS. NovaS también te lo enseña al abrirse después de actualizarse.</p>
+  <div class="changelog" id="changelog" data-src="novas-novedades.json" data-repo="nova5emu/novas"><p class="section-lede">Cargando las novedades…</p></div>
+</section>
+
 <section class="wrap section" id="preguntas">
   <h2>Preguntas</h2>
   <div class="faq">
@@ -255,6 +262,7 @@
   <div class="wrap final-in">
     <h2>Listo para jugar</h2>
     <a class="pill pill-red big" data-download href="https://github.com/nova5emu/novas/releases/latest">Descargar NovaS para Windows</a>
+    <a class="pill pill-line big" href="https://github.com/nova5emu/novas" target="_blank" rel="noopener" data-stars="nova5emu/novas"><svg class="gh-mark" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> Ver código fuente</a>
     <a class="pill pill-line big" href="https://ko-fi.com/nova5emu" target="_blank" rel="noopener">☕ Apoya NovaS en Ko-fi</a>
     <p class="final-alt"><a data-portable href="https://github.com/nova5emu/novas/releases/latest">Versión portátil (.zip)</a> · <a href="https://github.com/nova5emu/novas">Código fuente</a></p>
   </div>
@@ -274,11 +282,10 @@
           data-term="NovaS"
           data-strict="1"
           data-reactions-enabled="1"
-          data-emit-metadata="0"
+          data-emit-metadata="1"
           data-input-position="top"
           data-theme="light"
           data-lang="es"
-          data-loading="lazy"
           crossorigin="anonymous"
           async></script>
 </section>
@@ -293,6 +300,8 @@
   </div>
 </footer>
 
-<script src="novas.js?v=20261107d" defer></script>
+<script src="novas.js?v=20261107e" defer></script>
+<script src="changelog.js?v=20261107" defer></script>
+<script src="cuenta.js?v=20261107" defer></script>
 </body>
 </html>

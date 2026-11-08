@@ -1,5 +1,6 @@
-// "Novedades" section: what each version brings, from novedades.json (the same file the launcher shows
-// after an update). The newest version is open; older ones fold into their own row.
+// "Novedades" section: what each version brings, from novedades.json (or the file in data-src, like NovaS's
+// novas-novedades.json; the same file the launcher shows after an update). The newest version is open; older ones
+// fold into their own row.
 (() => {
   const box = document.getElementById('changelog');
   if (!box) return;
@@ -22,7 +23,8 @@
     p.textContent = `Versión ${v.version} · ${day(v.date)}`;
     return p;
   };
-  fetch('novedades.json', { cache: 'no-cache' })
+  const repo = box.dataset.repo || 'nova5emu/nova5';
+  fetch(box.dataset.src || 'novedades.json', { cache: 'no-cache' })
     .then((r) => (r.ok ? r.json() : Promise.reject()))
     .then(({ versions }) => {
       // Only released versions: the one being prepared has no date yet.
@@ -50,6 +52,6 @@
       });
     })
     .catch(() => {
-      box.innerHTML = '<p class="fine">No se pudieron cargar las novedades. Están también en <a href="https://github.com/nova5emu/nova5/releases">las versiones de GitHub</a>.</p>';
+      box.innerHTML = `<p class="fine">No se pudieron cargar las novedades. Están también en <a href="https://github.com/${repo}/releases">las versiones de GitHub</a>.</p>`;
     });
 })();

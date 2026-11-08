@@ -319,3 +319,19 @@ kbd {
 .comments { max-width: 900px; }
 .comments-lede { color: var(--muted); margin: 8px 0 24px; }
 .comments .giscus { min-height: 160px; }
+
+/* Novedades: the newest version open, the older ones folded (changelog.js). */
+.changelog { display: grid; gap: 12px; max-width: 860px; margin-top: 28px; }
+.changelog .release { padding: 28px 30px; border-radius: 24px; background: var(--white); border: 2px solid var(--red); box-shadow: 0 4px 0 var(--line); }
+.changelog .release h3 { font-size: 22px; margin: 6px 0 4px; }
+.changelog .ver { color: var(--red-deep); font-size: 14px; font-weight: 800; margin: 0; }
+.changelog ul { margin: 12px 0 0; padding-left: 20px; color: var(--muted); }
+.changelog li + li { margin-top: 6px; }
+.changelog details { border: 1px solid var(--line); border-radius: 18px; background: var(--white); padding: 0 24px; }
+.changelog summary { cursor: pointer; padding: 18px 0; font-weight: 700; list-style: none; display: flex; justify-content: space-between; gap: 16px; }
+.changelog summary::-webkit-details-marker { display: none; }
+.changelog summary::after { content: '+'; color: var(--red); font-size: 22px; line-height: 1; }
+.changelog details[open] summary::after { content: '\2212'; }
+.changelog details ul { margin: 0 0 20px; }
+.changelog summary .muted { color: var(--muted); font-weight: 400; font-size: 14px; margin-left: 6px; }
+.pill .gh-mark { width: 20px; height: 20px; }
