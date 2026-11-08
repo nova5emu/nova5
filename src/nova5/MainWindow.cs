@@ -2181,7 +2181,7 @@ public sealed class MainWindow : Window
 		{
 			_zone = Zone.NovaS;
 			_music.Stop();
-			_novas.Load(SwitchGames.Scan(SwitchRoots()));
+			RefreshSwitchGames();
 		}
 		else if (tab == SettingsTab)
 		{
@@ -2643,6 +2643,23 @@ public sealed class MainWindow : Window
 	// ---- NovaS (Switch 2) -----------------------------------------------------------------------
 
 	// The PS5 game folders also hold Switch 2 games; NovaS adds its own.
+	// Scans the Switch 2 folders off the UI thread and then shows them: a loose dump's first scan adds up the size of
+	// every file in it (~160,000 for Donkey Kong Bananza), which froze the launcher for seconds, e.g. on returning from
+	// a game. Only the latest scan is shown.
+	private int _switchScan;
+	private bool _switchScanned;
+
+	private async void RefreshSwitchGames()
+	{
+		var scan = ++_switchScan;
+		var roots = SwitchRoots();
+		if (!_switchScanned) _novas.Toast(L.T("Buscando tus juegos…"));
+		var games = await Task.Run(() => SwitchGames.Scan(roots));
+		if (scan != _switchScan) return;
+		_switchScanned = true;
+		_novas.Load(games);
+	}
+
 	private List<string> SwitchRoots() =>
 	    _emulator.GameDirs().Concat(_store.ExtraDirs).Concat(_store.SwitchDirs).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 
@@ -2665,7 +2682,7 @@ public sealed class MainWindow : Window
 		{
 			ShowToast(L.T("No se pudo guardar la portada: ") + e.Message);
 		}
-		_novas.Load(SwitchGames.Scan(SwitchRoots()));
+		RefreshSwitchGames();
 	}
 
 	// The console's prod.keys / title.keys into NovaS.
@@ -2687,7 +2704,7 @@ public sealed class MainWindow : Window
 		{
 			ShowToast(L.T("No se pudieron copiar las claves: ") + e.Message);
 		}
-		_novas.Load(SwitchGames.Scan(SwitchRoots()));
+		RefreshSwitchGames();
 	}
 
 	// The console's firmware: its .zip, or any .nca of its folder (one picker for both).
@@ -2718,7 +2735,7 @@ public sealed class MainWindow : Window
 		{
 			ShowToast(L.T("No se pudo instalar el firmware: ") + e.Message);
 		}
-		_novas.Load(SwitchGames.Scan(SwitchRoots()));
+		RefreshSwitchGames();
 	}
 
 	// A Switch 2 game full screen in NovaSEmulator.
@@ -2843,7 +2860,7 @@ public sealed class MainWindow : Window
 		WindowState  = _shownState; // As the player had it before the game.
 		Activate();
 		// Back on NovaS: its own list again, and no PS5 menu music (selecting the PS5 game would start it).
-		if (_tab == NovaSTab) _novas.Load(SwitchGames.Scan(SwitchRoots()));
+		if (_tab == NovaSTab) RefreshSwitchGames();
 		else Select(_index, force: true);
 		if (closed is not null) AfterArchiveTest(closed);
 		if (crashed && closed is not null && _zone != Zone.Choice)

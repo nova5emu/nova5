@@ -509,5 +509,6 @@ public static class Strings
 		["Tienes NovaS {0}. Lo nuevo de esta versión y de las anteriores."] = "You have NovaS {0}. What is new in this version and earlier ones.",
 		["▲ ▼ / rueda del ratón desplazar     A o B cerrar"] = "▲ ▼ / mouse wheel scroll     A or B close",
 		["Cerrar"] = "Close",
+		["Buscando tus juegos…"] = "Looking for your games…",
 	};
 }

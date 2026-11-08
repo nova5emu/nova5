@@ -83,6 +83,63 @@ public static partial class SwitchGames
 		File.Copy(image, CoverBase(game) + System.IO.Path.GetExtension(image).ToLowerInvariant(), overwrite: true);
 	}
 
+	// The size of an extracted game, counted once per folder: Donkey Kong Bananza's dump alone has ~160,000 files, and
+	// adding them up again on every scan (each return from a game) froze the launcher for seconds.
+	// Kept in _Cache\novas-sizes.json between sessions, with the folder's own write time: a dump whose top folder changed
+	// (an update or DLC added or removed) is counted again.
+	private sealed record SizeEntry(long Size, long Stamp);
+
+	private static readonly string SizesFile = System.IO.Path.Combine(AppContext.BaseDirectory, "_Cache", "novas-sizes.json");
+	private static readonly Lazy<System.Collections.Concurrent.ConcurrentDictionary<string, SizeEntry>> FolderSizes = new(LoadSizes);
+
+	private static System.Collections.Concurrent.ConcurrentDictionary<string, SizeEntry> LoadSizes()
+	{
+		try
+		{
+			if (File.Exists(SizesFile) &&
+			    System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, SizeEntry>>(File.ReadAllText(SizesFile)) is { } saved)
+				return new(saved, StringComparer.OrdinalIgnoreCase);
+		}
+		catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)
+		{
+		}
+		return new(StringComparer.OrdinalIgnoreCase);
+	}
+
+	private static long FolderSize(string folder)
+	{
+		var path = System.IO.Path.GetFullPath(folder);
+		long stamp;
+		try
+		{
+			stamp = Directory.GetLastWriteTimeUtc(path).Ticks;
+		}
+		catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+		{
+			return 0;
+		}
+		if (FolderSizes.Value.TryGetValue(path, out var known) && known.Stamp == stamp) return known.Size;
+		long size;
+		try
+		{
+			size = Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
+		}
+		catch (Exception e) when (e is UnauthorizedAccessException or IOException)
+		{
+			return 0;
+		}
+		FolderSizes.Value[path] = new SizeEntry(size, stamp);
+		try
+		{
+			Directory.CreateDirectory(System.IO.Path.GetDirectoryName(SizesFile)!);
+			File.WriteAllText(SizesFile, System.Text.Json.JsonSerializer.Serialize(FolderSizes.Value));
+		}
+		catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+		{
+		}
+		return size;
+	}
+
 	private static IEnumerable<string> Folders(string dir, int depth)
 	{
 		yield return dir;
@@ -123,27 +180,9 @@ public static partial class SwitchGames
 		var icon   = places.SelectMany(p => Directory.EnumerateFiles(p, "icon_*.dat"))
 		    .OrderBy(f => f.Contains("LatinAmericanSpanish", StringComparison.OrdinalIgnoreCase) ? 0 : f.Contains("AmericanEnglish", StringComparison.OrdinalIgnoreCase) ? 1 : 2)
 		    .FirstOrDefault();
-		long size;
-		try
-		{
-			size = Directory.EnumerateFiles(game, "*", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
-		}
-		catch (Exception e) when (e is UnauthorizedAccessException or IOException)
-		{
-			size = 0;
-		}
 		var title = nacp is null ? null : TitleFromNacp(nacp);
 		var folder = dumpRoot ?? game;
-		if (dumpRoot is not null)
-		{
-			try
-			{
-				size = Directory.EnumerateFiles(dumpRoot, "*", SearchOption.AllDirectories).Sum(f => new FileInfo(f).Length);
-			}
-			catch (Exception e) when (e is UnauthorizedAccessException or IOException)
-			{
-			}
-		}
+		var size = FolderSize(folder);
 		var extras = dumpRoot is not null && new[] { "updates", "dlc" }.Any(d =>
 		    Directory.Exists(System.IO.Path.Combine(dumpRoot, d)) && Directory.EnumerateDirectories(System.IO.Path.Combine(dumpRoot, d)).Any());
 		return new SwitchGame(title ?? Words(Clean(System.IO.Path.GetFileName(folder))), main, size)

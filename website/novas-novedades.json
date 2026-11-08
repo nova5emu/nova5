@@ -1,6 +1,20 @@
 {
   "versions": [
     {
+      "version": "0.1.5",
+      "date": "2026-11-07",
+      "title": "Donkey Kong Bananza mucho más cerca de los 60 FPS",
+      "items": [
+        "Donkey Kong Bananza prepara el siguiente fotograma mientras la tarjeta gráfica dibuja el anterior: en nuestras pruebas pasó de ir casi siempre a 30 FPS a ir la mayor parte del tiempo a 60, sin caídas a 20.",
+        "Al salir de un juego, NovaS ya no se queda congelado unos segundos: busca tus juegos en segundo plano y recuerda lo que ocupa cada uno."
+      ],
+      "title_en": "Donkey Kong Bananza much closer to 60 FPS",
+      "items_en": [
+        "Donkey Kong Bananza prepares the next frame while the graphics card draws the previous one: in our tests it went from running almost always at 30 FPS to running most of the time at 60, with no drops to 20.",
+        "When you leave a game, NovaS no longer freezes for a few seconds: it looks for your games in the background and remembers how much each one takes."
+      ]
+    },
+    {
       "version": "0.1.4",
       "date": "2026-11-07",
       "title": "Donkey Kong Bananza más fluido y novedades al actualizar",
