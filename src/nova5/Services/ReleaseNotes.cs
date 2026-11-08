@@ -5,15 +5,16 @@ namespace Nova5.Services;
 
 public sealed record ReleaseNote(Version Version, string Date, string Title, IReadOnlyList<string> Items);
 
-// What each version brings, from website/novedades.json (embedded at build time, so the web and the launcher show
-// the same text).
+// What each version brings, from website/novedades.json and, for NovaS, website/novas-novedades.json (embedded at
+// build time, so the web and the launcher show the same text).
 public static class ReleaseNotes
 {
-	public static IReadOnlyList<ReleaseNote> All { get; } = Load();
+	public static IReadOnlyList<ReleaseNote> All   { get; } = Load("novedades.json");
+	public static IReadOnlyList<ReleaseNote> NovaS { get; } = Load("novas-novedades.json");
 
-	private static List<ReleaseNote> Load()
+	private static List<ReleaseNote> Load(string resource)
 	{
-		using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("novedades.json");
+		using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(resource);
 		if (stream is null) return new();
 		using var json = JsonDocument.Parse(stream);
 		var notes = new List<ReleaseNote>();
@@ -29,11 +30,13 @@ public static class ReleaseNotes
 	}
 
 	// The versions installed since the player last saw the notes (just the current one on a first run), newest first.
-	public static List<ReleaseNote> Since(string? seen, Version current)
+	public static List<ReleaseNote> Since(string? seen, Version current) => Since(All, seen, current);
+
+	public static List<ReleaseNote> Since(IReadOnlyList<ReleaseNote> all, string? seen, Version current)
 	{
 		var newer = Version.TryParse(seen, out var last)
-		    ? All.Where(n => n.Version > last && n.Version <= current).ToList()
-		    : All.Where(n => n.Version == current).ToList();
-		return newer.Count > 0 ? newer : All.Where(n => n.Version <= current).Take(1).ToList();
+		    ? all.Where(n => n.Version > last && n.Version <= current).ToList()
+		    : all.Where(n => n.Version == current).ToList();
+		return newer.Count > 0 ? newer : all.Where(n => n.Version <= current).Take(1).ToList();
 	}
 }

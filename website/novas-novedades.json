@@ -2,14 +2,18 @@
   "versions": [
     {
       "version": "0.1.4",
-      "date": "",
-      "title": "Novedades al actualizar",
+      "date": "2026-11-07",
+      "title": "Donkey Kong Bananza más fluido y novedades al actualizar",
       "items": [
+        "Donkey Kong Bananza da muchos menos tirones: los fotogramas más lentos pasaron de 105 a 40 ms en nuestras pruebas. Sigue a 30 FPS reales (60 con la generación de fotogramas).",
+        "Las listas de órdenes que el juego genera en la tarjeta gráfica ya no hacen esperar al emulador más de lo necesario.",
         "Después de cada actualización, NovaS te enseña lo nuevo de esa versión al abrirse.",
         "En los ajustes de NovaS, «Novedades» enseña lo que trajo cada versión."
       ],
-      "title_en": "What's new after updating",
+      "title_en": "Smoother Donkey Kong Bananza and what's new after updating",
       "items_en": [
+        "Donkey Kong Bananza stutters much less: its slowest frames went from 105 to 40 ms in our tests. It still runs at 30 real FPS (60 with frame generation).",
+        "The command lists the game builds on the graphics card no longer make the emulator wait longer than needed.",
         "After each update, NovaS shows what that version brings when it opens.",
         "In NovaS's settings, «What's new» shows what each version brought."
       ]

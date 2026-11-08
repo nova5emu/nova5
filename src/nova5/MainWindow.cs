@@ -179,6 +179,14 @@ public sealed class MainWindow : Window
 			    () => _update is null ? L.T("Consulta en GitHub si hay una versión nueva de NovaS.") : L.F("NovaS {0} está lista: se descarga e instala y tus partidas y ajustes se conservan.", _update.Version),
 			    () => _updating ? L.T("Actualizando…") : _update is null ? L.T("Buscar ›") : L.F("Actualizar a {0} ›", _update.Version),
 			    _ => { if (_update is null) CheckUpdates(true); else StartUpdate(); }));
+			_novas.LauncherRows.Add(new(L.T("Novedades"), () => L.F("Tienes NovaS {0}. Lo nuevo de esta versión y de las anteriores.", Updates.Current),
+			    () => L.T("Ver ›"), _ => _novas.ShowNotes(L.T("Novedades de NovaS"), ReleaseNotes.NovaS.Where(n => n.Version <= Updates.Current).ToList())));
+			_novas.NotesClosed += () =>
+			{
+				if (_store.SeenNovaSNotes == Updates.Current.ToString()) return;
+				_store.SeenNovaSNotes = Updates.Current.ToString();
+				_store.Save();
+			};
 			_novas.LauncherRows.Add(new(L.T("Actualizaciones"),
 			    () => L.T("Avisar: te avisa al abrir NovaS y tú decides. Automáticas: se instalan solas al abrir NovaS. Desactivadas: no se conecta para esto."),
 			    () => _store.UpdateMode switch { "auto" => L.T("Automáticas"), "no" => L.T("Desactivadas"), _ => L.T("Avisar") }, step =>
@@ -224,7 +232,7 @@ public sealed class MainWindow : Window
 		PointerWheelChanged += (_, e) =>
 		{
 			if (_running is not null || _zone is Zone.Prompt or Zone.Notes or Zone.GameOptions or Zone.TrophyList or Zone.TextEntry or Zone.Keys or Zone.Choice) return;
-			if (_tab == NovaSTab && _novas.SettingsOpen) return; // Its list scrolls with the wheel.
+			if (_tab == NovaSTab && (_novas.SettingsOpen || _novas.NotesOpen)) return; // Its lists scroll with the wheel.
 			var sideways = _tab is 0 or NovaSTab;
 			OnInput(e.Delta.Y < 0 ? (sideways ? PadInput.Right : PadInput.Down) : (sideways ? PadInput.Left : PadInput.Up));
 		};
@@ -241,7 +249,8 @@ public sealed class MainWindow : Window
 			Reload();
 			if (SnapshotPath is { } snapshot)
 			{
-				if (SnapshotNotes) ShowNotes(ReleaseNotes.Since(null, Updates.Current), firstTime: false);
+				if (SnapshotNotes && Edition.NovaSOnly) { ShowTab(NovaSTab); _novas.ShowNotes(L.F("Novedades de NovaS {0}", Updates.Current), ReleaseNotes.NovaS.Where(n => n.Version <= Updates.Current).ToList()); }
+				else if (SnapshotNotes) ShowNotes(ReleaseNotes.Since(null, Updates.Current), firstTime: false);
 				if (SnapshotSettings) ShowTab(SettingsTab);
 				if (SnapshotTrophies) ShowTab(TrophiesTab);
 				if (SnapshotNovaS) ShowTab(NovaSTab);
@@ -251,8 +260,13 @@ public sealed class MainWindow : Window
 				DispatcherTimer.RunOnce(() => SaveSnapshot(snapshot), TimeSpan.FromSeconds(4));
 				return;
 			}
-			// NovaS on its own: straight to its home, without Nova5's notes or menu music.
-			if (Edition.NovaSOnly) ShowTab(NovaSTab);
+			// NovaS on its own: straight to its home, without Nova5's notes or menu music; a new NovaS shows its own notes, once.
+			if (Edition.NovaSOnly)
+			{
+				ShowTab(NovaSTab);
+				if (_store.SeenNovaSNotes != Updates.Current.ToString())
+					_novas.ShowNotes(L.F("Novedades de NovaS {0}", Updates.Current), ReleaseNotes.Since(ReleaseNotes.NovaS, _store.SeenNovaSNotes, Updates.Current));
+			}
 			// A new version (or a first run) shows what it brings, once.
 			else if (_store.SeenNotes != Updates.Current.ToString()) ShowNotes(ReleaseNotes.Since(_store.SeenNotes, Updates.Current), firstTime: true);
 			if (_store.UpdateMode != "no") DispatcherTimer.RunOnce(() => CheckUpdates(false), TimeSpan.FromSeconds(3));

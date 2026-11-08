@@ -503,5 +503,11 @@ public static class Strings
 		["NovaS {0} está lista: se descarga e instala y tus partidas y ajustes se conservan."] = "NovaS {0} is ready: it downloads and installs, and your saves and settings are kept.",
 		["Actualizar a {0} ›"] = "Update to {0} ›",
 		["Avisar: te avisa al abrir NovaS y tú decides. Automáticas: se instalan solas al abrir NovaS. Desactivadas: no se conecta para esto."] = "Notify: tells you when NovaS opens and you decide. Automatic: installed by themselves when NovaS opens. Off: it doesn't connect for this.",
+		["Novedades de NovaS {0}"] = "What's new in NovaS {0}",
+		["Novedades de NovaS"] = "What's new in NovaS",
+		["Novedades"] = "What's new",
+		["Tienes NovaS {0}. Lo nuevo de esta versión y de las anteriores."] = "You have NovaS {0}. What is new in this version and earlier ones.",
+		["▲ ▼ / rueda del ratón desplazar     A o B cerrar"] = "▲ ▼ / mouse wheel scroll     A or B close",
+		["Cerrar"] = "Close",
 	};
 }

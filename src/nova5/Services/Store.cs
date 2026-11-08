@@ -15,6 +15,8 @@ public sealed class Store
 	public string                       UpdateMode  { get; set; } = "avisar";
 	// The last version whose notes the player saw; a newer Nova5 shows its notes once at startup.
 	public string?                      SeenNotes   { get; set; }
+	// The same for NovaS on its own (its versions go apart from Nova5's).
+	public string?                      SeenNovaSNotes { get; set; }
 	// The launcher's language: "auto" follows Windows (Spanish if Windows is in Spanish, else English), "es" or "en".
 	public string                       Language    { get; set; } = "auto";
 

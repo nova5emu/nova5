@@ -150,6 +150,7 @@ public sealed class NovaSHome : Grid
 		// (the same look as NovaS's web page). The drawn buttons work like the real ones.
 		_screen.Children.Add(stage);
 		_screen.Children.Add(_settingsHost);
+		_screen.Children.Add(_notesHost);
 		_joyLeft  = JoyCon(left: true);
 		_joyRight = JoyCon(left: false);
 		_bezel.Child = _screen;
@@ -439,9 +440,98 @@ public sealed class NovaSHome : Grid
 		}
 	}
 
+	// ---- Release notes (once after an update, and from Ajustes › Novedades) ------------------------
+
+	private readonly Grid _notesHost = new() { IsVisible = false, Background = new SolidColorBrush(Colors.Black, 0.55) };
+	private readonly StackPanel _notesList = new() { Spacing = 34 };
+	private readonly ScrollViewer _notesScroll = new()
+	{
+		MaxHeight = 600, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+		VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(0, 0, 18, 0),
+	};
+	private readonly TextBlock _notesTitle = Label("", 40, FontWeight.Bold, TextColor);
+	private Border? _notesSheet;
+
+	public bool NotesOpen => _notesHost.IsVisible;
+	public event System.Action? NotesClosed;
+
+	public void ShowNotes(string title, IReadOnlyList<Services.ReleaseNote> notes)
+	{
+		if (notes.Count == 0) return;
+		if (_notesSheet is null)
+		{
+			var body = new StackPanel { Spacing = 22 };
+			var head = new DockPanel { LastChildFill = true };
+			var close = Hint("B", L.T("Cerrar"));
+			close.Cursor = new Cursor(StandardCursorType.Hand);
+			close.PointerPressed += (_, _) => CloseNotes();
+			DockPanel.SetDock(close, Dock.Right);
+			head.Children.Add(close);
+			_notesTitle.TextWrapping = TextWrapping.Wrap;
+			head.Children.Add(_notesTitle);
+			body.Children.Add(head);
+			body.Children.Add(Label(L.T("▲ ▼ / rueda del ratón desplazar     A o B cerrar"), 20, FontWeight.Normal, Dim));
+			_notesScroll.Content = _notesList;
+			body.Children.Add(_notesScroll);
+			_notesSheet = new Border
+			{
+				Width = 1240, Padding = new Thickness(48, 40), CornerRadius = new CornerRadius(28), Child = body,
+				Background = new SolidColorBrush(Panel), BorderBrush = new SolidColorBrush(Line), BorderThickness = new Thickness(1),
+				HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
+				Margin = new Thickness(0, 110, 0, 0), // Below the window bar.
+			};
+			_notesSheet.PointerPressed += (_, e) => e.Handled = true; // Clicks inside do not reach the backdrop.
+			_notesHost.PointerPressed += (_, _) => CloseNotes();
+			_notesHost.Children.Add(_notesSheet);
+		}
+		_notesTitle.Text = title;
+		_notesList.Children.Clear();
+		foreach (var note in notes)
+		{
+			var block = new StackPanel { Spacing = 10 };
+			var date  = DateTime.TryParse(note.Date, out var day) ? " · " + day.ToString(L.T("d 'de' MMMM 'de' yyyy"), new System.Globalization.CultureInfo(L.T("es-ES"))) : "";
+			block.Children.Add(Label(L.F("VERSIÓN {0}{1}", note.Version, date), 18, FontWeight.SemiBold, Accent));
+			block.Children.Add(new TextBlock { Text = note.Title, FontSize = 30, FontWeight = FontWeight.Bold, Foreground = new SolidColorBrush(TextColor), TextWrapping = TextWrapping.Wrap });
+			foreach (var item in note.Items)
+			{
+				var line = new DockPanel { Margin = new Thickness(0, 4, 0, 0) };
+				var dot  = new Ellipse { Width = 10, Height = 10, Fill = new SolidColorBrush(Red), VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(4, 12, 18, 0) };
+				DockPanel.SetDock(dot, Dock.Left);
+				line.Children.Add(dot);
+				line.Children.Add(new TextBlock { Text = item, FontSize = 23, LineHeight = 33, Foreground = new SolidColorBrush(TextColor, 0.88), TextWrapping = TextWrapping.Wrap });
+				block.Children.Add(line);
+			}
+			_notesList.Children.Add(block);
+		}
+		_notesScroll.Offset = default;
+		_notesHost.IsVisible = true;
+	}
+
+	private void CloseNotes()
+	{
+		if (!NotesOpen) return;
+		_notesHost.IsVisible = false;
+		NotesClosed?.Invoke();
+	}
+
+	private void NotesInput(PadInput input)
+	{
+		switch (input)
+		{
+			case PadInput.Up:   _notesScroll.Offset = _notesScroll.Offset.WithY(Math.Max(0, _notesScroll.Offset.Y - 140)); break;
+			case PadInput.Down: _notesScroll.Offset = _notesScroll.Offset.WithY(_notesScroll.Offset.Y + 140); break;
+			case PadInput.Accept or PadInput.Back or PadInput.Options or PadInput.Menu: CloseNotes(); break;
+		}
+	}
+
 	// Pad and keyboard.
 	public void Input(PadInput input)
 	{
+		if (NotesOpen)
+		{
+			NotesInput(input);
+			return;
+		}
 		if (SettingsOpen)
 		{
 			SettingsInput(input);

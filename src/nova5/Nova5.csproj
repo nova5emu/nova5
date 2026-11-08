@@ -25,6 +25,7 @@
     <AvaloniaResource Include="Assets\**" />
     <!-- The release notes the website shows too (Services/ReleaseNotes.cs). -->
     <EmbeddedResource Include="..\..\website\novedades.json" LogicalName="novedades.json" />
+    <EmbeddedResource Include="..\..\website\novas-novedades.json" LogicalName="novas-novedades.json" />
     <!-- Tuned patch files, installed next to the launcher; Services/GamePatches.cs seeds _Patches from them. -->
     <None Include="patches\*.json" Link="assets\patches\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
   </ItemGroup>
