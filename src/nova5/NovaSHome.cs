@@ -99,6 +99,13 @@ public sealed class NovaSHome : Grid
 		DockPanel.SetDock(status, Dock.Right);
 		statusDock.Children.Add(status);
 		Place(stage, statusDock, RowLeft, 66);
+		// A new version: its own line under the clock, clear of the window bar in the middle.
+		_updateNotice.Child = _updateNoticeText;
+		_updateNotice.PointerPressed += (_, _) => _updateRun?.Invoke();
+		var noticeDock = new DockPanel { Width = 1920 - RowLeft * 2, LastChildFill = false };
+		DockPanel.SetDock(_updateNotice, Dock.Right);
+		noticeDock.Children.Add(_updateNotice);
+		Place(stage, noticeDock, RowLeft, 128);
 
 		// The focused game's name, then the row of games.
 		var info = new StackPanel { Spacing = 4 };
@@ -264,11 +271,23 @@ public sealed class NovaSHome : Grid
 		}
 	}
 
-	// A newer version was found (NovaS on its own): one more round button, first in the row, that installs it.
-	public void OfferUpdate(string label, System.Action run)
+	// A newer version was found (NovaS on its own): a red notice at the top, by the clock, and a red round button first
+	// in the row; both install it.
+	private readonly TextBlock _updateNoticeText = Label("", 22, FontWeight.Bold, Colors.White);
+	private readonly Border _updateNotice = new()
+	{
+		IsVisible = false, Padding = new Thickness(22, 9), CornerRadius = new CornerRadius(24), Background = new SolidColorBrush(Red),
+		Cursor = new Cursor(StandardCursorType.Hand), VerticalAlignment = VerticalAlignment.Center,
+	};
+	private System.Action? _updateRun;
+
+	public void OfferUpdate(string label, System.Action run, string? notice = null)
 	{
 		_buttons.RemoveAll(b => b.Glyph == UpdateGlyph);
 		_buttons.Insert(0, new(UpdateGlyph, label, run));
+		_updateRun = run;
+		_updateNoticeText.Text = notice ?? label;
+		_updateNotice.IsVisible = true;
 		BuildActions();
 		Refresh();
 	}
@@ -735,13 +754,14 @@ public sealed class NovaSHome : Grid
 	private static StackPanel RoundButton(Action action)
 	{
 		var panel = new StackPanel { Spacing = 10, Cursor = new Cursor(StandardCursorType.Hand) };
+		var update = action.Glyph == UpdateGlyph; // Stands out: red, like the notice at the top.
 		panel.Children.Add(new Border
 		{
-			Width = 92, Height = 92, CornerRadius = new CornerRadius(46), Background = new SolidColorBrush(Panel),
+			Width = 92, Height = 92, CornerRadius = new CornerRadius(46), Background = new SolidColorBrush(update ? Red : Panel),
 			BorderThickness = new Thickness(4), BorderBrush = new SolidColorBrush(Line), HorizontalAlignment = HorizontalAlignment.Center,
-			Child = Label(action.Glyph, 36, FontWeight.Normal, TextColor, Icons, center: true),
+			Child = Label(action.Glyph, 36, FontWeight.Normal, update ? Colors.White : TextColor, Icons, center: true),
 		});
-		panel.Children.Add(Label(action.Label, 18, FontWeight.Normal, Dim, center: true));
+		panel.Children.Add(Label(action.Label, 18, update ? FontWeight.Bold : FontWeight.Normal, update ? TextColor : Dim, center: true));
 		return panel;
 	}
 

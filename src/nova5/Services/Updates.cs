@@ -28,13 +28,19 @@ public static class Updates
 		return client;
 	}
 
+	// Whether the last check could not ask GitHub at all (no network, or its API refused): worth trying again later.
+	public static bool LastCheckFailed { get; private set; }
+
 	// Null when there is no newer release, no setup asset, or no network.
 	public static async Task<UpdateInfo?> CheckAsync()
 	{
+		LastCheckFailed = false;
 		try
 		{
 			using var response = await Http.GetAsync(LatestRelease);
-			if (!response.IsSuccessStatusCode) return null;
+			// GitHub's API answers 60 requests an hour per address without a login (the website's download counters
+			// use them too): when it refuses, read the latest release from the plain releases page instead.
+			if (!response.IsSuccessStatusCode) return await CheckFromReleasePage();
 			using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
 			var root = json.RootElement;
 			if (!Version.TryParse(root.GetProperty("tag_name").GetString()?.TrimStart('v', 'V'), out var latest)) return null;
@@ -50,8 +56,42 @@ public static class Updates
 		}
 		catch (Exception e) when (e is HttpRequestException or TaskCanceledException or JsonException or KeyNotFoundException or InvalidOperationException)
 		{
+			LastCheckFailed = true;
 		}
 		return null;
+	}
+
+	// github.com/<repo>/releases/latest redirects to the latest tag's page, with no request limit. The setup's size comes
+	// from its download's headers; there is no SHA-256 this way, so the size check alone guards the download.
+	private static async Task<UpdateInfo?> CheckFromReleasePage()
+	{
+		try
+		{
+			using var handler = new HttpClientHandler { AllowAutoRedirect = false };
+			using var plain   = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
+			plain.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue(Edition.Name, Current.ToString()));
+			using var page = await plain.GetAsync($"https://github.com/{Edition.Repository}/releases/latest");
+			var tag = page.Headers.Location?.ToString().Split('/').LastOrDefault();
+			if (tag is null || !Version.TryParse(tag.TrimStart('v', 'V'), out var latest))
+			{
+				LastCheckFailed = true;
+				return null;
+			}
+			if (latest <= Current) return null;
+			var url = $"https://github.com/{Edition.Repository}/releases/download/{tag}/{SetupAsset}";
+			using var head = await Http.SendAsync(new HttpRequestMessage(HttpMethod.Head, url));
+			if (!head.IsSuccessStatusCode || head.Content.Headers.ContentLength is not { } size || size <= 0)
+			{
+				LastCheckFailed = true;
+				return null;
+			}
+			return new UpdateInfo(latest, url, size, null);
+		}
+		catch (Exception e) when (e is HttpRequestException or TaskCanceledException or InvalidOperationException or UriFormatException)
+		{
+			LastCheckFailed = true;
+			return null;
+		}
 	}
 
 	// Downloads the setup to %TEMP% and checks its size and, when GitHub publishes it, its SHA-256.

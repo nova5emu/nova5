@@ -389,8 +389,9 @@ public static partial class SwitchGames
 
 	public static readonly Option[] Options =
 	{
-		new(L.T("Resolución"), L.T("Más resolución se ve más nítido pero pide más a la tarjeta gráfica."), "Renderer", "resolution_setup",
-		    new[] { ("5", "4K (1.5x)"), ("3", L.T("Nativa (1440p)")), ("6", "2x (5K)"), ("7", "3x") }),
+		// The engine's scale over the game's own resolution (1440p in Dock): 3 = 1x, 2 = 3/4 (1080p), 1 = 1/2 (720p).
+		new(L.T("Resolución"), L.T("Más resolución se ve más nítido pero pide más a la tarjeta gráfica. En PC menos potentes, como la ROG Ally o un portátil, 1080p o 720p van más rápido y en una pantalla pequeña se ven bien."), "Renderer", "resolution_setup",
+		    new[] { ("5", "4K (1.5x)"), ("3", L.T("Nativa (1440p)")), ("6", "2x (5K)"), ("7", "3x"), ("2", L.T("1080p (menos calidad)")), ("1", L.T("720p (la más ligera)")) }),
 		new(L.T("Modo de consola"), L.T("Dock: como conectada a la tele (más resolución). Portátil: como en la mano."), "System", "use_docked_mode",
 		    new[] { ("1", "Dock (TV)"), ("0", L.T("Portátil")) }),
 		new(L.T("Sincronización vertical"), L.T("Sí evita cortes en la imagen; No da la menor latencia."), "Renderer", "use_vsync",

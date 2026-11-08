@@ -2568,6 +2568,16 @@ public sealed class MainWindow : Window
 		if (_tab == SettingsTab) BuildSettings();
 		if (_update is null)
 		{
+			// GitHub could not be asked (no network yet, or it refused): try again in a while, while the launcher is open.
+			if (Updates.LastCheckFailed && !manual && _store.UpdateMode != "no")
+				DispatcherTimer.RunOnce(() => { if (_update is null) CheckUpdates(false); }, TimeSpan.FromMinutes(10));
+			if (manual && Updates.LastCheckFailed)
+			{
+				ShowToast(L.T("No se pudo consultar GitHub. Revisa tu conexión e inténtalo de nuevo."));
+				if (Edition.NovaSOnly) _novas.Toast(L.T("No se pudo consultar GitHub. Revisa tu conexión e inténtalo de nuevo."));
+				_novas.RefreshSettings();
+				return;
+			}
 			if (manual) ShowToast(L.F("Tienes la última versión ({0})", Updates.Current));
 			if (manual && Edition.NovaSOnly) _novas.Toast(L.F("Tienes la última versión ({0})", Updates.Current));
 			_novas.RefreshSettings();
@@ -2576,7 +2586,7 @@ public sealed class MainWindow : Window
 		_updateText.Text      = L.F("Actualizar a {0}", _update.Version);
 		_updatePill.IsVisible = true;
 		// NovaS on its own shows the update as one more round button on its home.
-		if (Edition.NovaSOnly) _novas.OfferUpdate(L.F("Actualizar a {0}", _update.Version), StartUpdate);
+		if (Edition.NovaSOnly) _novas.OfferUpdate(L.F("Actualizar a {0}", _update.Version), StartUpdate, L.F("Nueva versión {0} disponible · Actualizar ›", _update.Version));
 		_novas.RefreshSettings();
 		if (_store.UpdateMode == "auto" && !manual) StartUpdate();
 		else if (Edition.NovaSOnly) _novas.Toast(L.F("NovaS {0} está disponible: pulsa «Actualizar a {1}»", _update.Version, _update.Version));

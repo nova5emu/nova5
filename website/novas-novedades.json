@@ -1,6 +1,22 @@
 {
   "versions": [
     {
+      "version": "0.1.6",
+      "date": "2026-11-07",
+      "title": "Resoluciones para PC menos potentes y aviso de actualización a la vista",
+      "items": [
+        "Resolución 1080p y 720p en los ajustes de NovaS, para PC menos potentes como la ROG Ally o un portátil: van más rápido y en una pantalla pequeña se ven bien.",
+        "Cuando hay una versión nueva, NovaS lo avisa arriba en rojo y con un botón rojo de «Actualizar» en la fila de abajo.",
+        "Si GitHub no responde al abrir NovaS, la versión nueva se busca por otro camino y se vuelve a intentar más tarde: ya no hace falta ir a los ajustes para encontrarla."
+      ],
+      "title_en": "Resolutions for less powerful PCs and an update notice you can see",
+      "items_en": [
+        "1080p and 720p resolution in NovaS's settings, for less powerful PCs like the ROG Ally or a laptop: they run faster and look fine on a small screen.",
+        "When there is a new version, NovaS says so at the top in red and with a red «Update» button in the bottom row.",
+        "If GitHub does not answer when NovaS opens, the new version is looked up another way and checked again later: no need to go to the settings to find it."
+      ]
+    },
+    {
       "version": "0.1.5",
       "date": "2026-11-07",
       "title": "Donkey Kong Bananza mucho más cerca de los 60 FPS",

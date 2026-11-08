@@ -510,5 +510,10 @@ public static class Strings
 		["▲ ▼ / rueda del ratón desplazar     A o B cerrar"] = "▲ ▼ / mouse wheel scroll     A or B close",
 		["Cerrar"] = "Close",
 		["Buscando tus juegos…"] = "Looking for your games…",
+		["Más resolución se ve más nítido pero pide más a la tarjeta gráfica. En PC menos potentes, como la ROG Ally o un portátil, 1080p o 720p van más rápido y en una pantalla pequeña se ven bien."] = "More resolution looks sharper but asks more of the graphics card. On less powerful PCs, like the ROG Ally or a laptop, 1080p or 720p run faster and look fine on a small screen.",
+		["1080p (menos calidad)"] = "1080p (lower quality)",
+		["720p (la más ligera)"] = "720p (the lightest)",
+		["Nueva versión {0} disponible · Actualizar ›"] = "New version {0} available · Update ›",
+		["No se pudo consultar GitHub. Revisa tu conexión e inténtalo de nuevo."] = "Could not reach GitHub. Check your connection and try again.",
 	};
 }
