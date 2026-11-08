@@ -52,7 +52,11 @@
     const data = event.data.giscus;
     if (data.signOut) { save(null); show(null); return; }
     if (!('discussion' in data)) return;
-    const viewer = data.viewer && data.viewer.login ? { login: data.viewer.login, avatarUrl: data.viewer.avatarUrl } : null;
+    // Without a session giscus reads as its own bot (giscus[bot]): that is nobody signed in.
+    let signedIn = false;
+    try { signedIn = !!localStorage.getItem('giscus-session'); } catch { /* private mode */ }
+    const person = signedIn && data.viewer && data.viewer.login && !data.viewer.login.endsWith('[bot]');
+    const viewer = person ? { login: data.viewer.login, avatarUrl: data.viewer.avatarUrl } : null;
     save(viewer);
     show(viewer);
   });
