@@ -250,3 +250,16 @@ details p { color: var(--muted); margin: 0 0 20px; }
 .comments { max-width: 900px; }
 .comments-lede { color: var(--muted); margin: 8px 0 24px; }
 .comments .giscus { min-height: 160px; }
+
+/* The menu keeps to one line: the in-page sections that scrolling reaches anyway step out first on narrower screens. */
+@media (min-width: 961px) {
+  .nav { gap: 24px; }
+  .links { gap: 18px; }
+  .links a { white-space: nowrap; font-size: 14px; }
+}
+@media (min-width: 961px) and (max-width: 1760px) {
+  .links a[href="#capturas"], .links a[href="#empezar"] { display: none; }
+}
+@media (min-width: 961px) and (max-width: 1300px) {
+  .links a[href="#funciones"], .links a[href="#compatibilidad"], .links a[href="#preguntas"] { display: none; }
+}
