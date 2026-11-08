@@ -499,5 +499,9 @@ public static class Strings
 		["Automático (el del PC)"] = "Automatic (your PC's)",
 		["EMULADOR"] = "EMULATOR",
 		["Comprimido .zar"] = "Compressed .zar",
+		["Consulta en GitHub si hay una versión nueva de NovaS."] = "Checks GitHub for a new version of NovaS.",
+		["NovaS {0} está lista: se descarga e instala y tus partidas y ajustes se conservan."] = "NovaS {0} is ready: it downloads and installs, and your saves and settings are kept.",
+		["Actualizar a {0} ›"] = "Update to {0} ›",
+		["Avisar: te avisa al abrir NovaS y tú decides. Automáticas: se instalan solas al abrir NovaS. Desactivadas: no se conecta para esto."] = "Notify: tells you when NovaS opens and you decide. Automatic: installed by themselves when NovaS opens. Off: it doesn't connect for this.",
 	};
 }

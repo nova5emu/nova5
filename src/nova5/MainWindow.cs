@@ -170,8 +170,24 @@ public sealed class MainWindow : Window
 			Background            = Brushes.Transparent;
 			_consoleWindow        = true;
 		}
-		_novas.LanguageValue  = () => LanguageName(_store.Language);
-		_novas.LanguageChange = ChangeLanguage;
+		// NovaS's settings start with the launcher's own rows: the language and, for NovaS on its own, its updates.
+		_novas.LauncherRows.Add(new("Idioma / Language", () => L.T("Idioma de Nova5 y NovaS. Automático usa el de tu PC. Se aplica al reiniciar."),
+		    () => LanguageName(_store.Language), ChangeLanguage));
+		if (Edition.NovaSOnly)
+		{
+			_novas.LauncherRows.Add(new(L.T("Buscar actualizaciones"),
+			    () => _update is null ? L.T("Consulta en GitHub si hay una versión nueva de NovaS.") : L.F("NovaS {0} está lista: se descarga e instala y tus partidas y ajustes se conservan.", _update.Version),
+			    () => _updating ? L.T("Actualizando…") : _update is null ? L.T("Buscar ›") : L.F("Actualizar a {0} ›", _update.Version),
+			    _ => { if (_update is null) CheckUpdates(true); else StartUpdate(); }));
+			_novas.LauncherRows.Add(new(L.T("Actualizaciones"),
+			    () => L.T("Avisar: te avisa al abrir NovaS y tú decides. Automáticas: se instalan solas al abrir NovaS. Desactivadas: no se conecta para esto."),
+			    () => _store.UpdateMode switch { "auto" => L.T("Automáticas"), "no" => L.T("Desactivadas"), _ => L.T("Avisar") }, step =>
+			{
+				string[] modes = { "avisar", "auto", "no" };
+				_store.UpdateMode = modes[(Math.Max(Array.IndexOf(modes, _store.UpdateMode), 0) + step + modes.Length) % modes.Length];
+				_store.Save();
+			}));
+		}
 		_novas.MinimizeRequested   += () => WindowState = WindowState.Minimized;
 		_novas.FullScreenRequested += () => WindowState = WindowState == WindowState.FullScreen ? WindowState.Normal : WindowState.FullScreen;
 		_novas.CloseRequested      += Close;
@@ -2533,17 +2549,21 @@ public sealed class MainWindow : Window
 	private async void CheckUpdates(bool manual)
 	{
 		if (manual) ShowToast(L.T("Buscando actualizaciones…"));
+		if (manual && Edition.NovaSOnly) _novas.Toast(L.T("Buscando actualizaciones…"));
 		_update = await Updates.CheckAsync();
 		if (_tab == SettingsTab) BuildSettings();
 		if (_update is null)
 		{
 			if (manual) ShowToast(L.F("Tienes la última versión ({0})", Updates.Current));
+			if (manual && Edition.NovaSOnly) _novas.Toast(L.F("Tienes la última versión ({0})", Updates.Current));
+			_novas.RefreshSettings();
 			return;
 		}
 		_updateText.Text      = L.F("Actualizar a {0}", _update.Version);
 		_updatePill.IsVisible = true;
 		// NovaS on its own shows the update as one more round button on its home.
 		if (Edition.NovaSOnly) _novas.OfferUpdate(L.F("Actualizar a {0}", _update.Version), StartUpdate);
+		_novas.RefreshSettings();
 		if (_store.UpdateMode == "auto" && !manual) StartUpdate();
 		else if (Edition.NovaSOnly) _novas.Toast(L.F("NovaS {0} está disponible: pulsa «Actualizar a {1}»", _update.Version, _update.Version));
 		else ShowToast(L.F("Nova5 {0} está disponible: pulsa «Actualizar» arriba o en Ajustes", _update.Version));

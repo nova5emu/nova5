@@ -79,6 +79,7 @@ public sealed class NovaSHome : Grid
 			new("", "Firmware", () => InstallFirmware?.Invoke()),
 			new("", L.T("Portada"), () => { if (_index < _games.Count) ChangeCover?.Invoke(_games[_index]); else Toast(L.T("Elige primero un juego")); }),
 			new("", L.T("Ajustes NovaS"), OpenSettings),
+			new("", L.T("Donar"), () => System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://ko-fi.com/nova5emu") { UseShellExecute = true })),
 			// NovaS on its own has no PS5 side to go back to: its last button closes it.
 			Edition.NovaSOnly ? new("", L.T("Salir"), () => Leave?.Invoke()) : new("", "Nova5 (PS5)", () => Leave?.Invoke()),
 		};
@@ -357,10 +358,10 @@ public sealed class NovaSHome : Grid
 
 	private void CloseSettings() => _settingsHost.IsVisible = false;
 
-	// The launcher's language (the first row; the launcher keeps it) and then the engine's options.
-	public Func<string>? LanguageValue;
-	public System.Action<int>? LanguageChange;
-	private int SettingCount => SwitchGames.Options.Length + 1;
+	// The launcher's own rows first (language, updates; the launcher keeps them), then the engine's options.
+	public sealed record LauncherRow(string Label, Func<string> Detail, Func<string> Value, System.Action<int> Change);
+	public List<LauncherRow> LauncherRows { get; } = new();
+	private int SettingCount => LauncherRows.Count + SwitchGames.Options.Length;
 
 	public void RefreshSettings()
 	{
@@ -373,16 +374,17 @@ public sealed class NovaSHome : Grid
 		for (var i = 0; i < SettingCount; i++)
 		{
 			var index  = i;
-			var option = i == 0 ? null : SwitchGames.Options[i - 1];
+			var launcher = i < LauncherRows.Count ? LauncherRows[i] : null;
+			var option = launcher is null ? SwitchGames.Options[i - LauncherRows.Count] : null;
 			var focused = i == _setting;
 			var row = new DockPanel { LastChildFill = true };
-			var shown = option is null ? LanguageValue?.Invoke() ?? "" : option.Choices[SwitchGames.Current(option)].Name;
+			var shown = launcher is not null ? launcher.Value() : option!.Choices[SwitchGames.Current(option)].Name;
 			var value = Label("‹  " + shown + "  ›", 24, FontWeight.SemiBold, focused ? Accent : TextColor);
 			DockPanel.SetDock(value, Dock.Right);
 			row.Children.Add(value);
 			var text = new StackPanel { Spacing = 4, HorizontalAlignment = HorizontalAlignment.Left };
-			text.Children.Add(Label(option?.Label ?? "Idioma / Language", 26, FontWeight.SemiBold, TextColor));
-			text.Children.Add(new TextBlock { Text = option?.Detail ?? L.T("Idioma de Nova5 y NovaS. Automático usa el de tu PC. Se aplica al reiniciar."), FontSize = 18, TextWrapping = TextWrapping.Wrap, Foreground = new SolidColorBrush(Dim), MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Left });
+			text.Children.Add(Label(launcher?.Label ?? option!.Label, 26, FontWeight.SemiBold, TextColor));
+			text.Children.Add(new TextBlock { Text = launcher?.Detail() ?? option!.Detail, FontSize = 18, TextWrapping = TextWrapping.Wrap, Foreground = new SolidColorBrush(Dim), MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Left });
 			row.Children.Add(text);
 			var box = new Border
 			{
@@ -406,12 +408,13 @@ public sealed class NovaSHome : Grid
 
 	private void Change(int step)
 	{
-		if (_setting == 0)
+		if (_setting < LauncherRows.Count)
 		{
-			LanguageChange?.Invoke(step);
+			LauncherRows[_setting].Change(step);
+			BuildSettings();
 			return;
 		}
-		var option = SwitchGames.Options[_setting - 1];
+		var option = SwitchGames.Options[_setting - LauncherRows.Count];
 		var next = (SwitchGames.Current(option) + step + option.Choices.Length) % option.Choices.Length;
 		try
 		{
