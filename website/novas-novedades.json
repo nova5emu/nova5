@@ -1,6 +1,22 @@
 {
   "versions": [
     {
+      "version": "0.1.9",
+      "date": "2026-11-09",
+      "title": "Trae tus partidas de otro emulador",
+      "items": [
+        "Partidas › Importar de otro emulador: NovaS busca en tu PC las partidas que jugaste en Eden, Eglantine, Citron, Sudachi o yuzu y las copia a NovaS para que sigas donde lo dejaste.",
+        "Si ya tenías partida de ese juego en NovaS, no se borra: queda guardada en una copia (save-copias) antes de importar.",
+        "Partidas › Abrir la carpeta de partidas sigue ahí para hacer copias de seguridad o pasarlas a otro PC."
+      ],
+      "title_en": "Bring your saves from another emulator",
+      "items_en": [
+        "Saves › Import from another emulator: NovaS looks on your PC for the saves you played in Eden, Eglantine, Citron, Sudachi or yuzu and copies them to NovaS so you carry on where you left off.",
+        "If you already had a save of that game in NovaS, it is not deleted: it is kept in a copy (save-copias) before importing.",
+        "Saves › Open the saves folder is still there to back them up or move them to another PC."
+      ]
+    },
+    {
       "version": "0.1.8",
       "date": "2026-11-09",
       "title": "Aviso de «Preparando el juego» y botones del mando a tu gusto",

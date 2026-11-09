@@ -64,6 +64,7 @@ public sealed class NovaSHome : Grid
 	public event System.Action<SwitchGame>? Launch;
 	public event System.Action? Leave;           // Back to the PS5 side.
 	public event System.Action? AddFolder;
+	public event System.Action? Saves;           // The "Partidas" button: open the saves folder or import them.
 	public event System.Action? InstallKeys;     // Pick prod.keys / title.keys.
 	public event System.Action? InstallFirmware; // Pick a firmware .zip or any .nca of its folder.
 	public event System.Action<SwitchGame>? ChangeCover; // Pick an image as a game's cover.
@@ -78,7 +79,7 @@ public sealed class NovaSHome : Grid
 			new("", L.T("Claves"), () => InstallKeys?.Invoke()),
 			new("", "Firmware", () => InstallFirmware?.Invoke()),
 			// The games' saves: opens the folder to copy them or bring them from another PC.
-			new("", L.T("Partidas"), Services.SwitchGames.OpenSavesFolder),
+			new("", L.T("Partidas"), () => Saves?.Invoke()),
 			new("", L.T("Portada"), () => { if (_index < _games.Count) ChangeCover?.Invoke(_games[_index]); else Toast(L.T("Elige primero un juego")); }),
 			new("", L.T("Ajustes NovaS"), OpenSettings),
 			new("", L.T("Donar"), () => System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://ko-fi.com/nova5emu") { UseShellExecute = true })),

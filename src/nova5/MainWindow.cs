@@ -160,6 +160,7 @@ public sealed class MainWindow : Window
 		_novas.ChangeCover     += ChangeSwitchCover;
 		_novas.Leave     += () => { if (Edition.NovaSOnly) Close(); else ShowTab(0); };
 		_novas.AddFolder += AddSwitchFolder;
+		_novas.Saves     += ShowSwitchSaves;
 		// NovaS's console window (see UpdateNovaSWindow): its bar minimizes, enlarges (full screen: just the screen, as
 		// before) and closes it; the bar and the controllers' bodies move it.
 		if (Edition.NovaSOnly && SnapshotPath is null)
@@ -2694,6 +2695,53 @@ public sealed class MainWindow : Window
 			ShowToast(L.T("No se pudo guardar la portada: ") + e.Message);
 		}
 		RefreshSwitchGames();
+	}
+
+	// "Partidas": open the saves folder, or bring the saves of another emulator of the same family (Eden, Eglantine,
+	// Citron, Sudachi, yuzu...) into NovaS.
+	private void ShowSwitchSaves()
+	{
+		var found = SwitchGames.FindForeignSaves();
+		var detail = found.Count == 0
+		    ? L.T("Busca en este PC las partidas que jugaste en Eden, Eglantine, Citron, Sudachi o yuzu y las copia a NovaS. Ahora no encontré ninguna.")
+		    : L.F("Encontré {0}. Las copia a NovaS para que sigas donde lo dejaste; si ya tienes partida de ese juego en NovaS, antes guarda una copia de la tuya.",
+		          string.Join(", ", found.Select(s => L.F("{0} (de {1})", SwitchGames.GameName(s.GameId), s.Emulator))));
+		ShowChoice(L.T("Partidas"), L.T("Tus partidas guardadas de los juegos de Switch 2."), new()
+		{
+			new(L.T("Importar de otro emulador"), detail, () => "", _ => ImportSwitchSaves(found)),
+			new(L.T("Abrir la carpeta de partidas"), L.T("Para hacer una copia de seguridad o pasarlas a otro PC."), () => "", _ => SwitchGames.OpenSavesFolder()),
+			new(L.T("Ahora no"), "", () => "", _ => { }),
+		});
+	}
+
+	private void ImportSwitchSaves(List<SwitchGames.ForeignSave> found)
+	{
+		if (found.Count == 0)
+		{
+			_novas.Toast(L.T("No encontré partidas de Eden, Eglantine, Citron, Sudachi ni yuzu en este PC"));
+			return;
+		}
+		if (SwitchGames.NovaSUser() is not { } user)
+		{
+			_novas.Toast(L.T("Abre antes un juego una vez en NovaS para crear tu usuario, y vuelve a importar"));
+			return;
+		}
+		try
+		{
+			var backup = SwitchGames.ImportSaves(found, user);
+			var names = string.Join(", ", found.Select(s => SwitchGames.GameName(s.GameId)));
+			ShowChoice(L.T("Partidas importadas"),
+			    L.F("Ya están en NovaS: {0}. Abre el juego y continúa donde lo dejaste.", names) +
+			    (backup is null ? "" : " " + L.T("Las partidas que ya tenías de esos juegos quedaron guardadas en una copia (save-copias).")), new()
+			{
+				new(L.T("Aceptar"), "", () => "", _ => { }),
+				new(L.T("Abrir la carpeta de partidas"), "", () => "", _ => SwitchGames.OpenSavesFolder()),
+			});
+		}
+		catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+		{
+			_novas.Toast(L.T("No se pudieron importar las partidas: ") + e.Message);
+		}
 	}
 
 	// The console's prod.keys / title.keys into NovaS.

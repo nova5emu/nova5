@@ -360,6 +360,101 @@ public static partial class SwitchGames
 		Process.Start(new ProcessStartInfo(SavesDir) { UseShellExecute = true });
 	}
 
+	// ---- Saves from other emulators of the same family (Eden, Eglantine, Citron, Sudachi, yuzu...) -----------
+	// They keep saves like NovaS: <emulator>\nand\user\save\0000000000000000\<user>\<game id>\. Ryujinx keeps them another
+	// way and runs no Switch 2 games, so it is not looked at.
+	public static readonly string[] OtherEmulators = { "Eden", "Eglantine", "Citron", "Sudachi", "yuzu", "suyu", "torzu" };
+
+	public sealed record ForeignSave(string Emulator, string GameId, string Folder, DateTime Modified);
+
+	// The newest save of each game across the other emulators installed for this Windows user.
+	public static List<ForeignSave> FindForeignSaves()
+	{
+		var found   = new Dictionary<string, ForeignSave>(StringComparer.OrdinalIgnoreCase);
+		var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+		foreach (var emulator in OtherEmulators)
+		{
+			var users = System.IO.Path.Combine(appData, emulator.ToLowerInvariant(), "nand", "user", "save", "0000000000000000");
+			if (!Directory.Exists(users)) continue;
+			try
+			{
+				foreach (var user in Directory.EnumerateDirectories(users))
+				foreach (var game in Directory.EnumerateDirectories(user))
+				{
+					var id = System.IO.Path.GetFileName(game);
+					if (!GameIdPattern().IsMatch(id)) continue;
+					var files = Directory.EnumerateFiles(game, "*", SearchOption.AllDirectories).ToList();
+					if (files.Count == 0) continue;
+					var modified = files.Max(File.GetLastWriteTimeUtc);
+					if (!found.TryGetValue(id, out var old) || old.Modified < modified) found[id] = new(emulator, id.ToUpperInvariant(), game, modified);
+				}
+			}
+			catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+			{
+			}
+		}
+		return found.Values.OrderBy(s => GameName(s.GameId), StringComparer.CurrentCultureIgnoreCase).ToList();
+	}
+
+	[GeneratedRegex("^[0-9A-Fa-f]{16}$")]
+	private static partial Regex GameIdPattern();
+
+	// Names of the games NovaS knows by id; the rest show their id.
+	private static readonly Dictionary<string, string> GameNames = new(StringComparer.OrdinalIgnoreCase)
+	{
+		["040074A01BF12000"] = "Donkey Kong Bananza",
+		["0400486024DEC000"] = "The Legend of Zelda: Ocarina of Time",
+		["0400A3A01EE4C000"] = "Pokémon Pokopia",
+	};
+
+	public static string GameName(string id) => GameNames.TryGetValue(id, out var name) ? name : L.F("juego {0}", id);
+
+	// NovaS's own user: the first user's id in nand\system\save\8000000000000010\su\avators\profiles.dat (bytes 16-31),
+	// written backwards as its saves folder's name. Without that file yet, the saves folder already there; else null.
+	public static string? NovaSUser()
+	{
+		var profiles = System.IO.Path.Combine(UserDir, "nand", "system", "save", "8000000000000010", "su", "avators", "profiles.dat");
+		try
+		{
+			if (File.Exists(profiles))
+			{
+				var bytes = File.ReadAllBytes(profiles);
+				if (bytes.Length >= 32 && bytes.Skip(16).Take(16).Any(b => b != 0))
+					return Convert.ToHexString(bytes.Skip(16).Take(16).Reverse().ToArray());
+			}
+		}
+		catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+		{
+		}
+		var users = System.IO.Path.Combine(SavesDir, "0000000000000000");
+		return Directory.Exists(users) ? Directory.EnumerateDirectories(users).Select(System.IO.Path.GetFileName).FirstOrDefault() : null;
+	}
+
+	// Copies each save into NovaS's user. A save NovaS already has for that game is moved first, whole, to
+	// user\nand\user\save-copias\<date> (nothing is deleted). Returns that folder when it was needed.
+	public static string? ImportSaves(IEnumerable<ForeignSave> saves, string user)
+	{
+		var dest = System.IO.Path.Combine(SavesDir, "0000000000000000", user);
+		string? backup = null;
+		foreach (var save in saves)
+		{
+			var target = System.IO.Path.Combine(dest, save.GameId);
+			if (Directory.Exists(target))
+			{
+				backup ??= System.IO.Path.Combine(UserDir, "nand", "user", "save-copias", DateTime.Now.ToString("yyyy-MM-dd HH.mm.ss"));
+				Directory.CreateDirectory(backup);
+				Directory.Move(target, System.IO.Path.Combine(backup, save.GameId));
+			}
+			foreach (var file in Directory.EnumerateFiles(save.Folder, "*", SearchOption.AllDirectories))
+			{
+				var to = System.IO.Path.Combine(target, System.IO.Path.GetRelativePath(save.Folder, file));
+				Directory.CreateDirectory(System.IO.Path.GetDirectoryName(to)!);
+				File.Copy(file, to, overwrite: true);
+			}
+		}
+		return backup;
+	}
+
 	public static string FirmwareDir => System.IO.Path.Combine(UserDir, "nand", "system", "Contents", "registered");
 	public static bool   HasFirmware => Directory.Exists(FirmwareDir) && Directory.EnumerateFiles(FirmwareDir, "*.nca").Any();
 
