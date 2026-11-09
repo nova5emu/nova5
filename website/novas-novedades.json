@@ -1,6 +1,24 @@
 {
   "versions": [
     {
+      "version": "0.1.7",
+      "date": "2026-11-09",
+      "title": "Más idiomas, juegos en ventana, pantalla ancha y botón de partidas",
+      "items": [
+        "Idioma de los juegos: además de español e inglés, portugués de Brasil y de Portugal, francés, alemán, italiano, neerlandés, ruso, polaco, japonés, coreano, chino y tailandés.",
+        "Ajustes › Abrir los juegos: pantalla completa o en ventana (F11 cambia entre las dos con el juego abierto).",
+        "Ajustes › Pantalla: 16:9 original, estirar a la pantalla, 21:9 (ultrawide) o 16:10.",
+        "Botón «Partidas» en el inicio: abre la carpeta de tus partidas guardadas para copiarlas o traerlas de otro PC."
+      ],
+      "title_en": "More languages, games in a window, wide screens and a saves button",
+      "items_en": [
+        "Game language: besides Spanish and English, Brazilian and European Portuguese, French, German, Italian, Dutch, Russian, Polish, Japanese, Korean, Chinese and Thai.",
+        "Settings › Open games: full screen or in a window (F11 switches between them while the game is open).",
+        "Settings › Screen: original 16:9, stretch to the screen, 21:9 (ultrawide) or 16:10.",
+        "«Saves» button on the home screen: opens your saves folder to copy them or bring them from another PC."
+      ]
+    },
+    {
       "version": "0.1.6",
       "date": "2026-11-07",
       "title": "Resoluciones para PC menos potentes y aviso de actualización a la vista",

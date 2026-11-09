@@ -337,10 +337,20 @@ public static partial class SwitchGames
 		tuning.AddRange(Options.Where(o => o.Section == EnvSection).Select(o => (o.Key, o.Choices[Current(o)].Value)));
 		foreach (var (name, value) in tuning)
 			if (Environment.GetEnvironmentVariable(name) is null) info.Environment[name] = value;
-		info.ArgumentList.Add("-f");
+		var fullscreen = Options.First(o => o.Section == LaunchSection && o.Key == "fullscreen");
+		if (fullscreen.Choices[Current(fullscreen)].Value == "true") info.ArgumentList.Add("-f");
 		info.ArgumentList.Add("-g");
 		info.ArgumentList.Add(game.Path);
 		return Process.Start(info) ?? throw new InvalidOperationException(L.T("No se pudo iniciar NovaS"));
+	}
+
+	// The games' saves (user/nand/user/save): one folder per user and game, to copy or bring saves from elsewhere.
+	public static string SavesDir => System.IO.Path.Combine(UserDir, "nand", "user", "save");
+
+	public static void OpenSavesFolder()
+	{
+		Directory.CreateDirectory(SavesDir);
+		Process.Start(new ProcessStartInfo(SavesDir) { UseShellExecute = true });
 	}
 
 	public static string FirmwareDir => System.IO.Path.Combine(UserDir, "nand", "system", "Contents", "registered");
@@ -385,6 +395,9 @@ public static partial class SwitchGames
 	// Options in this section are environment switches for the engine, set when a game starts (not ini keys).
 	public const string EnvSection = "Entorno";
 
+	// Options in this section are how the launcher starts a game (kept in the choices file, not the engine's ini).
+	public const string LaunchSection = "Lanzador";
+
 	public sealed record Option(string Label, string Detail, string Section, string Key, (string Value, string Name)[] Choices);
 
 	public static readonly Option[] Options =
@@ -394,10 +407,20 @@ public static partial class SwitchGames
 		    new[] { ("5", "4K (1.5x)"), ("3", L.T("Nativa (1440p)")), ("6", "2x (5K)"), ("7", "3x"), ("2", L.T("1080p (menos calidad)")), ("1", L.T("720p (la más ligera)")) }),
 		new(L.T("Modo de consola"), L.T("Dock: como conectada a la tele (más resolución). Portátil: como en la mano."), "System", "use_docked_mode",
 		    new[] { ("1", "Dock (TV)"), ("0", L.T("Portátil")) }),
+		// The engine's AspectRatio enum: 0 = 16:9, 2 = 21:9, 3 = 16:10, 4 = stretch to the window.
+		new(L.T("Pantalla"), L.T("16:9 es la imagen original. Estirar llena toda la ventana o el monitor (en pantallas ultrawide o 16:10 se ve sin franjas, ") +
+		    L.T("aunque un poco ancha)."), "Renderer", "aspect_ratio",
+		    new[] { ("0", L.T("16:9 (original)")), ("4", L.T("Estirar a la pantalla")), ("2", "21:9 (ultrawide)"), ("3", "16:10") }),
+		new(L.T("Abrir los juegos"), L.T("Pantalla completa, o en una ventana que puedes mover y agrandar (F11 cambia entre las dos con el juego abierto)."), LaunchSection, "fullscreen",
+		    new[] { ("true", L.T("Pantalla completa")), ("false", L.T("En ventana")) }),
 		new(L.T("Sincronización vertical"), L.T("Sí evita cortes en la imagen; No da la menor latencia."), "Renderer", "use_vsync",
 		    new[] { ("2", L.T("Sí")), ("1", "Mailbox"), ("0", "No") }),
 		new(L.T("Idioma de los juegos"), L.T("El idioma de la consola que ven los juegos."), "System", "language_index",
-		    new[] { ("14", L.T("Español (Latinoamérica)")), ("5", L.T("Español (España)")), ("1", L.T("Inglés")) }),
+		    // Values: the engine's Language enum (common/settings_enums.h).
+		    new[] { ("14", L.T("Español (Latinoamérica)")), ("5", L.T("Español (España)")), ("1", L.T("Inglés")), ("12", L.T("Inglés (Reino Unido)")),
+		            ("17", L.T("Portugués (Brasil)")), ("9", L.T("Portugués (Portugal)")), ("2", L.T("Francés")), ("13", L.T("Francés (Canadá)")),
+		            ("3", L.T("Alemán")), ("4", L.T("Italiano")), ("8", L.T("Neerlandés")), ("10", L.T("Ruso")), ("18", L.T("Polaco")),
+		            ("0", L.T("Japonés")), ("7", L.T("Coreano")), ("15", L.T("Chino simplificado")), ("16", L.T("Chino tradicional")), ("19", L.T("Tailandés")) }),
 		new(L.T("Límite de velocidad"), L.T("Sí: el juego va a su velocidad real. No: tan rápido como pueda el PC."), "Core", "use_speed_limit",
 		    new[] { ("true", L.T("Sí")), ("false", "No") }),
 		new(L.T("Caché de shaders"), L.T("Guarda los shaders compilados para que las siguientes partidas no den tirones."), "Renderer", "use_disk_shader_cache",
@@ -441,7 +464,7 @@ public static partial class SwitchGames
 	{
 		Directory.CreateDirectory(System.IO.Path.GetDirectoryName(SettingsPath)!);
 		var ini = new IniFile(SettingsPath);
-		foreach (var option in Options.Where(o => o.Section != EnvSection))
+		foreach (var option in Options.Where(o => o.Section != EnvSection && o.Section != LaunchSection))
 		{
 			ini.Set(option.Section, option.Key, option.Choices[Current(option)].Value);
 			ini.Set(option.Section, option.Key + "\\default", "false");

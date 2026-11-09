@@ -515,5 +515,17 @@ public static class Strings
 		["720p (la más ligera)"] = "720p (the lightest)",
 		["Nueva versión {0} disponible · Actualizar ›"] = "New version {0} available · Update ›",
 		["No se pudo consultar GitHub. Revisa tu conexión e inténtalo de nuevo."] = "Could not reach GitHub. Check your connection and try again.",
+		["Partidas"] = "Saves",
+		["Francés (Canadá)"] = "French (Canada)",
+		["Neerlandés"] = "Dutch",
+		["Tailandés"] = "Thai",
+		["Pantalla"] = "Screen",
+		["16:9 es la imagen original. Estirar llena toda la ventana o el monitor (en pantallas ultrawide o 16:10 se ve sin franjas, "] = "16:9 is the original picture. Stretch fills the whole window or monitor (on ultrawide or 16:10 screens it shows without bars, ",
+		["aunque un poco ancha)."] = "though a little wide).",
+		["16:9 (original)"] = "16:9 (original)",
+		["Estirar a la pantalla"] = "Stretch to the screen",
+		["Abrir los juegos"] = "Open games",
+		["Pantalla completa, o en una ventana que puedes mover y agrandar (F11 cambia entre las dos con el juego abierto)."] = "Full screen, or in a window you can move and enlarge (F11 switches between them while the game is open).",
+		["En ventana"] = "In a window",
 	};
 }

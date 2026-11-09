@@ -77,6 +77,8 @@ public sealed class NovaSHome : Grid
 			new("", L.T("Añadir carpeta"), () => AddFolder?.Invoke()),
 			new("", L.T("Claves"), () => InstallKeys?.Invoke()),
 			new("", "Firmware", () => InstallFirmware?.Invoke()),
+			// The games' saves: opens the folder to copy them or bring them from another PC.
+			new("", L.T("Partidas"), Services.SwitchGames.OpenSavesFolder),
 			new("", L.T("Portada"), () => { if (_index < _games.Count) ChangeCover?.Invoke(_games[_index]); else Toast(L.T("Elige primero un juego")); }),
 			new("", L.T("Ajustes NovaS"), OpenSettings),
 			new("", L.T("Donar"), () => System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://ko-fi.com/nova5emu") { UseShellExecute = true })),
@@ -415,6 +417,15 @@ public sealed class NovaSHome : Grid
 			box.PointerPressed += (_, _) => { _setting = index; Change(1); };
 			_settingsRows.Children.Add(box);
 		}
+	}
+
+	// Snapshots: the settings open on the row whose label starts with this text.
+	public void FocusSetting(string label)
+	{
+		var index = LauncherRows.FindIndex(r => r.Label.StartsWith(label, StringComparison.OrdinalIgnoreCase));
+		var option = Array.FindIndex(SwitchGames.Options, o => o.Label.StartsWith(label, StringComparison.OrdinalIgnoreCase));
+		if (index < 0 && option >= 0) index = LauncherRows.Count + option;
+		if (index >= 0) SelectSetting(index);
 	}
 
 	// Pad and keyboard move the selection; keep it on screen.

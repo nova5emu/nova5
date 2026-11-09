@@ -335,3 +335,6 @@ kbd {
 .changelog details ul { margin: 0 0 20px; }
 .changelog summary .muted { color: var(--muted); font-weight: 400; font-size: 14px; margin-left: 6px; }
 .pill .gh-mark { width: 20px; height: 20px; }
+
+/* "Qué esperar según tu PC": a second list under the requirements. */
+.reqs-title { margin-top: 40px; font-size: 22px; }

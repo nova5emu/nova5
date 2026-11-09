@@ -38,6 +38,8 @@ internal static class Program
 		MainWindow.SnapshotTrophyList = args.Contains("--snapshot-trophy-list");
 		MainWindow.SnapshotNovaS    = args.Contains("--snapshot-novas");
 		MainWindow.SnapshotNovaSSettings = args.Contains("--snapshot-novas-settings");
+		var focus = Array.IndexOf(args, "--snapshot-setting"); // With --snapshot-novas-settings: the row to show.
+		if (focus >= 0 && focus + 1 < args.Length) MainWindow.SnapshotSettingLabel = args[focus + 1];
 		BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
 	}
 

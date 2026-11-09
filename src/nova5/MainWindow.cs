@@ -254,7 +254,7 @@ public sealed class MainWindow : Window
 				if (SnapshotSettings) ShowTab(SettingsTab);
 				if (SnapshotTrophies) ShowTab(TrophiesTab);
 				if (SnapshotNovaS) ShowTab(NovaSTab);
-				if (SnapshotNovaSSettings) { ShowTab(NovaSTab); _novas.OpenSettings(); }
+				if (SnapshotNovaSSettings) { ShowTab(NovaSTab); _novas.OpenSettings(); if (SnapshotSettingLabel is { } label) _novas.FocusSetting(label); }
 				if (SnapshotTrophyList && _trophySets.FirstOrDefault() is { } first) ShowTrophyList(first);
 				if (SnapshotGame && _games.FirstOrDefault(g => g.Package is null) is { } shown) ShowGameOptions(shown);
 				DispatcherTimer.RunOnce(() => SaveSnapshot(snapshot), TimeSpan.FromSeconds(4));
@@ -3073,6 +3073,7 @@ public sealed class MainWindow : Window
 	public static bool    SnapshotTrophies { get; set; }
 	public static bool    SnapshotNovaS { get; set; }
 	public static bool    SnapshotNovaSSettings { get; set; }
+	public static string? SnapshotSettingLabel { get; set; }
 	public static bool    SnapshotTrophyList { get; set; }
 
 	private void SaveSnapshot(string path)
