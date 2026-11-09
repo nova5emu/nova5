@@ -1,6 +1,20 @@
 {
   "versions": [
     {
+      "version": "0.1.8",
+      "date": "2026-11-09",
+      "title": "Aviso de «Preparando el juego» y botones del mando a tu gusto",
+      "items": [
+        "Mientras el juego prepara sus shaders antes de arrancar (la primera vez puede tardar varios minutos), NovaS muestra «Preparando el juego» con una barra de progreso en vez de una pantalla negra.",
+        "Ajustes › Botones del mando: «Según la letra» hace que con un mando de Xbox o de PC A sea A y B sea B; «Posición de Switch» usa el botón de la derecha como A, como en la consola."
+      ],
+      "title_en": "A «Preparing the game» notice and controller buttons your way",
+      "items_en": [
+        "While a game prepares its shaders before starting (the first time it can take several minutes), NovaS shows «Preparing the game» with a progress bar instead of a black screen.",
+        "Settings › Controller buttons: «By letter» makes A be A and B be B on an Xbox or PC controller; «Switch position» uses the right button as A, like on the console."
+      ]
+    },
+    {
       "version": "0.1.7",
       "date": "2026-11-09",
       "title": "Más idiomas, juegos en ventana, pantalla ancha y botón de partidas",

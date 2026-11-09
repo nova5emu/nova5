@@ -253,7 +253,8 @@ public sealed class MainWindow : Window
 				else if (SnapshotNotes) ShowNotes(ReleaseNotes.Since(null, Updates.Current), firstTime: false);
 				if (SnapshotSettings) ShowTab(SettingsTab);
 				if (SnapshotTrophies) ShowTab(TrophiesTab);
-				if (SnapshotNovaS) ShowTab(NovaSTab);
+				if (SnapshotNovaS)    ShowTab(NovaSTab);
+				if (SnapshotLoading)  { ShowTab(NovaSTab); _novas.ShowLoading("Donkey Kong Bananza", 0.45); }
 				if (SnapshotNovaSSettings) { ShowTab(NovaSTab); _novas.OpenSettings(); if (SnapshotSettingLabel is { } label) _novas.FocusSetting(label); }
 				if (SnapshotTrophyList && _trophySets.FirstOrDefault() is { } first) ShowTrophyList(first);
 				if (SnapshotGame && _games.FirstOrDefault(g => g.Package is null) is { } shown) ShowGameOptions(shown);
@@ -2784,13 +2785,50 @@ public sealed class MainWindow : Window
 			_started     = DateTime.UtcNow;
 			_running.EnableRaisingEvents = true;
 			_running.Exited += (_, _) => Dispatcher.UIThread.Post(GameExited);
-			WindowState = WindowState.Minimized;
+			WatchSwitchLoading(game);
 		}
 		catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception)
 		{
 			_running = null;
 			ShowToast(L.T("No se pudo abrir NovaS: ") + e.Message);
 		}
+	}
+
+	// While the engine builds its saved shaders its window stays hidden: NovaS shows the progress instead of a black
+	// screen (up to 20 minutes on slower PCs), and steps aside once the game is on screen.
+	private DispatcherTimer? _loadingWatch;
+
+	private void WatchSwitchLoading(SwitchGame game)
+	{
+		_loadingWatch?.Stop();
+		var started = DateTime.UtcNow;
+		var running = _running;
+		_loadingWatch = new DispatcherTimer(TimeSpan.FromMilliseconds(300), DispatcherPriority.Background, (_, _) =>
+		{
+			string? text = null;
+			try
+			{
+				if (File.Exists(SwitchGames.LoadingFile)) text = File.ReadAllText(SwitchGames.LoadingFile).Trim();
+			}
+			catch (IOException)
+			{
+			}
+			var gone = running is null || running.HasExited || _running != running;
+			// An engine without the progress file (older) shows its own window: step aside after a few seconds.
+			var done = text == "done" || (text is null && DateTime.UtcNow - started > TimeSpan.FromSeconds(12));
+			if (gone || done)
+			{
+				_loadingWatch?.Stop();
+				_novas.HideLoading();
+				if (!gone) WindowState = WindowState.Minimized;
+				return;
+			}
+			var parts = text?.Split(' ');
+			double? fraction = parts is { Length: 2 } && double.TryParse(parts[0], out var value) && double.TryParse(parts[1], out var total) && total > 0
+			    ? value / total : null;
+			_novas.ShowLoading(game.Name, fraction);
+		});
+		_loadingWatch.Start();
 	}
 
 	private readonly HashSet<string> _askedPack = new(StringComparer.OrdinalIgnoreCase);
@@ -3074,6 +3112,7 @@ public sealed class MainWindow : Window
 	public static bool    SnapshotNovaS { get; set; }
 	public static bool    SnapshotNovaSSettings { get; set; }
 	public static string? SnapshotSettingLabel { get; set; }
+	public static bool    SnapshotLoading { get; set; }
 	public static bool    SnapshotTrophyList { get; set; }
 
 	private void SaveSnapshot(string path)

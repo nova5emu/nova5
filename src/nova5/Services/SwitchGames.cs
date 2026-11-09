@@ -337,12 +337,19 @@ public static partial class SwitchGames
 		tuning.AddRange(Options.Where(o => o.Section == EnvSection).Select(o => (o.Key, o.Choices[Current(o)].Value)));
 		foreach (var (name, value) in tuning)
 			if (Environment.GetEnvironmentVariable(name) is null) info.Environment[name] = value;
+		// The engine hides its window while its disk shaders build and writes the progress here for the launcher.
+		Directory.CreateDirectory(System.IO.Path.GetDirectoryName(LoadingFile)!);
+		File.Delete(LoadingFile);
+		info.Environment["NOVAS_LOADING_FILE"] = LoadingFile;
 		var fullscreen = Options.First(o => o.Section == LaunchSection && o.Key == "fullscreen");
 		if (fullscreen.Choices[Current(fullscreen)].Value == "true") info.ArgumentList.Add("-f");
 		info.ArgumentList.Add("-g");
 		info.ArgumentList.Add(game.Path);
 		return Process.Start(info) ?? throw new InvalidOperationException(L.T("No se pudo iniciar NovaS"));
 	}
+
+	// Where the engine writes how far its disk shaders have built ("<value> <total>", then "done"), see LaunchSwitch.
+	public static string LoadingFile => System.IO.Path.Combine(UserDir, "log", "novas-loading.txt");
 
 	// The games' saves (user/nand/user/save): one folder per user and game, to copy or bring saves from elsewhere.
 	public static string SavesDir => System.IO.Path.Combine(UserDir, "nand", "user", "save");
@@ -413,6 +420,10 @@ public static partial class SwitchGames
 		    new[] { ("0", L.T("16:9 (original)")), ("4", L.T("Estirar a la pantalla")), ("2", "21:9 (ultrawide)"), ("3", "16:10") }),
 		new(L.T("Abrir los juegos"), L.T("Pantalla completa, o en una ventana que puedes mover y agrandar (F11 cambia entre las dos con el juego abierto)."), LaunchSection, "fullscreen",
 		    new[] { ("true", L.T("Pantalla completa")), ("false", L.T("En ventana")) }),
+		// NOVAS_BUTTON_LABELS (yuzu_cmd/auto_controller.cpp): swap A/B and X/Y of a detected pad.
+		new(L.T("Botones del mando"), L.T("Según la letra: con un mando de Xbox o de PC, A es A y B es B, como en los juegos de PC. ") +
+		    L.T("Posición de Switch: el botón de la derecha hace de A, como en la consola."), EnvSection, "NOVAS_BUTTON_LABELS",
+		    new[] { ("0", L.T("Posición de Switch")), ("1", L.T("Según la letra (Xbox)")) }),
 		new(L.T("Sincronización vertical"), L.T("Sí evita cortes en la imagen; No da la menor latencia."), "Renderer", "use_vsync",
 		    new[] { ("2", L.T("Sí")), ("1", "Mailbox"), ("0", "No") }),
 		new(L.T("Idioma de los juegos"), L.T("El idioma de la consola que ven los juegos."), "System", "language_index",

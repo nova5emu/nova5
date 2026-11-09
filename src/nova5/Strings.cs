@@ -527,5 +527,13 @@ public static class Strings
 		["Abrir los juegos"] = "Open games",
 		["Pantalla completa, o en una ventana que puedes mover y agrandar (F11 cambia entre las dos con el juego abierto)."] = "Full screen, or in a window you can move and enlarge (F11 switches between them while the game is open).",
 		["En ventana"] = "In a window",
+		["NovaS está preparando los shaders del juego. La primera vez, o después de una actualización, puede tardar varios minutos: no lo cierres. Después arranca mucho más rápido."] = "NovaS is preparing the game's shaders. The first time, or after an update, it can take several minutes: don't close it. Afterwards it starts much faster.",
+		["Preparando {0}…"] = "Preparing {0}…",
+		["Abriendo el juego…"] = "Opening the game…",
+		["Botones del mando"] = "Controller buttons",
+		["Según la letra: con un mando de Xbox o de PC, A es A y B es B, como en los juegos de PC. "] = "By letter: with an Xbox or PC controller, A is A and B is B, like in PC games. ",
+		["Posición de Switch: el botón de la derecha hace de A, como en la consola."] = "Switch position: the right button acts as A, like on the console.",
+		["Posición de Switch"] = "Switch position",
+		["Según la letra (Xbox)"] = "By letter (Xbox)",
 	};
 }

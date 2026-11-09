@@ -160,6 +160,7 @@ public sealed class NovaSHome : Grid
 		_screen.Children.Add(stage);
 		_screen.Children.Add(_settingsHost);
 		_screen.Children.Add(_notesHost);
+		_screen.Children.Add(_loadingHost);
 		_joyLeft  = JoyCon(left: true);
 		_joyRight = JoyCon(left: false);
 		_bezel.Child = _screen;
@@ -469,6 +470,48 @@ public sealed class NovaSHome : Grid
 			case PadInput.Back or PadInput.Options or PadInput.Menu: CloseSettings(); break;
 		}
 	}
+
+	// ---- Preparing a game (the engine builds its saved shaders before the first frame) --------------
+
+	private readonly Grid _loadingHost = new() { IsVisible = false, Background = new SolidColorBrush(Colors.Black, 0.72) };
+	private readonly TextBlock _loadingTitle = Label("", 38, FontWeight.Bold, TextColor);
+	private readonly TextBlock _loadingPercent = Label("", 26, FontWeight.SemiBold, Accent);
+	private readonly Border _loadingFill = new() { Width = 0, Height = 14, CornerRadius = new CornerRadius(7), Background = new SolidColorBrush(Red), HorizontalAlignment = HorizontalAlignment.Left };
+	private const double LoadingBarWidth = 900;
+
+	public bool LoadingShown => _loadingHost.IsVisible;
+
+	// fraction: how much of the shaders is built, or null while it is not known yet.
+	public void ShowLoading(string game, double? fraction)
+	{
+		if (_loadingHost.Children.Count == 0)
+		{
+			var body = new StackPanel { Spacing = 22, Width = LoadingBarWidth };
+			body.Children.Add(_loadingTitle);
+			body.Children.Add(new TextBlock
+			{
+				Text = L.T("NovaS está preparando los shaders del juego. La primera vez, o después de una actualización, puede tardar varios minutos: no lo cierres. Después arranca mucho más rápido."),
+				FontSize = 24, LineHeight = 34, TextWrapping = TextWrapping.Wrap, Foreground = new SolidColorBrush(TextColor, 0.85),
+			});
+			body.Children.Add(new Border
+			{
+				Width = LoadingBarWidth, Height = 14, CornerRadius = new CornerRadius(7), Background = new SolidColorBrush(Line), Child = _loadingFill,
+			});
+			body.Children.Add(_loadingPercent);
+			_loadingHost.Children.Add(new Border
+			{
+				Child = body, Padding = new Thickness(56, 48), CornerRadius = new CornerRadius(28), Margin = new Thickness(0, 110, 0, 0),
+				Background = new SolidColorBrush(Panel), BorderBrush = new SolidColorBrush(Line), BorderThickness = new Thickness(1),
+				HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
+			});
+		}
+		_loadingTitle.Text = L.F("Preparando {0}…", game);
+		_loadingFill.Width = LoadingBarWidth * Math.Clamp(fraction ?? 0, 0, 1);
+		_loadingPercent.Text = fraction is { } f ? L.F("{0:0} %", f * 100) : L.T("Abriendo el juego…");
+		_loadingHost.IsVisible = true;
+	}
+
+	public void HideLoading() => _loadingHost.IsVisible = false;
 
 	// ---- Release notes (once after an update, and from Ajustes › Novedades) ------------------------
 
