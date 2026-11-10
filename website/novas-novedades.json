@@ -1,6 +1,22 @@
 {
   "versions": [
     {
+      "version": "0.2.1",
+      "date": "2026-11-10",
+      "title": "Zelda: la música y la imagen van juntas en las cinemáticas",
+      "items": [
+        "Zelda: Ocarina of Time: los vídeos del juego (la intro y el fondo del título) ya no van a cámara lenta cuando bajan los FPS. Antes la música seguía a su ritmo y se adelantaba a la imagen; ahora van juntas.",
+        "Medido en la intro con un PC lento: antes avanzaba al 70 % de su velocidad y ahora al 95-100 %. En el modo «30 estables», que la dejaba a menos de la mitad, ahora va a su velocidad.",
+        "Gráficas AMD: nuevo interruptor de diagnóstico para la vegetación negra (EDEN_NX2_AMD_NO_DEMOTE_REORDER=1 en un archivo nx2_switches.txt dentro de la carpeta novas de NovaS). Viene apagado y solo afecta a AMD; si tienes una AMD y ves la hierba negra, pruébalo y cuéntanos."
+      ],
+      "title_en": "Zelda: music and picture stay together in cutscenes",
+      "items_en": [
+        "Zelda: Ocarina of Time: the game's videos (the intro and the title background) no longer play in slow motion when FPS drop. The music used to keep its pace and run ahead of the picture; now they stay together.",
+        "Measured on the intro with a slow PC: it used to run at 70% of its speed and now at 95-100%. In the «30 stable» mode, which left it at less than half, it now runs at its speed.",
+        "AMD graphics: new diagnostic switch for black vegetation (EDEN_NX2_AMD_NO_DEMOTE_REORDER=1 in a nx2_switches.txt file inside NovaS's novas folder). It is off and only affects AMD; if you have an AMD card and see black grass, try it and tell us."
+      ]
+    },
+    {
       "version": "0.2.0",
       "date": "2026-11-09",
       "title": "Configurar mando: tus botones, juego por juego",
