@@ -341,6 +341,8 @@ public static partial class SwitchGames
 		Directory.CreateDirectory(System.IO.Path.GetDirectoryName(LoadingFile)!);
 		File.Delete(LoadingFile);
 		info.Environment["NOVAS_LOADING_FILE"] = LoadingFile;
+		// Ajustes > Configurar mando: the player's own buttons (they win over Botones del mando).
+		if (PadMap.EnvironmentValue(PadMap.GameKey(game.Name)) is { } buttons) info.Environment["NOVAS_BUTTON_MAP"] = buttons;
 		var fullscreen = Options.First(o => o.Section == LaunchSection && o.Key == "fullscreen");
 		if (fullscreen.Choices[Current(fullscreen)].Value == "true") info.ArgumentList.Add("-f");
 		info.ArgumentList.Add("-g");
@@ -518,7 +520,7 @@ public static partial class SwitchGames
 		// NOVAS_BUTTON_LABELS (yuzu_cmd/auto_controller.cpp): swap A/B and X/Y of a detected pad.
 		new(L.T("Botones del mando"), L.T("Según la letra: con un mando de Xbox o de PC, A es A y B es B, como en los juegos de PC. ") +
 		    L.T("Posición de Switch: el botón de la derecha hace de A, como en la consola."), EnvSection, "NOVAS_BUTTON_LABELS",
-		    new[] { ("0", L.T("Posición de Switch")), ("1", L.T("Según la letra (Xbox)")) }),
+		    new[] { ("1", L.T("Según la letra (Xbox)")), ("0", L.T("Posición de Switch")) }),
 		new(L.T("Sincronización vertical"), L.T("Sí evita cortes en la imagen; No da la menor latencia."), "Renderer", "use_vsync",
 		    new[] { ("2", L.T("Sí")), ("1", "Mailbox"), ("0", "No") }),
 		new(L.T("Idioma de los juegos"), L.T("El idioma de la consola que ven los juegos."), "System", "language_index",
@@ -583,6 +585,8 @@ public static partial class SwitchGames
 		Directory.CreateDirectory(System.IO.Path.GetDirectoryName(ChoicesPath)!);
 		var choices = new IniFile(ChoicesPath);
 		choices.Set(option.Section, option.Key, option.Choices[choice].Value);
+		// Choosing a style of Botones del mando drops the player's own map for all games of Configurar mando.
+		if (option.Key == "NOVAS_BUTTON_LABELS") choices.Remove("Mando", "map");
 		choices.Save();
 		ApplyDefaults();
 	}

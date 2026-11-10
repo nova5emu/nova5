@@ -1,6 +1,26 @@
 {
   "versions": [
     {
+      "version": "0.2.0",
+      "date": "2026-11-09",
+      "title": "Configurar mando: tus botones, juego por juego",
+      "items": [
+        "Ajustes › Configurar mando: un mando dibujado en pantalla se ilumina al pulsar cada botón y los sticks se mueven, para ver que tu mando responde.",
+        "Cada botón dice lo que hace en el juego (en Donkey Kong Bananza, A: Saltar, Y: Golpear…), también en Zelda: Ocarina of Time y Pokémon Pokopia.",
+        "Tipo Switch (cada botón en su sitio de la Switch), Tipo Xbox (saltas con la A, como en un juego de Xbox) o tus propios botones: elige uno y pulsa el que quieras.",
+        "Cada juego puede tener su propia configuración (LB / RB para elegir el juego); «Como en todos» lo devuelve a la general.",
+        "Ahora por defecto la letra de tu mando es la de Switch (Tipo Xbox). Si ya habías elegido otro estilo, se mantiene."
+      ],
+      "title_en": "Controller setup: your buttons, game by game",
+      "items_en": [
+        "Settings › Controller setup: a controller drawn on screen lights up as you press each button and the sticks move, so you can see your controller responds.",
+        "Each button says what it does in the game (in Donkey Kong Bananza, A: Jump, Y: Punch…), also in Zelda: Ocarina of Time and Pokémon Pokopia.",
+        "Switch type (each button where it is on the Switch), Xbox type (you jump with A, like in an Xbox game) or your own buttons: pick one and press the one you want.",
+        "Each game can have its own setup (LB / RB to choose the game); «Same as all» takes it back to the general one.",
+        "By default the letter on your controller is now the Switch one (Xbox type). If you had already chosen another style, it stays."
+      ]
+    },
+    {
       "version": "0.1.9",
       "date": "2026-11-09",
       "title": "Trae tus partidas de otro emulador",

@@ -197,6 +197,10 @@ public sealed class MainWindow : Window
 				_store.Save();
 			}));
 		}
+		// Ajustes > Configurar mando: the pad drawn with its buttons lit as they are pressed, and the player's own buttons.
+		_novas.LauncherRows.Add(new(L.T("Configurar mando"),
+		    () => L.T("Mira los botones de tu mando en pantalla y elige qué botón hace cada uno (por ejemplo, saltar con A en vez de B)."),
+		    () => PadMap.Custom() is null ? L.T("Abrir ›") : L.T("Personalizado ›"), _ => _novas.OpenPadSetup()));
 		_novas.MinimizeRequested   += () => WindowState = WindowState.Minimized;
 		_novas.FullScreenRequested += () => WindowState = WindowState == WindowState.FullScreen ? WindowState.Normal : WindowState.FullScreen;
 		_novas.CloseRequested      += Close;
@@ -220,6 +224,8 @@ public sealed class MainWindow : Window
 		_music.Volume  = _store.MusicVolume;
 		if (!Gamepad.Initialize()) _padStatus.Text = L.T("Mando no disponible");
 		_pad.Input     += OnInput;
+		_pad.Raw       += place => _novas.PadRaw(place);
+		_novas.Pad      = _pad;
 		_pad.Connected += name => _novas.PadStatus = _padStatus.Text = name is null ? L.T("Sin mando") : L.F("Mando: {0}", name);
 		_novas.PadStatus = _padStatus.Text;
 
@@ -2072,7 +2078,7 @@ public sealed class MainWindow : Window
 			if (input == PadInput.Back) ShowPrompt(false);
 			return;
 		}
-		if (_zone == Zone.NovaS && input is not (PadInput.PrevTab or PadInput.NextTab))
+		if (_zone == Zone.NovaS && (_novas.PadSetupOpen || input is not (PadInput.PrevTab or PadInput.NextTab))) // LB / RB choose the game in Configurar mando
 		{
 			_novas.Input(input);
 			return;

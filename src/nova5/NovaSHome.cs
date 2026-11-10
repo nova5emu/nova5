@@ -14,7 +14,7 @@ namespace Nova5;
 // NovaS home: the Switch 2 side of Nova5, laid out like a console home screen. A row of large square games with the
 // focused one outlined and its name above, a row of round buttons under it, the clock at the top and the controls at
 // the bottom. It draws on a 1920x1080 stage like the rest of the launcher.
-public sealed class NovaSHome : Grid
+public sealed partial class NovaSHome : Grid
 {
 	private const double Tile = 300, Gap = 26, RowLeft = 96, RowTop = 250;
 
@@ -160,6 +160,7 @@ public sealed class NovaSHome : Grid
 		// (the same look as NovaS's web page). The drawn buttons work like the real ones.
 		_screen.Children.Add(stage);
 		_screen.Children.Add(_settingsHost);
+		_screen.Children.Add(_padHost);
 		_screen.Children.Add(_notesHost);
 		_screen.Children.Add(_loadingHost);
 		_joyLeft  = JoyCon(left: true);
@@ -601,6 +602,11 @@ public sealed class NovaSHome : Grid
 	// Pad and keyboard.
 	public void Input(PadInput input)
 	{
+		if (PadSetupOpen)
+		{
+			PadSetupInput(input);
+			return;
+		}
 		if (NotesOpen)
 		{
 			NotesInput(input);
