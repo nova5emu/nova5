@@ -1,6 +1,24 @@
 {
   "versions": [
     {
+      "version": "0.2.2",
+      "date": "2026-11-11",
+      "title": "Zelda: arreglos que nos reportasteis",
+      "items": [
+        "Dominio Zora: arreglados los destellos que recortaban la zona hasta mover la cámara (salían azules en NovaS y blancos en otros emuladores).",
+        "Gráficas AMD: corregida una línea de color en el agua y en algunos volúmenes del escenario.",
+        "La intro y las cinemáticas de Zelda pesan menos en gráficas sin aceleración de IA (AMD, Intel, portátiles): la mejora de imagen que el juego aplica a sus vídeos se cambia por una copia directa.",
+        "Los vídeos del juego van más fluidos y a su ritmo: se avisa al juego en cuanto hay un fotograma listo y no se pierden trozos del vídeo."
+      ],
+      "title_en": "Zelda: fixes you reported",
+      "items_en": [
+        "Zora's Domain: fixed the flashes that cut the area off until the camera moved (blue in NovaS, white in other emulators).",
+        "AMD graphics: fixed a coloured line on water and some scene volumes.",
+        "Zelda's intro and cutscenes are lighter on GPUs without AI acceleration (AMD, Intel, handhelds): the image enhancement the game applies to its videos is replaced by a direct copy.",
+        "Game videos play smoother and on time: the game is told as soon as a frame is ready, and no part of the video is lost."
+      ]
+    },
+    {
       "version": "0.2.1",
       "date": "2026-11-10",
       "title": "Zelda: la música y la imagen van juntas en las cinemáticas",
