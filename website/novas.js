@@ -264,10 +264,23 @@
 	fetch(`https://api.github.com/repos/${REPO}/releases?per_page=100`, { headers: { Accept: 'application/vnd.github+json' } })
 		.then(r => (r.ok ? r.json() : Promise.reject(r.status)))
 		.then(releases => {
-			const total = releases.flatMap(r => r.assets || []).reduce((sum, a) => sum + (a.download_count || 0), 0);
+			const sum = list => list.flatMap(r => r.assets || []).reduce((n, a) => n + (a.download_count || 0), 0);
+			const android = releases.filter(r => /^android-/.test(r.tag_name || '') && !r.draft);
+			// The Android buttons point at the newest Android release's APK.
+			const newest = android.find(r => (r.assets || []).some(a => a.name === 'NovaS-Android.apk'));
+			if (newest) {
+				const apk = newest.assets.find(a => a.name === 'NovaS-Android.apk');
+				$$('[data-android]').forEach(a => { a.href = apk.browser_download_url; });
+			}
+			const total = sum(releases);
 			if (!total) return;
 			$$('[data-download-count]').forEach(b => { b.textContent = total.toLocaleString('es'); });
 			$$('[data-downloads]').forEach(s => { s.hidden = false; });
+			const onAndroid = sum(android);
+			if (onAndroid) {
+				$$('[data-android-count]').forEach(b => { b.textContent = onAndroid.toLocaleString('es'); });
+				$$('[data-android-downloads]').forEach(s => { s.hidden = false; });
+			}
 		})
 		.catch(() => {});
 
